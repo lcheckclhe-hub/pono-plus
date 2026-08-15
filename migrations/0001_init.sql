@@ -230,6 +230,9 @@ CREATE INDEX idx_employees_worksite ON employees(worksite_id);
 -- 6. シフト
 -- ============================================================
 
+-- 現行 tb_m_cate1 の CATE1_REMARKS1〜21 に相当（shift1Template.php で実証）。
+-- 会社ごとに最大21種類を自由に定義する。値0は「休み」で、シフト側は shift_type_id=NULL で表す。
+-- ⚠ 設計書 4.5 の「A〜Dグループ」は特定の会社の設定値であり、仕様ではなかった。
 CREATE TABLE shift_types (
   id           TEXT PRIMARY KEY,
   tenant_id    TEXT NOT NULL REFERENCES tenants(id),
@@ -241,7 +244,8 @@ CREATE TABLE shift_types (
   is_active    INTEGER NOT NULL DEFAULT 1,
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL,
-  UNIQUE (tenant_id, code)
+  UNIQUE (tenant_id, code),
+  CHECK (CAST(code AS INTEGER) BETWEEN 1 AND 21)
 );
 
 -- clock_out は日跨ぎを 24時超え表記で保持する (例 30:00)。負値バグを構造的に発生させない
@@ -260,7 +264,14 @@ CREATE TABLE shifts (
   is_absent        INTEGER NOT NULL DEFAULT 0,
   is_late          INTEGER NOT NULL DEFAULT 0,
   is_early_leave   INTEGER NOT NULL DEFAULT 0,
+  -- 現行 shift_s_id: その日の確定チェック（shift1Template.php で実証）
+  is_confirmed     INTEGER NOT NULL DEFAULT 0,
+  -- 現行 shift_flg2: 「当日確認」。立つと出退勤・休憩・残業・当日フリーが編集不可になる
+  is_day_locked    INTEGER NOT NULL DEFAULT 0,
+  -- 現行 shift_remarks1: 「フリー入力」（予定側の備考）
   note             TEXT,
+  -- 現行 shift_flg8: 「当日フリー」（実績側の備考）
+  day_note         TEXT,
   created_at       TEXT NOT NULL,
   updated_at       TEXT NOT NULL,
   deleted_at       TEXT,
@@ -272,21 +283,21 @@ CREATE TABLE shifts (
 CREATE INDEX idx_shifts_tenant_date ON shifts(tenant_id, worked_on);
 CREATE INDEX idx_shifts_employee_date ON shifts(employee_id, worked_on);
 
--- 現行 tb_m_shift1（user1flg1shift1insert）に相当。シフトの確定状態
--- 対象期間は「従業員 × 締め期間の開始日」で一意。現行の (u_id, c_id, day1) に対応
-CREATE TABLE shift_confirmations (
+-- 現行 tb_m_shift1（user1flg1shift1insert / shift1_r1_flg1）に相当。
+-- ⚠ これは「確定」ではなく画面上の「緊急確認」チェック（shift1Template.php で実証）。
+--   日ごとの確定は shifts.is_confirmed（現行 shift_s_id）である。
+CREATE TABLE shift_period_flags (
   id               TEXT PRIMARY KEY,
   tenant_id        TEXT NOT NULL REFERENCES tenants(id),
   employee_id      TEXT NOT NULL REFERENCES employees(id),
   period_start_on  TEXT NOT NULL,
-  is_confirmed     INTEGER NOT NULL DEFAULT 0,
-  confirmed_at     TEXT,
-  confirmed_by     TEXT,
+  needs_urgent_check INTEGER NOT NULL DEFAULT 0,
+  updated_by       TEXT,
   created_at       TEXT NOT NULL,
   updated_at       TEXT NOT NULL,
   UNIQUE (employee_id, period_start_on)
 );
-CREATE INDEX idx_shift_conf_tenant ON shift_confirmations(tenant_id, period_start_on);
+CREATE INDEX idx_shift_flags_tenant ON shift_period_flags(tenant_id, period_start_on);
 
 -- ============================================================
 -- 7. 勤怠評価
