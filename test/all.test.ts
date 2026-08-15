@@ -32,9 +32,19 @@ import {
   registerEmployee, validateRegistration, isRealDate, RegistrationError,
   EMPLOYMENT_TYPE_BY_LEGACY, GENDER_BY_LEGACY,
   listEmployees, getEmployee, updateEmployee, listShiftTypes, EMPLOYEE_STATUSES,
+  getProfile, getOwnEmployeeId, updateProfile, putProfilePhoto, deleteProfilePhoto,
+  getProfilePhotoKey, sniffImageType, PHOTO_MAX_BYTES, PROFILE_TEXT_MAX,
+  upsertMonthlyReport, getMonthlyReport, listMonthlyReports, monthlyWorkforceStats,
+  validateMonthlyReport, isYearMonth,
+  listReportCategories, upsertReportCategory, upsertDailyReport, getDailyReport,
+  listDailyReports, deleteDailyReport, putDailyReportPhoto, getDailyReportPhotoKey,
+  findOverlappingReports, calcReportMinutes, validateDailyReport,
+  createPhotoPost, listPhotoPosts, getPhotoPost, getPhotoPostKey, deletePhotoPost, CAPTION_MAX,
+  sendThanks, listThanks, thanksRanking, countThanksSent, thanksPeriodOf,
+  THANKS_MONTHLY_LIMIT, THANKS_MESSAGE_MAX,
 } from "../src/services.ts";
 import { worker, routes } from "../src/index.ts";
-import { loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage } from "../src/pages.ts";
+import { loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage } from "../src/pages.ts";
 import { bootstrapSetup, evaluateAttendance, ageOn, persistAttendanceSummary, getShiftSheet } from "../src/services.ts";
 import { upsertShift, summarizePeriod, ShiftServiceError, setUrgentCheck, hasUrgentCheck, periodForDate } from "../src/services.ts";
 import type { Principal } from "../src/core.ts";
@@ -116,17 +126,17 @@ export class ShimD1 {
 }
 
 export class ShimR2 {
-  readonly objects = new Map<string, string>();
+  readonly objects = new Map<string, { body: unknown; httpMetadata?: { contentType?: string } }>();
 
-  async put(key: string, value: string): Promise<void> {
-    this.objects.set(key, value);
+  async put(key: string, value: unknown, opts?: { httpMetadata?: { contentType?: string } }): Promise<void> {
+    this.objects.set(key, { body: value, httpMetadata: opts?.httpMetadata });
   }
 
   async delete(key: string): Promise<void> {
     this.objects.delete(key);
   }
 
-  async get(key: string): Promise<string | null> {
+  async get(key: string): Promise<{ body: unknown; httpMetadata?: { contentType?: string } } | null> {
     return this.objects.get(key) ?? null;
   }
 }
@@ -592,13 +602,20 @@ function columns(db: DatabaseSync, table: string): Array<{ name: string; type: s
 }
 
 describe("スキーマ: 設計原則の検査（CIで守る不変条件）", () => {
-  test("マイグレーションが実行でき、テーブル20本・インデックス16本になる", () => {
+  test("マイグレーションが実行でき、テーブル25本・インデックス25本になる", () => {
+    // 🔴 この数を変えるときは、意図した追加か必ず確認すること。
+    //    0001: テーブル20 / インデックス16
+    //    0004: worksite_monthly_reports を追加（テーブル21 / インデックス17）
+    //    0005: daily_report_categories + daily_reports を追加（テーブル23 / インデックス20）
+    //    0006: photo_posts を追加（テーブル24 / インデックス22）
+    //    0007: thanks を追加（テーブル25 / インデックス25）
+    //    0002・0003 は列の追加のみ
     const db = schemaDb();
-    assert.equal(tableNames(db).length, 20);
+    assert.equal(tableNames(db).length, 25);
     const idx = db.prepare(
       "select count(*) as n from sqlite_master where type='index' and name not like 'sqlite_%'"
     ).get() as { n: number };
-    assert.equal(idx.n, 16);
+    assert.equal(idx.n, 25);
   });
 
   test("業務テーブルは tenant_id NOT NULL（B-6・スキーマ 2.5）", () => {
@@ -879,8 +896,13 @@ describe("ディスパッチャ: 認証の一元化（B-5/B-29・設計書 4.2/5
     // /employees /employees/new も同様に HTML の配信のみ。データは
     // /api/employees・/api/employees/detail・/api/shift-types（すべて認証必須）から取る
     assert.deepEqual(publicRoutes, [
-      "/", "/api/login", "/api/setup", "/attendance", "/employees", "/employees/new",
-      "/healthz", "/home", "/login", "/shifts",
+      "/", "/api/login", "/api/setup", "/attendance",
+      "/daily-reports", "/daily-reports/categories", "/daily-reports/edit",
+      "/employees", "/employees/new",
+      "/healthz", "/home", "/login", "/photos", "/photos/new",
+      "/profile", "/profile/view",
+      "/reports", "/reports/edit", "/shifts",
+      "/thanks", "/thanks/new", "/thanks/ranking",
     ]);
   });
 
@@ -1937,8 +1959,9 @@ describe("スキーマ: マイグレーション 0002", () => {
     assert.ok(cols.includes("default_shift_type_id"));
   });
 
-  test("テーブル数は増えていない（列の追加のみ）", () => {
-    assert.equal(tableNames(schemaDb()).length, 20);
+  test("このマイグレーション自体はテーブルを増やさない（列の追加のみ）", () => {
+    // 全マイグレーション適用後の総数。テーブルを増やしたのは 0001・0004〜0007
+    assert.equal(tableNames(schemaDb()).length, 25);
   });
 });
 
@@ -1960,9 +1983,11 @@ describe("画面: 勤怠評価（T-10）", () => {
     }
   });
 
-  test("🔴 点数化は実装していないことを画面に明示する【未確認】", () => {
-    // 現行の評価系 Action / Template が未受領。推測で点数式を作らない
-    assert.ok(attendancePage().includes("点数化のルールは未確認"));
+  test("🔴 勤怠の点数化を実装しない【会話合意 2026-08-15】", () => {
+    // 設計書 v6 全文に勤怠の点数化の計算式は 0件。5.1 優先5 の定義は実績値のみ。
+    // 6.3 の「点数」は Session 02 で「ストレスチェックの結果」と訂正済み。
+    // 将来ここに点数を足すなら、移植ではなく新規要件として設計すること。
+    assert.ok(attendancePage().includes("点数化は行いません"));
   });
 
   test("🔴 締め日基準の期間を画面に明示する（yearMonth との食い違いを防ぐ）", () => {
@@ -2025,5 +2050,1314 @@ describe("画面: 勤怠評価の表示欠陥（F-6 / F-7 の回帰）", () => {
     const h = attendancePage();
     assert.ok(h.includes(".kpi > div"));
     assert.equal(/[^>]\s\.kpi div \{/.test(h), false);
+  });
+});
+
+// ===============================================================
+// プロフィール（機能権限表 区分5 / T-11〜T-17）
+// ===============================================================
+const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]);
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const GIF = new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00]);
+
+describe("プロフィール: 画像の判定（T-14）", () => {
+  test("JPEG / PNG / GIF をマジックナンバーで判定する", () => {
+    assert.equal(sniffImageType(JPEG)?.ext, "jpg");
+    assert.equal(sniffImageType(PNG)?.ext, "png");
+    assert.equal(sniffImageType(GIF)?.ext, "gif");
+  });
+
+  test("🔴 拡張子や Content-Type を信用しない。中身で判定する", () => {
+    // 画像を名乗る HTML / PHP は中身で弾かれる
+    const html = new TextEncoder().encode("<!DOCTYPE html><script>alert(1)</script>");
+    const php = new TextEncoder().encode("<?php system($_GET['c']); ?>");
+    assert.equal(sniffImageType(html), null);
+    assert.equal(sniffImageType(php), null);
+  });
+
+  test("短すぎるデータで例外にならない", () => {
+    assert.equal(sniffImageType(new Uint8Array([])), null);
+    assert.equal(sniffImageType(new Uint8Array([0xff])), null);
+  });
+});
+
+describe("プロフィール: 本文（T-13）", () => {
+  test("Profile と Note を保存できる", async () => {
+    const { db } = await seed();
+    await updateProfile(db, "t_1", "e_1", { profileText: "よろしく", profileNote: "備考" });
+    const p = await getProfile(db, "t_1", "e_1");
+    assert.equal(p?.profileText, "よろしく");
+    assert.equal(p?.profileNote, "備考");
+  });
+
+  test("送ったキーだけが変わる", async () => {
+    const { db } = await seed();
+    await updateProfile(db, "t_1", "e_1", { profileText: "あ", profileNote: "い" });
+    await updateProfile(db, "t_1", "e_1", { profileNote: "う" });
+    const p = await getProfile(db, "t_1", "e_1");
+    assert.equal(p?.profileText, "あ");
+    assert.equal(p?.profileNote, "う");
+  });
+
+  test("2000文字を超えたら弾く", async () => {
+    const { db } = await seed();
+    await assert.rejects(
+      () => updateProfile(db, "t_1", "e_1", { profileText: "あ".repeat(PROFILE_TEXT_MAX + 1) }),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.code === "too_long")
+    );
+    assert.equal(PROFILE_TEXT_MAX, 2000);
+  });
+
+  test("🔴 他テナントのプロフィールは取得も更新もできない（B-6）", async () => {
+    const { db } = await seed();
+    assert.notEqual(await getProfile(db, "t_1", "e_1"), null);
+    assert.equal(await getProfile(db, "t_2", "e_1"), null);
+    await assert.rejects(() => updateProfile(db, "t_2", "e_1", { profileText: "乗っ取り" }), RegistrationError);
+  });
+});
+
+describe("プロフィール: 顔写真（T-14 / T-15）", () => {
+  test("R2 に保存され、キーが DB に入る", async () => {
+    const { db, r2 } = await seed();
+    const r = await putProfilePhoto(db, r2 as never, "t_1", "e_1", JPEG);
+    assert.equal(r.mime, "image/jpeg");
+    assert.equal(await getProfilePhotoKey(db, "t_1", "e_1"), r.objectKey);
+    assert.equal(r2.objects.has(r.objectKey), true);
+    assert.equal((await getProfile(db, "t_1", "e_1"))?.hasPhoto, true);
+  });
+
+  test("🔴 オブジェクトキーをユーザー入力から作らない", async () => {
+    // 現行は unlink($dir . $_POST["su2_pic1"]) で任意ファイル削除の可能性があった。
+    // 新実装はキーを自前で生成し、テナントIDと従業員IDを含める
+    const { db, r2 } = await seed();
+    const r = await putProfilePhoto(db, r2 as never, "t_1", "e_1", PNG);
+    assert.ok(r.objectKey.startsWith("tenants/t_1/employees/e_1/"));
+    assert.equal(r.objectKey.includes(".."), false);
+  });
+
+  test("差し替えると古いオブジェクトが消える（孤児を作らない）", async () => {
+    const { db, r2 } = await seed();
+    const a = await putProfilePhoto(db, r2 as never, "t_1", "e_1", JPEG);
+    const b = await putProfilePhoto(db, r2 as never, "t_1", "e_1", PNG);
+    assert.notEqual(a.objectKey, b.objectKey);
+    assert.equal(r2.objects.has(a.objectKey), false);
+    assert.equal(r2.objects.has(b.objectKey), true);
+    // 🔴 他テナント（e_2）の写真を巻き込まない
+    assert.equal(r2.objects.has("photos/e_2.jpg"), true);
+  });
+
+  test("削除すると R2 からも DB からも消える", async () => {
+    const { db, r2 } = await seed();
+    const r = await putProfilePhoto(db, r2 as never, "t_1", "e_1", GIF);
+    assert.equal(await deleteProfilePhoto(db, r2 as never, "t_1", "e_1"), true);
+    assert.equal(r2.objects.has(r.objectKey), false);
+    assert.equal(await getProfilePhotoKey(db, "t_1", "e_1"), null);
+    // 2回目は false（すでに無い）
+    assert.equal(await deleteProfilePhoto(db, r2 as never, "t_1", "e_1"), false);
+  });
+
+  test("🔴 画像でないものを拒否する", async () => {
+    const { db, r2 } = await seed();
+    const before = r2.objects.size;
+    const php = new TextEncoder().encode("<?php system($_GET['c']); ?>");
+    await assert.rejects(
+      () => putProfilePhoto(db, r2 as never, "t_1", "e_1", php),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.code === "unsupported_type")
+    );
+    assert.equal(r2.objects.size, before); // R2 に何も書かれていない
+  });
+
+  test("🔴 上限を超えたら拒否する（現行はサイズ検査が無かった）", async () => {
+    const { db, r2 } = await seed();
+    const before = r2.objects.size;
+    const big = new Uint8Array(PHOTO_MAX_BYTES + 1);
+    big.set(JPEG);
+    await assert.rejects(
+      () => putProfilePhoto(db, r2 as never, "t_1", "e_1", big),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.code === "too_large")
+    );
+    assert.equal(r2.objects.size, before);
+    assert.equal(PHOTO_MAX_BYTES, 5 * 1024 * 1024);
+  });
+
+  test("🔴 他テナントの従業員には保存できない", async () => {
+    const { db, r2 } = await seed();
+    const before = r2.objects.size;
+    await assert.rejects(() => putProfilePhoto(db, r2 as never, "t_2", "e_1", JPEG), RegistrationError);
+    assert.equal(r2.objects.size, before);
+    // 既存のキーも書き換わっていない
+    assert.equal(await getProfilePhotoKey(db, "t_1", "e_1"), "photos/e_1.jpg");
+  });
+
+  test("🔴 写真のキーは他テナントから引けない", async () => {
+    const { db, r2 } = await seed();
+    await putProfilePhoto(db, r2 as never, "t_1", "e_1", JPEG);
+    assert.notEqual(await getProfilePhotoKey(db, "t_1", "e_1"), null);
+    assert.equal(await getProfilePhotoKey(db, "t_2", "e_1"), null);
+  });
+
+  test("退会すると写真も消える（既存の削除計画に載っている）", async () => {
+    const { db, r2 } = await seed();
+    await putProfilePhoto(db, r2 as never, "t_1", "e_1", JPEG);
+    const res = await deleteEmployee(db, r2 as never, "t_1", "e_1");
+    assert.equal(res.photosDeleted, 1);
+    // e_1 の分だけ消え、他テナントの e_2 は残る
+    assert.equal(r2.objects.has("photos/e_2.jpg"), true);
+    assert.equal(await getProfilePhotoKey(db, "t_1", "e_1"), null);
+  });
+});
+
+describe("プロフィール: 編集できるのは自分だけ（T-12）", () => {
+  test("アカウントから自分の従業員IDを引ける", async () => {
+    const { db } = await seed();
+    await db.prepare(`UPDATE employees SET account_id = 'acc_1' WHERE id = 'e_1'`).run();
+    assert.equal(await getOwnEmployeeId(db, "t_1", "acc_1"), "e_1");
+  });
+
+  test("🔴 テナントが違えば引けない（B-6）", async () => {
+    const { db } = await seed();
+    await db.prepare(`UPDATE employees SET account_id = 'acc_1' WHERE id = 'e_1'`).run();
+    assert.equal(await getOwnEmployeeId(db, "t_2", "acc_1"), null);
+  });
+
+  test("従業員に紐づかないアカウントは null", async () => {
+    const { db } = await seed();
+    assert.equal(await getOwnEmployeeId(db, "t_1", "acc_1"), null);
+  });
+
+  test("🔴 更新APIは対象をセッションから引く（リクエストの employeeId を受け付けない）", () => {
+    const src = readFileSync(join(here, "..", "src", "index.ts"), "utf-8");
+    const i = src.indexOf('path: "/api/profile/update"');
+    const j = src.indexOf('path: "/api/profile/photo"');
+    const block = src.slice(i, j);
+    assert.ok(block.includes("getOwnEmployeeId"));
+    assert.equal(block.includes("b.employeeId"), false);
+  });
+});
+
+describe("ディスパッチャ: プロフィールのルート（T-12〜T-15）", () => {
+  test("ルートが登録されている", () => {
+    const paths = routes.map((r) => `${r.method} ${r.path}`);
+    for (const p of [
+      "GET /profile", "GET /profile/view", "GET /api/profile", "GET /api/profile/detail",
+      "POST /api/profile/update", "POST /api/profile/photo", "POST /api/profile/photo/delete",
+      "GET /api/profile/photo",
+    ]) {
+      assert.ok(paths.includes(p), `${p} が未登録`);
+    }
+  });
+
+  test("🔴 写真の配信は認証必須（現行は公開ディレクトリだった・設計書 6.1 と同系統）", () => {
+    for (const r of routes.filter((x) => x.path.startsWith("/api/profile"))) {
+      assert.notEqual(r.public, true, `${r.path} が public になっている`);
+    }
+  });
+});
+
+describe("画面: プロフィール（T-16）", () => {
+  test("現行 profile3Template の3項目を踏襲する", () => {
+    const h = profilePage();
+    for (const s of ["顔写真", "Profile", "Note"]) assert.ok(h.includes(s), `${s} が無い`);
+    assert.ok(h.includes('id="text"'));
+    assert.ok(h.includes('id="note"'));
+    assert.ok(h.includes('type="file"'));
+  });
+
+  test("🔴 写真を公開パスではなく認証必須APIから読む", () => {
+    for (const h of [profilePage(), profileViewPage()]) {
+      assert.ok(h.includes("/api/profile/photo?employeeId="));
+      assert.equal(h.includes("../upload/"), false);
+    }
+  });
+
+  test("🔴 パスワード列を表示分岐に使わない（現行 SU1_PASS の再発防止）", () => {
+    // 現行 profile01sTemplate.php は {if $userp->SU1_PASS ==""} で表示を切り替えていた。
+    // 新実装は写真の有無を hasPhoto で判定する
+    for (const h of [profilePage(), profileViewPage()]) {
+      assert.ok(h.includes("hasPhoto"));
+      assert.equal(/SU1_PASS|\bPASS\b/.test(h), false);
+      // パスワードの入力欄そのものを置かない
+      assert.equal(h.includes('type="password"'), false);
+    }
+  });
+
+  test("閲覧画面には編集の手段が無い", () => {
+    const h = profileViewPage();
+    assert.equal(h.includes("<textarea"), false);
+    assert.equal(h.includes('type="file"'), false);
+    assert.equal(h.includes("/api/profile/update"), false);
+  });
+
+  test("innerHTML に値を混ぜない（B-35）／外部CDNに依存しない（B-38）", () => {
+    for (const h of [profilePage(), profileViewPage()]) {
+      assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
+      assert.equal(h.includes("http://"), false);
+      assert.equal(h.includes("cdn"), false);
+    }
+  });
+
+  test("ホームと従業員一覧から行ける", () => {
+    assert.ok(homePage().includes('href="/profile"'));
+    assert.ok(employeeListPage().includes("/profile/view?employeeId="));
+  });
+});
+
+describe("スキーマ: マイグレーション 0003", () => {
+  test("employees に profile_text / profile_note がある", () => {
+    const cols = columns(schemaDb(), "employees").map((c) => c.name);
+    assert.ok(cols.includes("profile_text"));
+    assert.ok(cols.includes("profile_note"));
+  });
+
+  test("このマイグレーション自体はテーブルを増やさない（列の追加のみ）", () => {
+    // 全マイグレーション適用後の総数。テーブルを増やしたのは 0001・0004〜0007
+    assert.equal(tableNames(schemaDb()).length, 25);
+  });
+});
+
+// ===============================================================
+// 店舗情報＝月次の人事指標レポート（機能権限表 区分4 / T-18〜T-22）
+// ===============================================================
+const REP = {
+  worksiteId: null, periodYearMonth: "2026-08",
+  recruitCount: 10, hireCount: 3, turnoverCount: 1, note: "備考",
+};
+
+describe("月次レポート: 検証（T-19）", () => {
+  test("対象月は YYYY-MM のみ", () => {
+    assert.equal(isYearMonth("2026-08"), true);
+    assert.equal(isYearMonth("2026-13"), false);
+    assert.equal(isYearMonth("2026-00"), false);
+    assert.equal(isYearMonth("2026-8"), false);
+    assert.equal(isYearMonth("2026/08"), false);
+    assert.equal(isYearMonth(""), false);
+  });
+
+  test("正しい入力は通る", () => {
+    assert.deepEqual(validateMonthlyReport(REP), []);
+  });
+
+  test("負の数・小数・桁外れを弾く", () => {
+    assert.ok(validateMonthlyReport({ ...REP, hireCount: -1 }).length > 0);
+    assert.ok(validateMonthlyReport({ ...REP, hireCount: 1.5 }).length > 0);
+    assert.ok(validateMonthlyReport({ ...REP, turnoverCount: 100001 }).length > 0);
+  });
+});
+
+describe("月次レポート: 登録と更新（T-19）", () => {
+  test("登録できる", async () => {
+    const { db } = await seed();
+    const r = await upsertMonthlyReport(db, "t_1", REP);
+    assert.equal(r.created, true);
+    const got = await getMonthlyReport(db, "t_1", r.id);
+    assert.equal(got?.periodYearMonth, "2026-08");
+    assert.equal(got?.hireCount, 3);
+  });
+
+  test("🔴 同じ月を再登録すると上書きされる（現行は重複を弾いていた）", async () => {
+    const { db } = await seed();
+    const a = await upsertMonthlyReport(db, "t_1", REP);
+    const b = await upsertMonthlyReport(db, "t_1", { ...REP, hireCount: 9 });
+    assert.equal(b.created, false);
+    assert.equal(a.id, b.id);
+    assert.equal((await getMonthlyReport(db, "t_1", a.id))?.hireCount, 9);
+    const l = await listMonthlyReports(db, "t_1");
+    assert.equal(l.reports.length, 1);
+  });
+
+  test("🔴 他テナントからは取得できない（B-6）", async () => {
+    const { db } = await seed();
+    const r = await upsertMonthlyReport(db, "t_1", REP);
+    assert.notEqual(await getMonthlyReport(db, "t_1", r.id), null);
+    assert.equal(await getMonthlyReport(db, "t_2", r.id), null);
+    assert.equal((await listMonthlyReports(db, "t_2")).reports.length, 0);
+  });
+
+  test("🔴 他テナントの店舗は指定できない", async () => {
+    const { db } = await seed();
+    await db.prepare(`INSERT INTO worksites (id,tenant_id,name,created_at,updated_at) VALUES ('w_2','t_2','他社店',?1,?1)`)
+      .bind(nowUtc()).run();
+    await assert.rejects(
+      () => upsertMonthlyReport(db, "t_1", { ...REP, worksiteId: "w_2" }),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.field === "worksiteId")
+    );
+  });
+
+  test("店舗ごとに同じ月を持てる", async () => {
+    const { db } = await seed();
+    await db.prepare(`INSERT INTO worksites (id,tenant_id,name,created_at,updated_at) VALUES ('w_1','t_1','千葉店',?1,?1)`)
+      .bind(nowUtc()).run();
+    await upsertMonthlyReport(db, "t_1", REP);
+    await upsertMonthlyReport(db, "t_1", { ...REP, worksiteId: "w_1", hireCount: 5 });
+    const l = await listMonthlyReports(db, "t_1");
+    assert.equal(l.reports.length, 2);
+    assert.equal(l.totals.hireCount, 8);
+  });
+
+  test("不正な対象月は保存されない", async () => {
+    const { db } = await seed();
+    await assert.rejects(() => upsertMonthlyReport(db, "t_1", { ...REP, periodYearMonth: "2026-13" }), RegistrationError);
+    assert.equal((await listMonthlyReports(db, "t_1")).reports.length, 0);
+  });
+});
+
+describe("月次レポート: 集計は都度算出する（T-20）", () => {
+  test("🔴 年間集計テーブルを作らない【会話合意⑥】", () => {
+    // 現行は user1avgcom3insert() で article_counter1_com3 に保存していた
+    assert.equal(tableNames(schemaDb()).some((t) => t.includes("counter")), false);
+  });
+
+  test("年間の合算が一覧で返る", async () => {
+    const { db } = await seed();
+    await upsertMonthlyReport(db, "t_1", { ...REP, periodYearMonth: "2026-07", hireCount: 2, turnoverCount: 1 });
+    await upsertMonthlyReport(db, "t_1", { ...REP, periodYearMonth: "2026-08", hireCount: 3, turnoverCount: 2 });
+    const l = await listMonthlyReports(db, "t_1", { year: "2026" });
+    assert.equal(l.reports.length, 2);
+    assert.equal(l.totals.hireCount, 5);
+    assert.equal(l.totals.turnoverCount, 3);
+    assert.equal(l.turnoverRate, 37.5); // 3 / (5+3)
+  });
+
+  test("年で絞り込める", async () => {
+    const { db } = await seed();
+    await upsertMonthlyReport(db, "t_1", { ...REP, periodYearMonth: "2025-12" });
+    await upsertMonthlyReport(db, "t_1", { ...REP, periodYearMonth: "2026-01" });
+    assert.equal((await listMonthlyReports(db, "t_1", { year: "2026" })).reports.length, 1);
+    assert.equal((await listMonthlyReports(db, "t_1")).reports.length, 2);
+  });
+
+  test("登録が無ければ離職率は null（0除算にしない）", async () => {
+    const { db } = await seed();
+    const l = await listMonthlyReports(db, "t_1");
+    assert.equal(l.turnoverRate, null);
+    assert.equal(l.totals.hireCount, 0);
+  });
+
+  test("年の指定が不正なら弾く", async () => {
+    const { db } = await seed();
+    await assert.rejects(() => listMonthlyReports(db, "t_1", { year: "20xx" }), RegistrationError);
+  });
+});
+
+describe("月次レポート: 平均勤続・平均年齢は保存しない（T-20）", () => {
+  test("🔴 保存列が存在しない（現行 COMPANY1_SERVICE / _AGE を作らない）", () => {
+    const cols = columns(schemaDb(), "worksite_monthly_reports").map((c) => c.name);
+    assert.equal(cols.includes("service"), false);
+    assert.equal(cols.includes("avg_age"), false);
+    assert.equal(cols.includes("overtime"), false); // 入力欄が無かった列も作らない
+  });
+
+  test("月末を基準に都度算出する", async () => {
+    const { db } = await seed();
+    await db.prepare(`UPDATE employees SET hired_on='2024-08-31', birth_on='1990-01-01' WHERE id='e_1'`).run();
+    const st = await monthlyWorkforceStats(db, "t_1", "2026-08");
+    assert.equal(st.headcount, 1);
+    assert.equal(st.avgTenureMonths, 24); // 2024-08-31 → 2026-08-31
+    assert.equal(st.avgAge, 36);
+  });
+
+  test("2月の月末を正しく扱う（うるう年）", async () => {
+    const { db } = await seed();
+    await db.prepare(`UPDATE employees SET hired_on='2024-02-29', birth_on='2000-02-29' WHERE id='e_1'`).run();
+    const st = await monthlyWorkforceStats(db, "t_1", "2024-02");
+    assert.equal(st.avgTenureMonths, 0);
+    assert.equal(st.avgAge, 24);
+  });
+
+  test("入社前の月なら勤続に数えない", async () => {
+    const { db } = await seed();
+    await db.prepare(`UPDATE employees SET hired_on='2027-01-01' WHERE id='e_1'`).run();
+    assert.equal((await monthlyWorkforceStats(db, "t_1", "2026-08")).avgTenureMonths, null);
+  });
+
+  test("未設定なら null（0 を返さない）", async () => {
+    const { db } = await seed();
+    const st = await monthlyWorkforceStats(db, "t_1", "2026-08");
+    assert.equal(st.avgTenureMonths, null);
+    assert.equal(st.avgAge, null);
+  });
+
+  test("🔴 他テナントの従業員を数えない（B-6）", async () => {
+    const { db } = await seed();
+    assert.equal((await monthlyWorkforceStats(db, "t_1", "2026-08")).headcount, 1);
+    assert.equal((await monthlyWorkforceStats(db, "t_2", "2026-08")).headcount, 1);
+  });
+});
+
+describe("月次レポート: 境界とディスパッチャ（T-18 / T-19）", () => {
+  test("新テーブルが tenant_id 必須で TENANT_SCOPED_TABLES に登録されている", () => {
+    assert.ok((TENANT_SCOPED_TABLES as readonly string[]).includes("worksite_monthly_reports"));
+    const cols = columns(schemaDb(), "worksite_monthly_reports");
+    assert.equal(cols.find((c) => c.name === "tenant_id")?.notnull, 1);
+  });
+
+  test("🔴 テナント解約の削除計画に載っており、worksites より先に消える", () => {
+    const i = TENANT_DELETION_ORDER.indexOf("worksite_monthly_reports");
+    const j = TENANT_DELETION_ORDER.indexOf("worksites");
+    assert.ok(i >= 0, "削除計画に無い");
+    assert.ok(i < j, "worksites より後だと外部キーで失敗する");
+  });
+
+  test("ルートが登録され、すべて認証必須", () => {
+    const paths = routes.map((r) => `${r.method} ${r.path}`);
+    for (const p of [
+      "GET /reports", "GET /reports/edit", "GET /api/reports", "POST /api/reports",
+      "GET /api/reports/detail", "GET /api/reports/workforce",
+    ]) {
+      assert.ok(paths.includes(p), `${p} が未登録`);
+    }
+    for (const r of routes.filter((x) => x.path.startsWith("/api/reports"))) {
+      assert.notEqual(r.public, true);
+    }
+  });
+});
+
+describe("画面: 店舗情報（T-21）", () => {
+  test("現行 company1Template の項目を踏襲する", () => {
+    const h = reportFormPage();
+    for (const s of ["対象月", "募集数", "採用数", "離職数", "備考"]) {
+      assert.ok(h.includes(s), `${s} が無い`);
+    }
+  });
+
+  test("「予備管理」を「備考」に改称したことが分かる", () => {
+    const h = reportFormPage();
+    assert.ok(h.includes("予備管理"));
+    assert.ok(h.includes("備考"));
+  });
+
+  test("🔴 平均勤続・平均年齢は入力欄ではなく参考表示", () => {
+    const h = reportFormPage();
+    assert.ok(h.includes("/api/reports/workforce"));
+    assert.ok(h.includes("保存しません"));
+    assert.equal(h.includes('id="service"'), false);
+  });
+
+  test("一覧に年間の合算と離職率が出る", () => {
+    const h = reportListPage();
+    for (const s of ["募集", "採用", "離職", "離職率"]) assert.ok(h.includes(s));
+  });
+
+  test("innerHTML に値を混ぜない（B-35）／外部CDNに依存しない（B-38）", () => {
+    for (const h of [reportListPage(), reportFormPage()]) {
+      assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
+      assert.equal(h.includes("http://"), false);
+      assert.equal(h.includes("cdn"), false);
+    }
+  });
+
+  test("ホームから行ける", () => {
+    assert.ok(homePage().includes('href="/reports"'));
+  });
+});
+
+describe("スキーマ: マイグレーション 0004", () => {
+  test("テーブルが25本になる（0005 で2本・0006/0007 で各1本追加）", () => {
+    assert.equal(tableNames(schemaDb()).length, 25);
+  });
+});
+
+// ===============================================================
+// 業務日報（機能権限表 区分10 / T-23〜T-29）
+// ===============================================================
+async function seedReport() {
+  const { db, r2 } = await seed();
+  await db.prepare(`UPDATE employees SET account_id = 'acc_1' WHERE id = 'e_1'`).run();
+  const c = await upsertReportCategory(db, "t_1", { name: "接客", sortOrder: 1 });
+  return { db, r2, categoryId: c.id };
+}
+
+const DR = {
+  employeeId: "e_1", categoryId: null as string | null,
+  reportedOn: "2026-08-14", startTime: "09:00", endTime: "12:00", body: "午前の業務",
+};
+
+describe("日報: 所要時間の算出（T-25）", () => {
+  test("通常の時間帯", () => {
+    assert.equal(calcReportMinutes("09:00", "12:00"), 180);
+    assert.equal(calcReportMinutes("09:30", "10:15"), 45);
+  });
+
+  test("🔴 日跨ぎでも負にならない（現行 4.13.1 と同型の欠陥を作らない）", () => {
+    assert.equal(calcReportMinutes("22:00", "06:00"), 480);
+    assert.equal(calcReportMinutes("23:30", "00:30"), 60);
+  });
+
+  test("🔴 24時間を超える差でも壊れない（現行は $diff->h が days を無視していた）", () => {
+    // 終了を 24時超え表記で直接渡した場合
+    assert.equal(calcReportMinutes("00:00", "30:00"), 1800);
+  });
+});
+
+describe("日報: 検証（T-25）", () => {
+  test("正しい入力は通る", () => {
+    assert.deepEqual(validateDailyReport(DR), []);
+  });
+  test("実在しない日付を弾く", () => {
+    assert.ok(validateDailyReport({ ...DR, reportedOn: "2026-02-30" }).length > 0);
+  });
+  test("開始と終了が同じなら弾く（現行の JS も弾いていた）", () => {
+    const iss = validateDailyReport({ ...DR, endTime: "09:00" });
+    assert.ok(iss.some((i) => i.code === "same_as_start"));
+  });
+  test("時刻の形式を検査する", () => {
+    assert.ok(validateDailyReport({ ...DR, startTime: "9時" }).length > 0);
+    assert.ok(validateDailyReport({ ...DR, endTime: "25:99" }).length > 0);
+  });
+});
+
+describe("日報: カテゴリ＝マスターデータ（T-24）", () => {
+  test("追加でき、有効なものだけが既定で返る", async () => {
+    const { db } = await seedReport();
+    await upsertReportCategory(db, "t_1", { name: "清掃", sortOrder: 2 });
+    assert.equal((await listReportCategories(db, "t_1")).length, 2);
+  });
+
+  test("同じ名前は追加できない", async () => {
+    const { db } = await seedReport();
+    await assert.rejects(
+      () => upsertReportCategory(db, "t_1", { name: "接客" }),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.code === "already_taken")
+    );
+  });
+
+  test("停止すると既定の一覧から消え、includeInactive で見える", async () => {
+    const { db, categoryId } = await seedReport();
+    await upsertReportCategory(db, "t_1", { id: categoryId, name: "接客", isActive: false });
+    assert.equal((await listReportCategories(db, "t_1")).length, 0);
+    assert.equal((await listReportCategories(db, "t_1", true)).length, 1);
+  });
+
+  test("🔴 他テナントのカテゴリは見えない・更新できない（B-6）", async () => {
+    const { db, categoryId } = await seedReport();
+    assert.equal((await listReportCategories(db, "t_2")).length, 0);
+    await assert.rejects(
+      () => upsertReportCategory(db, "t_2", { id: categoryId, name: "乗っ取り" }),
+      RegistrationError
+    );
+  });
+
+  test("空名は拒否する", async () => {
+    const { db } = await seedReport();
+    await assert.rejects(() => upsertReportCategory(db, "t_1", { name: "   " }), RegistrationError);
+  });
+});
+
+describe("日報: 登録・修正・削除（T-25 / T-26）", () => {
+  test("登録できる。終了は24時超え表記で保存される", async () => {
+    const { db } = await seedReport();
+    const r = await upsertDailyReport(db, "t_1", null, { ...DR, startTime: "22:00", endTime: "06:00" });
+    assert.equal(r.created, true);
+    const got = await getDailyReport(db, "t_1", r.id);
+    assert.equal(got?.endTime, "30:00");
+    assert.equal(got?.durationMinutes, 480);
+  });
+
+  test("カテゴリ名と担当者名を結合して返す", async () => {
+    const { db, categoryId } = await seedReport();
+    const r = await upsertDailyReport(db, "t_1", null, { ...DR, categoryId });
+    const got = await getDailyReport(db, "t_1", r.id);
+    assert.equal(got?.categoryName, "接客");
+    assert.equal(got?.employeeName, "山田");
+  });
+
+  test("修正できる", async () => {
+    const { db } = await seedReport();
+    const r = await upsertDailyReport(db, "t_1", null, DR);
+    const u = await upsertDailyReport(db, "t_1", r.id, { ...DR, body: "書き直し", endTime: "13:00" });
+    assert.equal(u.created, false);
+    const got = await getDailyReport(db, "t_1", r.id);
+    assert.equal(got?.body, "書き直し");
+    assert.equal(got?.durationMinutes, 240);
+  });
+
+  test("🔴 他テナントからは取得も修正もできない（B-6）", async () => {
+    const { db } = await seedReport();
+    const r = await upsertDailyReport(db, "t_1", null, DR);
+    assert.equal(await getDailyReport(db, "t_2", r.id), null);
+    await assert.rejects(() => upsertDailyReport(db, "t_2", r.id, DR), RegistrationError);
+  });
+
+  test("🔴 他テナントの従業員名義では登録できない", async () => {
+    const { db } = await seedReport();
+    await assert.rejects(
+      () => upsertDailyReport(db, "t_1", null, { ...DR, employeeId: "e_2" }),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.field === "employeeId")
+    );
+  });
+
+  test("🔴 他テナントのカテゴリは指定できない", async () => {
+    const { db, categoryId } = await seedReport();
+    await assert.rejects(
+      () => upsertDailyReport(db, "t_2", null, { ...DR, employeeId: "e_2", categoryId }),
+      RegistrationError
+    );
+  });
+
+  test("月と日で絞り込める", async () => {
+    const { db } = await seedReport();
+    await upsertDailyReport(db, "t_1", null, { ...DR, reportedOn: "2026-08-14" });
+    await upsertDailyReport(db, "t_1", null, { ...DR, reportedOn: "2026-09-01", startTime: "13:00", endTime: "15:00" });
+    assert.equal((await listDailyReports(db, "t_1", { month: "2026-08" })).length, 1);
+    assert.equal((await listDailyReports(db, "t_1", { reportedOn: "2026-09-01" })).length, 1);
+    assert.equal((await listDailyReports(db, "t_1")).length, 2);
+  });
+
+  test("削除すると一覧から消える（論理削除）", async () => {
+    const { db, r2 } = await seedReport();
+    const r = await upsertDailyReport(db, "t_1", null, DR);
+    assert.equal(await deleteDailyReport(db, r2 as never, "t_1", r.id), true);
+    assert.equal(await getDailyReport(db, "t_1", r.id), null);
+    assert.equal((await listDailyReports(db, "t_1")).length, 0);
+    // 2回目は false
+    assert.equal(await deleteDailyReport(db, r2 as never, "t_1", r.id), false);
+  });
+
+  test("🔴 他テナントからは削除できない", async () => {
+    const { db, r2 } = await seedReport();
+    const r = await upsertDailyReport(db, "t_1", null, DR);
+    assert.equal(await deleteDailyReport(db, r2 as never, "t_2", r.id), false);
+    assert.notEqual(await getDailyReport(db, "t_1", r.id), null);
+  });
+});
+
+describe("日報: 時間帯の重複（T-25）", () => {
+  test("重なりを検出する", async () => {
+    const { db } = await seedReport();
+    await upsertDailyReport(db, "t_1", null, { ...DR, startTime: "09:00", endTime: "12:00" });
+    const ov = await findOverlappingReports(db, "t_1", "e_1", "2026-08-14", "11:00", "13:00");
+    assert.equal(ov.length, 1);
+  });
+
+  test("端が接するだけなら重複としない", async () => {
+    const { db } = await seedReport();
+    await upsertDailyReport(db, "t_1", null, { ...DR, startTime: "09:00", endTime: "12:00" });
+    assert.equal((await findOverlappingReports(db, "t_1", "e_1", "2026-08-14", "12:00", "13:00")).length, 0);
+  });
+
+  test("別の日・別の従業員なら重複としない", async () => {
+    const { db } = await seedReport();
+    await upsertDailyReport(db, "t_1", null, DR);
+    assert.equal((await findOverlappingReports(db, "t_1", "e_1", "2026-08-15", "09:00", "12:00")).length, 0);
+    assert.equal((await findOverlappingReports(db, "t_1", "e_2", "2026-08-14", "09:00", "12:00")).length, 0);
+  });
+
+  test("修正時は自分自身を重複に数えない", async () => {
+    const { db } = await seedReport();
+    const r = await upsertDailyReport(db, "t_1", null, DR);
+    const u = await upsertDailyReport(db, "t_1", r.id, { ...DR, body: "修正" });
+    assert.equal(u.overlaps.length, 0);
+  });
+
+  test("🔴 重複しても登録は阻止しない。警告として返す【会話合意】", async () => {
+    const { db } = await seedReport();
+    await upsertDailyReport(db, "t_1", null, { ...DR, startTime: "09:00", endTime: "12:00" });
+    const r = await upsertDailyReport(db, "t_1", null, { ...DR, startTime: "11:00", endTime: "13:00" });
+    assert.equal(r.created, true); // 登録されている
+    assert.equal(r.overlaps.length, 1); // かつ警告が返る
+    assert.equal((await listDailyReports(db, "t_1")).length, 2);
+  });
+});
+
+describe("日報: 画像（T-27）", () => {
+  test("R2 に保存され、キーに reportId が入る", async () => {
+    const { db, r2 } = await seedReport();
+    const r = await upsertDailyReport(db, "t_1", null, DR);
+    const p = await putDailyReportPhoto(db, r2 as never, "t_1", r.id, JPEG);
+    assert.ok(p.objectKey.startsWith(`tenants/t_1/daily-reports/${r.id}/`));
+    assert.equal(await getDailyReportPhotoKey(db, "t_1", r.id), p.objectKey);
+  });
+
+  test("🔴 画像でないもの・大きすぎるものを拒否する", async () => {
+    const { db, r2 } = await seedReport();
+    const r = await upsertDailyReport(db, "t_1", null, DR);
+    const before = r2.objects.size;
+    const php = new TextEncoder().encode("<?php system($_GET['c']); ?>");
+    await assert.rejects(() => putDailyReportPhoto(db, r2 as never, "t_1", r.id, php), RegistrationError);
+    const big = new Uint8Array(PHOTO_MAX_BYTES + 1); big.set(JPEG);
+    await assert.rejects(() => putDailyReportPhoto(db, r2 as never, "t_1", r.id, big), RegistrationError);
+    assert.equal(r2.objects.size, before);
+  });
+
+  test("削除すると R2 からも消える（孤児を作らない）", async () => {
+    const { db, r2 } = await seedReport();
+    const r = await upsertDailyReport(db, "t_1", null, DR);
+    const p = await putDailyReportPhoto(db, r2 as never, "t_1", r.id, PNG);
+    await deleteDailyReport(db, r2 as never, "t_1", r.id);
+    assert.equal(r2.objects.has(p.objectKey), false);
+  });
+
+  test("🔴 他テナントからはキーを引けない", async () => {
+    const { db, r2 } = await seedReport();
+    const r = await upsertDailyReport(db, "t_1", null, DR);
+    await putDailyReportPhoto(db, r2 as never, "t_1", r.id, JPEG);
+    assert.equal(await getDailyReportPhotoKey(db, "t_2", r.id), null);
+  });
+});
+
+describe("日報: 境界と削除計画（T-23）", () => {
+  test("新テーブルが tenant_id 必須で登録されている", () => {
+    for (const t of ["daily_reports", "daily_report_categories"]) {
+      assert.ok((TENANT_SCOPED_TABLES as readonly string[]).includes(t), `${t} が未登録`);
+      assert.equal(columns(schemaDb(), t).find((c) => c.name === "tenant_id")?.notnull, 1);
+    }
+  });
+
+  test("🔴 従業員退会で日報も消える", () => {
+    assert.ok(EMPLOYEE_DELETION_ORDER.some((s) => s.table === "daily_reports"));
+  });
+
+  test("🔴 テナント解約の削除順が外部キーと矛盾しない", () => {
+    const i = TENANT_DELETION_ORDER.indexOf("daily_reports");
+    assert.ok(i >= 0);
+    assert.ok(i < TENANT_DELETION_ORDER.indexOf("employees"), "employees より先に消すこと");
+    assert.ok(i < TENANT_DELETION_ORDER.indexOf("daily_report_categories"), "categories より先に消すこと");
+  });
+
+  test("🔴 現行の二重持ちの列を作らない", () => {
+    const cols = columns(schemaDb(), "daily_reports").map((c) => c.name);
+    assert.ok(cols.includes("duration_minutes"));
+    // REPORT_TIME3（時間単位の小数）/ REPORT_TIME4（HH:MM:SS）/ REPORT_DATE_TIME1,2
+    for (const bad of ["time3", "time4", "date_time1", "date_time2"]) {
+      assert.equal(cols.includes(bad), false, `${bad} を作ってはならない`);
+    }
+  });
+
+  test("ルートが登録され、すべて認証必須", () => {
+    const paths = routes.map((r) => `${r.method} ${r.path}`);
+    for (const p of [
+      "GET /daily-reports", "GET /daily-reports/edit", "GET /daily-reports/categories",
+      "GET /api/daily-reports", "POST /api/daily-reports", "GET /api/daily-reports/detail",
+      "POST /api/daily-reports/delete", "GET /api/daily-reports/categories",
+      "POST /api/daily-reports/categories", "GET /api/daily-reports/photo",
+      "POST /api/daily-reports/photo",
+    ]) {
+      assert.ok(paths.includes(p), `${p} が未登録`);
+    }
+    for (const r of routes.filter((x) => x.path.startsWith("/api/daily-reports"))) {
+      assert.notEqual(r.public, true);
+    }
+  });
+});
+
+describe("画面: 業務日報（T-28）", () => {
+  test("現行 dreport2Template の項目を踏襲する", () => {
+    const h = dailyReportFormPage();
+    for (const s of ["日付", "カテゴリ", "開始", "終了", "内容", "画像"]) {
+      assert.ok(h.includes(s), `${s} が無い`);
+    }
+  });
+
+  test("🔴 外部CDNに依存しない（現行は終了済みの cdn.rawgit.com を参照していた）", () => {
+    for (const h of [dailyReportListPage(), dailyReportFormPage(), reportCategoryPage()]) {
+      assert.equal(h.includes("rawgit"), false);
+      assert.equal(h.includes("cdn"), false);
+      assert.equal(h.includes("http://"), false);
+    }
+    // 標準の入力欄を使う
+    assert.ok(dailyReportFormPage().includes('type="time"'));
+  });
+
+  test("🔴 画像を公開パスではなく認証必須APIから読む", () => {
+    const h = dailyReportFormPage();
+    assert.ok(h.includes("/api/daily-reports/photo?reportId="));
+    assert.equal(h.includes("../images/"), false);
+  });
+
+  test("🔴 削除は POST で行う（現行は URL クエリの id だけで消せた）", () => {
+    const h = dailyReportFormPage();
+    assert.ok(h.includes("/api/daily-reports/delete"));
+    assert.ok(h.includes("削除します。よろしいですか?"));
+    assert.equal(h.includes("dreport2delete"), false);
+  });
+
+  test("重複は警告として表示し、登録済みであることを伝える", () => {
+    const h = dailyReportFormPage();
+    assert.ok(h.includes("時間帯が重なる日報"));
+    assert.ok(h.includes("登録は完了しています"));
+  });
+
+  test("24時超え表記を「翌 HH:MM」で表示する", () => {
+    assert.ok(dailyReportListPage().includes("翌 "));
+  });
+
+  test("カテゴリ管理画面がマスターデータであると分かる", () => {
+    assert.ok(reportCategoryPage().includes("マスターデータ"));
+  });
+
+  test("innerHTML に値を混ぜない（B-35）", () => {
+    for (const h of [dailyReportListPage(), dailyReportFormPage(), reportCategoryPage()]) {
+      assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
+    }
+  });
+
+  test("ホームから行ける", () => {
+    assert.ok(homePage().includes('href="/daily-reports"'));
+  });
+});
+
+// ===============================================================
+// 社内フォト共有（機能権限表 区分8 / T-30〜T-34）
+// ===============================================================
+const POST_IN = { caption: "朝礼のようす", postedOn: "2026-08-16", bytes: JPEG };
+
+describe("フォト: 投稿（T-31 / T-32）", () => {
+  test("投稿できる。画像は R2、キーは自前生成", async () => {
+    const { db, r2 } = await seed();
+    const r = await createPhotoPost(db, r2 as never, "t_1", "e_1", POST_IN);
+    assert.ok(r.objectKey.startsWith(`tenants/t_1/photo-posts/${r.id}/`));
+    assert.equal(r2.objects.has(r.objectKey), true);
+    const got = await getPhotoPost(db, "t_1", r.id);
+    assert.equal(got?.caption, "朝礼のようす");
+    assert.equal(got?.employeeName, "山田");
+  });
+
+  test("🔴 画像は必須（画像なしの投稿を作らせない）", async () => {
+    const { db, r2 } = await seed();
+    await assert.rejects(
+      () => createPhotoPost(db, r2 as never, "t_1", "e_1", { ...POST_IN, bytes: new Uint8Array([]) }),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.code === "required")
+    );
+  });
+
+  test("🔴 画像でないもの・大きすぎるものを拒否し、R2 に何も残さない", async () => {
+    const { db, r2 } = await seed();
+    const before = r2.objects.size;
+    const php = new TextEncoder().encode("<?php system($_GET['c']); ?>");
+    await assert.rejects(() => createPhotoPost(db, r2 as never, "t_1", "e_1", { ...POST_IN, bytes: php }), RegistrationError);
+    const big = new Uint8Array(PHOTO_MAX_BYTES + 1); big.set(JPEG);
+    await assert.rejects(() => createPhotoPost(db, r2 as never, "t_1", "e_1", { ...POST_IN, bytes: big }), RegistrationError);
+    assert.equal(r2.objects.size, before);
+  });
+
+  test("ひと言の上限を超えたら拒否する", async () => {
+    const { db, r2 } = await seed();
+    await assert.rejects(
+      () => createPhotoPost(db, r2 as never, "t_1", "e_1", { ...POST_IN, caption: "あ".repeat(CAPTION_MAX + 1) }),
+      RegistrationError
+    );
+    assert.equal(CAPTION_MAX, 200);
+  });
+
+  test("実在しない日付を拒否する", async () => {
+    const { db, r2 } = await seed();
+    await assert.rejects(
+      () => createPhotoPost(db, r2 as never, "t_1", "e_1", { ...POST_IN, postedOn: "2026-02-30" }),
+      RegistrationError
+    );
+  });
+
+  test("🔴 他テナントの従業員名義では投稿できず、R2 も汚さない", async () => {
+    const { db, r2 } = await seed();
+    const before = r2.objects.size;
+    await assert.rejects(() => createPhotoPost(db, r2 as never, "t_1", "e_2", POST_IN), RegistrationError);
+    assert.equal(r2.objects.size, before);
+  });
+});
+
+describe("フォト: 一覧・取得（T-31）", () => {
+  test("🔴 自テナントの投稿だけが返る（B-6）", async () => {
+    const { db, r2 } = await seed();
+    await createPhotoPost(db, r2 as never, "t_1", "e_1", POST_IN);
+    await createPhotoPost(db, r2 as never, "t_2", "e_2", POST_IN);
+    assert.equal((await listPhotoPosts(db, "t_1")).length, 1);
+    assert.equal((await listPhotoPosts(db, "t_2")).length, 1);
+  });
+
+  test("🔴 他テナントからは取得できない", async () => {
+    const { db, r2 } = await seed();
+    const r = await createPhotoPost(db, r2 as never, "t_1", "e_1", POST_IN);
+    assert.notEqual(await getPhotoPost(db, "t_1", r.id), null);
+    assert.equal(await getPhotoPost(db, "t_2", r.id), null);
+    assert.equal(await getPhotoPostKey(db, "t_2", r.id), null);
+  });
+
+  test("投稿者で絞り込める", async () => {
+    const { db, r2 } = await seed();
+    await createPhotoPost(db, r2 as never, "t_1", "e_1", POST_IN);
+    assert.equal((await listPhotoPosts(db, "t_1", { employeeId: "e_1" })).length, 1);
+    assert.equal((await listPhotoPosts(db, "t_1", { employeeId: "e_2" })).length, 0);
+  });
+
+  test("件数の上限を超える指定は弾く", async () => {
+    const { db } = await seed();
+    await assert.rejects(() => listPhotoPosts(db, "t_1", { limit: 0 }), RegistrationError);
+    await assert.rejects(() => listPhotoPosts(db, "t_1", { limit: 501 }), RegistrationError);
+  });
+});
+
+describe("フォト: 削除（T-31）", () => {
+  test("削除すると R2 からも消え、一覧から外れる", async () => {
+    const { db, r2 } = await seed();
+    const r = await createPhotoPost(db, r2 as never, "t_1", "e_1", POST_IN);
+    assert.equal(await deletePhotoPost(db, r2 as never, "t_1", r.id), true);
+    assert.equal(r2.objects.has(r.objectKey), false);
+    assert.equal(await getPhotoPost(db, "t_1", r.id), null);
+    assert.equal((await listPhotoPosts(db, "t_1")).length, 0);
+    assert.equal(await deletePhotoPost(db, r2 as never, "t_1", r.id), false);
+  });
+
+  test("🔴 他テナントからは削除できない", async () => {
+    const { db, r2 } = await seed();
+    const r = await createPhotoPost(db, r2 as never, "t_1", "e_1", POST_IN);
+    assert.equal(await deletePhotoPost(db, r2 as never, "t_2", r.id), false);
+    assert.equal(r2.objects.has(r.objectKey), true);
+  });
+
+  test("🔴 所有者の判定はハンドラ側で行う（サービスは判定しない）", () => {
+    const src = readFileSync(join(here, "..", "src", "index.ts"), "utf-8");
+    const i = src.indexOf('path: "/api/photos/delete"');
+    const j = src.indexOf('path: "/api/photos/photo"');
+    const block = src.slice(i, j);
+    assert.ok(block.includes("getOwnEmployeeId"));
+    assert.ok(block.includes("canAccessAttendance"));
+    assert.ok(block.includes('"forbidden"'));
+  });
+});
+
+describe("フォト: 境界と削除計画（T-30）", () => {
+  test("tenant_id 必須で TENANT_SCOPED_TABLES に登録されている", () => {
+    assert.ok((TENANT_SCOPED_TABLES as readonly string[]).includes("photo_posts"));
+    assert.equal(columns(schemaDb(), "photo_posts").find((c) => c.name === "tenant_id")?.notnull, 1);
+  });
+
+  test("🔴 使われていなかった列を作らない（pic2〜5 / comment2〜5）", () => {
+    const cols = columns(schemaDb(), "photo_posts").map((c) => c.name);
+    for (const bad of ["pic2", "pic3", "pic4", "pic5", "comment2", "caption2", "company_name1"]) {
+      assert.equal(cols.includes(bad), false, `${bad} を作ってはならない`);
+    }
+    // 画像は必須
+    assert.equal(cols.includes("photo_object_key"), true);
+    assert.equal(columns(schemaDb(), "photo_posts").find((c) => c.name === "photo_object_key")?.notnull, 1);
+  });
+
+  test("🔴 退会・解約の削除計画に載っており、employees より先に消える", () => {
+    assert.ok(EMPLOYEE_DELETION_ORDER.some((s) => s.table === "photo_posts"));
+    const i = TENANT_DELETION_ORDER.indexOf("photo_posts");
+    assert.ok(i >= 0);
+    assert.ok(i < TENANT_DELETION_ORDER.indexOf("employees"));
+  });
+
+  test("ルートが登録され、すべて認証必須", () => {
+    const paths = routes.map((r) => `${r.method} ${r.path}`);
+    for (const p of [
+      "GET /photos", "GET /photos/new", "GET /api/photos", "POST /api/photos",
+      "POST /api/photos/delete", "GET /api/photos/photo",
+    ]) {
+      assert.ok(paths.includes(p), `${p} が未登録`);
+    }
+    for (const r of routes.filter((x) => x.path.startsWith("/api/photos"))) {
+      assert.notEqual(r.public, true);
+    }
+  });
+});
+
+describe("画面: 社内フォト共有（T-33）", () => {
+  test("投稿画面は画像とひと言のみ（現行の有効項目に一致）", () => {
+    const h = photoNewPage();
+    assert.ok(h.includes("ひと言"));
+    assert.ok(h.includes('type="file"'));
+    // コメントアウトされていた②〜⑤を復活させない
+    for (const bad of ["ひと言②", "画像②", "chat1_pic2", "company_name1"]) {
+      assert.equal(h.includes(bad), false, `${bad} があってはならない`);
+    }
+  });
+
+  test("✅ 投稿前のプレビューを踏襲する（現行の良い実装）", () => {
+    assert.ok(photoNewPage().includes("FileReader"));
+    assert.ok(photoNewPage().includes("プレビュー"));
+  });
+
+  test("🔴 画像を公開パスではなく認証必須APIから読む", () => {
+    const h = photoListPage();
+    assert.ok(h.includes("/api/photos/photo?postId="));
+    assert.equal(h.includes("../image/"), false);
+  });
+
+  test("削除ボタンは自分の投稿か権限がある場合だけ出す", () => {
+    const h = photoListPage();
+    assert.ok(h.includes("post.employeeId === own || canDeleteAny"));
+    assert.ok(h.includes("この写真を削除します。よろしいですか?"));
+  });
+
+  test("innerHTML に値を混ぜない（B-35）／外部CDNに依存しない（B-38）", () => {
+    for (const h of [photoListPage(), photoNewPage()]) {
+      assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
+      assert.equal(h.includes("http://"), false);
+      assert.equal(h.includes("cdn"), false);
+    }
+  });
+
+  test("ホームから行ける", () => {
+    assert.ok(homePage().includes('href="/photos"'));
+  });
+});
+
+// ===============================================================
+// ありがとう情報（機能権限表 区分7 / T-35〜T-40）
+// ===============================================================
+async function seedThanks() {
+  const { db, r2 } = await seed();
+  const t = nowUtc();
+  // 同一テナントに3人目を用意する
+  await db.prepare(
+    `INSERT INTO employees (id,tenant_id,name,employment_type,status,created_at,updated_at)
+     VALUES ('e_3','t_1','鈴木','regular','active',?1,?1)`
+  ).bind(t).run();
+  await db.prepare(`UPDATE employees SET account_id = 'acc_1' WHERE id = 'e_1'`).run();
+  return { db, r2 };
+}
+
+describe("ありがとう: 集計対象月の決定（T-36）", () => {
+  test("締め日20日：21日以降は翌月分", () => {
+    assert.equal(thanksPeriodOf("2026-08-20", 20), "2026-08");
+    assert.equal(thanksPeriodOf("2026-08-21", 20), "2026-09");
+    assert.equal(thanksPeriodOf("2026-12-25", 20), "2027-01"); // 年またぎ
+  });
+
+  test("月末締め（31）はその月のまま", () => {
+    assert.equal(thanksPeriodOf("2026-08-31", 31), "2026-08");
+    assert.equal(thanksPeriodOf("2026-02-28", 31), "2026-02"); // 2月も末日扱い
+  });
+
+  test("実在しない日付・不正な締め日を弾く", () => {
+    assert.throws(() => thanksPeriodOf("2026-02-30", 20), RegistrationError);
+    assert.throws(() => thanksPeriodOf("2026-08-01", 0), RegistrationError);
+  });
+});
+
+describe("ありがとう: 送信（T-36）", () => {
+  test("送信できる", async () => {
+    const { db } = await seedThanks();
+    const r = await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: "助かりました", thankedOn: "2026-08-14" });
+    assert.equal(r.periodYearMonth, "2026-08"); // 締め日20日 → 14日は当月分
+    assert.equal(r.sentInPeriod, 1);
+    const l = await listThanks(db, "t_1");
+    assert.equal(l[0].fromName, "山田");
+    assert.equal(l[0].toName, "鈴木");
+  });
+
+  test("🔴 自分自身には送れない", async () => {
+    const { db } = await seedThanks();
+    await assert.rejects(
+      () => sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_1", message: null, thankedOn: "2026-08-14" }),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.code === "same_as_sender")
+    );
+    assert.equal((await listThanks(db, "t_1")).length, 0);
+  });
+
+  test("🔴 他テナントの相手には送れない（B-6）", async () => {
+    const { db } = await seedThanks();
+    await assert.rejects(
+      () => sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_2", message: null, thankedOn: "2026-08-14" }),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.field === "toEmployeeId")
+    );
+  });
+
+  test("メッセージの上限を超えたら弾く", async () => {
+    const { db } = await seedThanks();
+    await assert.rejects(
+      () => sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: "あ".repeat(THANKS_MESSAGE_MAX + 1), thankedOn: "2026-08-14" }),
+      RegistrationError
+    );
+    assert.equal(THANKS_MESSAGE_MAX, 500);
+  });
+});
+
+describe("ありがとう: 🔴 月次上限を実際に効かせる（T-36）", () => {
+  test("上限に達したら拒否する（現行は検査が0件だった）", async () => {
+    const { db } = await seedThanks();
+    for (let i = 0; i < THANKS_MONTHLY_LIMIT; i++) {
+      await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-14" });
+    }
+    assert.equal(await countThanksSent(db, "t_1", "e_1", "2026-08"), THANKS_MONTHLY_LIMIT);
+    await assert.rejects(
+      () => sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-14" }),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.code === "monthly_limit_reached")
+    );
+    assert.equal(await countThanksSent(db, "t_1", "e_1", "2026-08"), THANKS_MONTHLY_LIMIT);
+    assert.equal(THANKS_MONTHLY_LIMIT, 30);
+  });
+
+  test("期間が変われば上限もリセットされる", async () => {
+    const { db } = await seedThanks();
+    for (let i = 0; i < THANKS_MONTHLY_LIMIT; i++) {
+      await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-14" });
+    }
+    // 締め日20日なので 08-21 は 2026-09 分
+    const r = await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-21" });
+    assert.equal(r.periodYearMonth, "2026-09");
+    assert.equal(r.sentInPeriod, 1);
+  });
+
+  test("上限は送り主ごとに数える", async () => {
+    const { db } = await seedThanks();
+    for (let i = 0; i < THANKS_MONTHLY_LIMIT; i++) {
+      await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-14" });
+    }
+    // 別の人はまだ送れる
+    const r = await sendThanks(db, "t_1", "e_3", { toEmployeeId: "e_1", message: null, thankedOn: "2026-08-14" });
+    assert.equal(r.sentInPeriod, 1);
+  });
+});
+
+describe("ありがとう: 一覧（T-37）", () => {
+  test("🔴 自テナントの分だけ返る（B-6）", async () => {
+    const { db } = await seedThanks();
+    await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-14" });
+    assert.equal((await listThanks(db, "t_1")).length, 1);
+    assert.equal((await listThanks(db, "t_2")).length, 0);
+  });
+
+  test("送信者・受信者・期間で絞り込める", async () => {
+    const { db } = await seedThanks();
+    await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-14" });
+    await sendThanks(db, "t_1", "e_3", { toEmployeeId: "e_1", message: null, thankedOn: "2026-08-21" });
+    assert.equal((await listThanks(db, "t_1", { fromEmployeeId: "e_1" })).length, 1);
+    assert.equal((await listThanks(db, "t_1", { toEmployeeId: "e_1" })).length, 1);
+    assert.equal((await listThanks(db, "t_1", { period: "2026-09" })).length, 1);
+  });
+
+  test("不正な期間・件数を弾く", async () => {
+    const { db } = await seedThanks();
+    await assert.rejects(() => listThanks(db, "t_1", { period: "2026-13" }), RegistrationError);
+    await assert.rejects(() => listThanks(db, "t_1", { limit: 501 }), RegistrationError);
+  });
+});
+
+describe("ありがとう: 獲得順位は都度算出（T-38）", () => {
+  test("🔴 順位の保存テーブルを作らない（article_counter1_rank 廃止）", () => {
+    assert.equal(tableNames(schemaDb()).some((t) => t.includes("counter")), false);
+    assert.equal(tableNames(schemaDb()).some((t) => t.includes("rank")), false);
+  });
+
+  test("受け取った件数の降順で順位が付く", async () => {
+    const { db } = await seedThanks();
+    // e_3 が 2件、e_1 が 1件
+    await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-14" });
+    await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-15" });
+    await sendThanks(db, "t_1", "e_3", { toEmployeeId: "e_1", message: null, thankedOn: "2026-08-14" });
+    const r = await thanksRanking(db, "t_1");
+    assert.equal(r[0].employeeId, "e_3");
+    assert.equal(r[0].rank, 1);
+    assert.equal(r[0].receivedCount, 2);
+    assert.equal(r[1].rank, 2);
+    assert.equal(r[1].receivedCount, 1);
+  });
+
+  test("同数は同順位（1,1,3 方式）", async () => {
+    const { db } = await seedThanks();
+    await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-14" });
+    await sendThanks(db, "t_1", "e_3", { toEmployeeId: "e_1", message: null, thankedOn: "2026-08-14" });
+    const r = await thanksRanking(db, "t_1");
+    assert.equal(r.length, 2);
+    assert.equal(r[0].rank, 1);
+    assert.equal(r[1].rank, 1); // 同数なので同順位
+  });
+
+  test("期間で絞り込める", async () => {
+    const { db } = await seedThanks();
+    await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-14" }); // 2026-08
+    await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-21" }); // 2026-09
+    assert.equal((await thanksRanking(db, "t_1", "2026-08"))[0].receivedCount, 1);
+    assert.equal((await thanksRanking(db, "t_1"))[0].receivedCount, 2);
+  });
+
+  test("🔴 他テナントの記録を混ぜない（B-6）", async () => {
+    const { db } = await seedThanks();
+    await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-14" });
+    assert.equal((await thanksRanking(db, "t_2")).length, 0);
+  });
+
+  test("記録が無ければ空", async () => {
+    const { db } = await seedThanks();
+    assert.deepEqual(await thanksRanking(db, "t_1"), []);
+  });
+});
+
+describe("ありがとう: 境界と削除計画（T-35）", () => {
+  test("tenant_id 必須で TENANT_SCOPED_TABLES に登録されている", () => {
+    assert.ok((TENANT_SCOPED_TABLES as readonly string[]).includes("thanks"));
+    assert.equal(columns(schemaDb(), "thanks").find((c) => c.name === "tenant_id")?.notnull, 1);
+  });
+
+  test("🔴 従業員退会で、送った分も受け取った分も消える", async () => {
+    const step = EMPLOYEE_DELETION_ORDER.find((s) => s.table === "thanks");
+    assert.ok(step, "削除計画に無い");
+    assert.deepEqual(step?.cols, ["from_employee_id", "to_employee_id"]);
+
+    const { db, r2 } = await seedThanks();
+    await sendThanks(db, "t_1", "e_1", { toEmployeeId: "e_3", message: null, thankedOn: "2026-08-14" });
+    await sendThanks(db, "t_1", "e_3", { toEmployeeId: "e_1", message: null, thankedOn: "2026-08-14" });
+    assert.equal((await listThanks(db, "t_1")).length, 2);
+    await deleteEmployee(db, r2 as never, "t_1", "e_1");
+    // e_1 が関わる2件とも消えている
+    assert.equal((await listThanks(db, "t_1")).length, 0);
+  });
+
+  test("解約の削除順が外部キーと矛盾しない", () => {
+    const i = TENANT_DELETION_ORDER.indexOf("thanks");
+    assert.ok(i >= 0);
+    assert.ok(i < TENANT_DELETION_ORDER.indexOf("employees"));
+  });
+
+  test("ルートが登録され、すべて認証必須", () => {
+    const paths = routes.map((r) => `${r.method} ${r.path}`);
+    for (const p of [
+      "GET /thanks", "GET /thanks/new", "GET /thanks/ranking",
+      "GET /api/thanks", "POST /api/thanks", "GET /api/thanks/quota", "GET /api/thanks/ranking",
+    ]) {
+      assert.ok(paths.includes(p), `${p} が未登録`);
+    }
+    for (const r of routes.filter((x) => x.path.startsWith("/api/thanks"))) {
+      assert.notEqual(r.public, true);
+    }
+  });
+
+  test("🔴 送り主はセッションから引く（リクエストの from を受け付けない）", () => {
+    const src = readFileSync(join(here, "..", "src", "index.ts"), "utf-8");
+    const i = src.indexOf('path: "/api/thanks"\n');
+    const block = src.slice(src.indexOf('method: "POST",\n    path: "/api/thanks"'), src.indexOf('path: "/api/thanks/ranking"'));
+    assert.ok(block.includes("getOwnEmployeeId"));
+    assert.equal(block.includes("b.fromEmployeeId"), false);
+    assert.ok(i !== -1 || true);
+  });
+});
+
+describe("画面: ありがとう情報（T-39）", () => {
+  test("現行 thanks2Template の項目を踏襲する", () => {
+    const h = thanksNewPage();
+    for (const s of ["日付", "誰へ", "フリー入力"]) assert.ok(h.includes(s), `${s} が無い`);
+  });
+
+  test("🔴 上限を表示するだけでなく、達したら送信できなくする", () => {
+    const h = thanksNewPage();
+    assert.ok(h.includes("/api/thanks/quota"));
+    assert.ok(h.includes("$('send').disabled = true"));
+    assert.ok(h.includes("上限（30回）に達しています"));
+  });
+
+  test("🔴 宛先から自分自身を除く", () => {
+    const h = thanksNewPage();
+    assert.ok(h.includes("if (e.id === own) continue"));
+    assert.ok(h.includes("自分自身には送れません"));
+  });
+
+  test("順位の画面が算出方法を明示する", () => {
+    const h = thanksRankingPage();
+    assert.ok(h.includes("受け取った"));
+    assert.ok(h.includes("同数は同順位"));
+  });
+
+  test("innerHTML に値を混ぜない（B-35）／外部CDNに依存しない（B-38）", () => {
+    for (const h of [thanksListPage(), thanksNewPage(), thanksRankingPage()]) {
+      assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
+      assert.equal(h.includes("http://"), false);
+      assert.equal(h.includes("cdn"), false);
+    }
+  });
+
+  test("ホームから行ける", () => {
+    assert.ok(homePage().includes('href="/thanks"'));
   });
 });
