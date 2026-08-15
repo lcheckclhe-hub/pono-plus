@@ -2002,3 +2002,28 @@ describe("画面: 導線（T-9）", () => {
     }
   });
 });
+
+describe("画面: 勤怠評価の表示欠陥（F-6 / F-7 の回帰）", () => {
+  test("🔴 F-6: 出勤率を二重に百分率化しない", async () => {
+    // services 側が既に百分率を返す（下の実測で固定）。画面で 100 倍すると 10000% になる
+    const { db } = await seed();
+    await db.prepare(
+      `INSERT INTO shifts (id,tenant_id,employee_id,worked_on,clock_in,clock_out,break_minutes,overtime_minutes,worked_minutes,is_absent,created_at,updated_at)
+       VALUES ('sh_ab','t_1','e_1','2026-08-15',NULL,NULL,0,0,0,1,?1,?1)`
+    ).bind(nowUtc()).run();
+    const r = await evaluateAttendance(db, "t_1", {
+      employeeId: "e_1", yearMonth: "2026-08", cutoffDay: 20, asOf: "2026-08-21",
+    });
+    assert.equal(r.attendanceRate, 50); // 1 / (1+1)。0.5 ではない
+
+    const h = attendancePage();
+    assert.equal(h.includes("attendanceRate * 1000"), false);
+    assert.ok(h.includes("r.attendanceRate + ' %'"));
+  });
+
+  test("🔴 F-7: カードの枠を子セレクタで当てる（入れ子の div に二重に付かない）", () => {
+    const h = attendancePage();
+    assert.ok(h.includes(".kpi > div"));
+    assert.equal(/[^>]\s\.kpi div \{/.test(h), false);
+  });
+});
