@@ -33,8 +33,9 @@ import {
   EMPLOYMENT_TYPE_BY_LEGACY, GENDER_BY_LEGACY, SHIFT_GROUP_BY_LEGACY,
 } from "../src/services.ts";
 import { worker, routes } from "../src/index.ts";
-import { bootstrapSetup, evaluateAttendance, ageOn, persistAttendanceSummary } from "../src/services.ts";
-import { upsertShift, summarizePeriod, ShiftServiceError, setShiftConfirmation, isPeriodConfirmed, periodForDate } from "../src/services.ts";
+import { loginPage, shiftSheetPage } from "../src/pages.ts";
+import { bootstrapSetup, evaluateAttendance, ageOn, persistAttendanceSummary, getShiftSheet } from "../src/services.ts";
+import { upsertShift, summarizePeriod, ShiftServiceError, setUrgentCheck, hasUrgentCheck, periodForDate } from "../src/services.ts";
 import type { Principal } from "../src/core.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -219,16 +220,16 @@ describe("shift: 締め日期間（設計書 4.13.2）", () => {
 describe("shift: 区分別集計（B-1・設計書 4.13.3）", () => {
   test("区分1が合計と同値にならない（現行バグの再発検知）", () => {
     const rows = [
-      { shiftTypeCode: "A" }, { shiftTypeCode: "A" }, { shiftTypeCode: "B" },
-      { shiftTypeCode: "C" }, { shiftTypeCode: null },
+      { shiftTypeCode: "1" }, { shiftTypeCode: "1" }, { shiftTypeCode: "2" },
+      { shiftTypeCode: "3" }, { shiftTypeCode: null },
     ];
-    const r = countByShiftType(rows, ["A", "B", "C", "D"]);
+    const r = countByShiftType(rows, ["1", "2", "3", "4"]);
     assert.equal(r.total, 5);
-    assert.equal(r.byCode.A, 2);
-    assert.equal(r.byCode.B, 1);
-    assert.equal(r.byCode.C, 1);
-    assert.equal(r.byCode.D, 0);
-    assert.notEqual(r.byCode.A, r.total, "区分Aの件数が合計と同値になってはならない（B-1）");
+    assert.equal(r.byCode["1"], 2);
+    assert.equal(r.byCode["2"], 1);
+    assert.equal(r.byCode["3"], 1);
+    assert.equal(r.byCode["4"], 0);
+    assert.notEqual(r.byCode["1"], r.total, "区分Aの件数が合計と同値になってはならない（B-1）");
   });
 
   test("eachDate は期間の日を過不足なく列挙する", () => {
@@ -358,7 +359,8 @@ async function seed(): Promise<{ db: AnyDb; r2: ShimR2 }> {
     await r2.put(`photos/${eid}.jpg`, "dummy");
   }
 
-  await db.prepare(`INSERT INTO shift_types (id,tenant_id,code,name,sort_order,created_at,updated_at) VALUES ('st_a1','t_1','A','Aグループ',1,?1,?1)`).bind(t).run();
+  // 現行 tb_m_cate1 の CATE1_REMARKS1..21 に相当。code は 1〜21 の数値
+  await db.prepare(`INSERT INTO shift_types (id,tenant_id,code,name,sort_order,created_at,updated_at) VALUES ('st_a1','t_1','1','早番',1,?1,?1)`).bind(t).run();
   await db.prepare(
     `INSERT INTO shifts (id,tenant_id,employee_id,worked_on,shift_type_id,clock_in,clock_out,break_minutes,overtime_minutes,worked_minutes,created_at,updated_at)
      VALUES ('sh_1','t_1','e_1','2026-08-14','st_a1','09:00','18:00',60,0,480,?1,?1)`
@@ -755,11 +757,12 @@ describe("登録: 実際に登録できる", () => {
     await assert.rejects(() => registerEmployee(db, "t_1", BASE_REG, TODAY), RegistrationError);
   });
 
-  test("別テナントなら同じIDを使える（テナント単位のUNIQUE）", async () => {
+  test("🔴 別テナントでも同じIDは使えない（会話合意 2026-08-15）", async () => {
+    // 現行のログイン画面は ID と PW のみで会社を選ばせないため
+    // （loginuser2/3Template.php で実証）、IDが重複すると会社を特定できない
     const { db } = await seed();
     await registerEmployee(db, "t_1", BASE_REG, TODAY);
-    const r = await registerEmployee(db, "t_2", BASE_REG, TODAY);
-    assert.ok(r.accountId.length > 0);
+    await assert.rejects(() => registerEmployee(db, "t_2", BASE_REG, TODAY), RegistrationError);
   });
 
   test("パスワードはDBのどこにも平文で残らない（設計書 6.2.1）", async () => {
@@ -858,7 +861,9 @@ describe("ディスパッチャ: 認証の一元化（B-5/B-29・設計書 4.2/5
     //    現行は各 Action に認証を個別実装しており、shift3updateAction では
     //    認証失敗時の遷移が丸ごと欠落していた（B-5・設計書 4.13.6）。
     const publicRoutes = routes.filter((r) => r.public === true).map((r) => r.path).sort();
-    assert.deepEqual(publicRoutes, ["/api/login", "/api/setup", "/healthz"]);
+    // 画面（/ /login /home）は認証前に配信する必要がある。
+    // /home は HTML を返すだけで、中身のデータは /api/me（認証必須）から取る
+    assert.deepEqual(publicRoutes, ["/", "/api/login", "/api/setup", "/healthz", "/home", "/login", "/shifts"]);
   });
 
   test("ログインAPIが動作し、Cookie が HttpOnly / Secure / SameSite=Strict で発行される", async () => {
@@ -963,7 +968,7 @@ describe("シフト: 4本を1本に集約した登録処理", () => {
     const r = await upsertShift(db, "t_1", {
       employeeId: "e_1", workedOn: "2026-08-20", shiftTypeId: "st_a1",
       clockIn: "09:00", clockOut: "18:00", breakMinutes: 60, overtimeMinutes: 30,
-      isAbsent: false, isLate: false, isEarlyLeave: false, note: null, worksiteId: null,
+      isAbsent: false, isLate: false, isEarlyLeave: false, note: null, dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
     }, "2026-08-15");
     assert.equal(r.workedMinutes, 510);
     const row = await db.prepare(`SELECT * FROM shifts WHERE id = ?1`).bind(r.shiftId).first();
@@ -975,7 +980,7 @@ describe("シフト: 4本を1本に集約した登録処理", () => {
     const r = await upsertShift(db, "t_1", {
       employeeId: "e_1", workedOn: "2026-08-21", shiftTypeId: null,
       clockIn: "22:00", clockOut: "06:00", breakMinutes: 60, overtimeMinutes: 0,
-      isAbsent: false, isLate: false, isEarlyLeave: false, note: null, worksiteId: null,
+      isAbsent: false, isLate: false, isEarlyLeave: false, note: null, dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
     }, "2026-08-15");
     assert.equal(r.workedMinutes, 420);
     const row = await db.prepare(`SELECT clock_out FROM shifts WHERE id = ?1`).bind(r.shiftId).first();
@@ -987,7 +992,7 @@ describe("シフト: 4本を1本に集約した登録処理", () => {
     const base = {
       employeeId: "e_1", workedOn: "2026-08-22", shiftTypeId: "st_a1",
       clockIn: "09:00", clockOut: "17:00", breakMinutes: 60, overtimeMinutes: 0,
-      isAbsent: false, isLate: false, isEarlyLeave: false, note: null, worksiteId: null,
+      isAbsent: false, isLate: false, isEarlyLeave: false, note: null, dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
     };
     const a = await upsertShift(db, "t_1", base, "2026-08-22");
     const b = await upsertShift(db, "t_1", { ...base, clockOut: "20:00" }, "2026-08-22");
@@ -1003,7 +1008,7 @@ describe("シフト: 4本を1本に集約した登録処理", () => {
       () => upsertShift(db, "t_1", {
         employeeId: "e_2", workedOn: "2026-08-20", shiftTypeId: null,
         clockIn: "09:00", clockOut: "18:00", breakMinutes: 0, overtimeMinutes: 0,
-        isAbsent: false, isLate: false, isEarlyLeave: false, note: null, worksiteId: null,
+        isAbsent: false, isLate: false, isEarlyLeave: false, note: null, dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
       }, "2026-08-15"),
       ShiftServiceError
     );
@@ -1011,12 +1016,12 @@ describe("シフト: 4本を1本に集約した登録処理", () => {
 
   test("他テナントの勤務区分は指定できない", async () => {
     const { db } = await seed();
-    await db.prepare(`INSERT INTO shift_types (id,tenant_id,code,name,sort_order,created_at,updated_at) VALUES ('st_b1','t_2','A','Aグループ',1,?1,?1)`).bind(nowUtc()).run();
+    await db.prepare(`INSERT INTO shift_types (id,tenant_id,code,name,sort_order,created_at,updated_at) VALUES ('st_b1','t_2','1','早番',1,?1,?1)`).bind(nowUtc()).run();
     await assert.rejects(
       () => upsertShift(db, "t_1", {
         employeeId: "e_1", workedOn: "2026-08-23", shiftTypeId: "st_b1",
         clockIn: "09:00", clockOut: "18:00", breakMinutes: 0, overtimeMinutes: 0,
-        isAbsent: false, isLate: false, isEarlyLeave: false, note: null, worksiteId: null,
+        isAbsent: false, isLate: false, isEarlyLeave: false, note: null, dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
       }, "2026-08-15"),
       ShiftServiceError
     );
@@ -1027,7 +1032,7 @@ describe("シフト: 4本を1本に集約した登録処理", () => {
     const r = await upsertShift(db, "t_1", {
       employeeId: "e_1", workedOn: "2026-08-24", shiftTypeId: null,
       clockIn: null, clockOut: null, breakMinutes: 0, overtimeMinutes: 0,
-      isAbsent: true, isLate: false, isEarlyLeave: false, note: "私用", worksiteId: null,
+      isAbsent: true, isLate: false, isEarlyLeave: false, note: "私用", dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
     }, "2026-08-15");
     assert.equal(r.workedMinutes, 0);
   });
@@ -1036,23 +1041,23 @@ describe("シフト: 4本を1本に集約した登録処理", () => {
 describe("シフト: 締め日基準の集計（集計テーブルを持たない）", () => {
   test("🔴 B-1: 区分別の件数が合計と同値にならない", async () => {
     const { db } = await seed();
-    await db.prepare(`INSERT INTO shift_types (id,tenant_id,code,name,sort_order,created_at,updated_at) VALUES ('st_b','t_1','B','Bグループ',2,?1,?1)`).bind(nowUtc()).run();
+    await db.prepare(`INSERT INTO shift_types (id,tenant_id,code,name,sort_order,created_at,updated_at) VALUES ('st_b','t_1','2','遅番',2,?1,?1)`).bind(nowUtc()).run();
     // 締め日20日 → 2026-08 の期間は 2026-07-21〜2026-08-20
     for (const [d, st] of [["2026-07-25","st_a1"],["2026-08-01","st_a1"],["2026-08-05","st_b"]] as const) {
       await upsertShift(db, "t_1", {
         employeeId: "e_1", workedOn: d, shiftTypeId: st,
         clockIn: "09:00", clockOut: "18:00", breakMinutes: 60, overtimeMinutes: 0,
-        isAbsent: false, isLate: false, isEarlyLeave: false, note: null, worksiteId: null,
+        isAbsent: false, isLate: false, isEarlyLeave: false, note: null, dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
       }, "2026-08-15");
     }
     const sum = await summarizePeriod(db, "t_1", "e_1", "2026-08", 20);
     assert.equal(sum.periodStartOn, "2026-07-21");
     assert.equal(sum.periodEndOn, "2026-08-20");
     // seed の 2026-08-14（st_a1）も期間内に含まれるため A は 3 件
-    assert.equal(sum.byShiftType.A, 3);
-    assert.equal(sum.byShiftType.B, 1);
+    assert.equal(sum.byShiftType["1"], 3);
+    assert.equal(sum.byShiftType["2"], 1);
     assert.equal(sum.workDays, 4);
-    assert.notEqual(sum.byShiftType.A, sum.workDays, "区分Aの件数が合計と同値になってはならない（B-1）");
+    assert.notEqual(sum.byShiftType["1"], sum.workDays, "区分Aの件数が合計と同値になってはならない（B-1）");
   });
 
   test("締め日の期間外のシフトは集計に含まれない", async () => {
@@ -1060,7 +1065,7 @@ describe("シフト: 締め日基準の集計（集計テーブルを持たな�
     await upsertShift(db, "t_1", {
       employeeId: "e_1", workedOn: "2026-08-25", shiftTypeId: "st_a1",
       clockIn: "09:00", clockOut: "18:00", breakMinutes: 60, overtimeMinutes: 0,
-      isAbsent: false, isLate: false, isEarlyLeave: false, note: null, worksiteId: null,
+      isAbsent: false, isLate: false, isEarlyLeave: false, note: null, dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
     }, "2026-08-15");
     const sum = await summarizePeriod(db, "t_1", "e_1", "2026-08", 20);
     assert.equal(sum.workDays, 1, "8/25 は次の締め期間なので含まれない（seed の 8/14 のみ）");
@@ -1071,12 +1076,12 @@ describe("シフト: 締め日基準の集計（集計テーブルを持たな�
     await upsertShift(db, "t_1", {
       employeeId: "e_1", workedOn: "2026-08-03", shiftTypeId: null,
       clockIn: "10:00", clockOut: "18:00", breakMinutes: 60, overtimeMinutes: 0,
-      isAbsent: false, isLate: true, isEarlyLeave: false, note: null, worksiteId: null,
+      isAbsent: false, isLate: true, isEarlyLeave: false, note: null, dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
     }, "2026-08-15");
     await upsertShift(db, "t_1", {
       employeeId: "e_1", workedOn: "2026-08-04", shiftTypeId: null,
       clockIn: null, clockOut: null, breakMinutes: 0, overtimeMinutes: 0,
-      isAbsent: true, isLate: false, isEarlyLeave: false, note: null, worksiteId: null,
+      isAbsent: true, isLate: false, isEarlyLeave: false, note: null, dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
     }, "2026-08-15");
     const sum = await summarizePeriod(db, "t_1", "e_1", "2026-08", 20);
     assert.equal(sum.lateCount, 1);
@@ -1084,40 +1089,91 @@ describe("シフト: 締め日基準の集計（集計テーブルを持たな�
   });
 });
 
-describe("シフト確定フラグ（現行 user1flg1shift1insert 相当・照合報告 5.1）", () => {
-  test("確定すると締め期間の開始日で記録される", async () => {
+describe("期間単位の緊急確認（現行 shift1_r1_flg1・shift1Template.php で意味を訂正）", () => {
+  test("緊急確認を立てると締め期間の開始日で記録される", async () => {
     const { db } = await seed();
-    const r = await setShiftConfirmation(db, "t_1", "e_1", "2026-08", 20, true, "acc_1");
+    const r = await setUrgentCheck(db, "t_1", "e_1", "2026-08", 20, true, "acc_1");
     assert.equal(r.periodStartOn, "2026-07-21");
-    assert.equal(r.isConfirmed, true);
-    assert.equal(await isPeriodConfirmed(db, "t_1", "e_1", "2026-07-21"), true);
+    assert.equal(r.needsUrgentCheck, true);
+    assert.equal(await hasUrgentCheck(db, "t_1", "e_1", "2026-07-21"), true);
   });
 
-  test("確定を解除できる", async () => {
+  test("解除できる", async () => {
     const { db } = await seed();
-    await setShiftConfirmation(db, "t_1", "e_1", "2026-08", 20, true, "acc_1");
-    await setShiftConfirmation(db, "t_1", "e_1", "2026-08", 20, false, "acc_1");
-    assert.equal(await isPeriodConfirmed(db, "t_1", "e_1", "2026-07-21"), false);
+    await setUrgentCheck(db, "t_1", "e_1", "2026-08", 20, true, "acc_1");
+    await setUrgentCheck(db, "t_1", "e_1", "2026-08", 20, false, "acc_1");
+    assert.equal(await hasUrgentCheck(db, "t_1", "e_1", "2026-07-21"), false);
   });
 
-  test("同じ期間を二重に確定しても行が増えない", async () => {
+  test("二重に立てても行が増えない", async () => {
     const { db } = await seed();
-    await setShiftConfirmation(db, "t_1", "e_1", "2026-08", 20, true, "acc_1");
-    await setShiftConfirmation(db, "t_1", "e_1", "2026-08", 20, true, "acc_1");
-    const n = await db.prepare(`SELECT COUNT(*) AS n FROM shift_confirmations`).first();
+    await setUrgentCheck(db, "t_1", "e_1", "2026-08", 20, true, "acc_1");
+    await setUrgentCheck(db, "t_1", "e_1", "2026-08", 20, true, "acc_1");
+    const n = await db.prepare(`SELECT COUNT(*) AS n FROM shift_period_flags`).first();
     assert.equal(n.n, 1);
   });
 
-  test("他テナントの従業員は確定できない（B-6）", async () => {
+  test("他テナントの従業員には立てられない（B-6）", async () => {
     const { db } = await seed();
-    await assert.rejects(() => setShiftConfirmation(db, "t_1", "e_2", "2026-08", 20, true, "acc_1"), ShiftServiceError);
+    await assert.rejects(() => setUrgentCheck(db, "t_1", "e_2", "2026-08", 20, true, "acc_1"), ShiftServiceError);
   });
 
-  test("確定情報は退会時に削除される", async () => {
+  test("退会時に削除される", async () => {
     const { db, r2 } = await seed();
-    await setShiftConfirmation(db, "t_1", "e_1", "2026-08", 20, true, "acc_1");
+    await setUrgentCheck(db, "t_1", "e_1", "2026-08", 20, true, "acc_1");
     const res = await deleteEmployee(db, r2 as never, "t_1", "e_1");
-    assert.equal(res.deleted.shift_confirmations, 1);
+    assert.equal(res.deleted.shift_period_flags, 1);
+  });
+});
+
+describe("日ごとの確定・当日確認（現行 shift_s_id / shift_flg2 を実証）", () => {
+  const base = {
+    employeeId: "e_1", workedOn: "2026-08-25", shiftTypeId: null,
+    clockIn: "09:00", clockOut: "18:00", breakMinutes: 60, overtimeMinutes: 0,
+    isAbsent: false, isLate: false, isEarlyLeave: false,
+    note: null, dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
+  };
+
+  test("日ごとの確定が保存される（現行 shift_s_id）", async () => {
+    const { db } = await seed();
+    const r = await upsertShift(db, "t_1", { ...base, isConfirmed: true }, "2026-08-25");
+    const row = await db.prepare(`SELECT is_confirmed FROM shifts WHERE id = ?1`).bind(r.shiftId).first();
+    assert.equal(row.is_confirmed, 1);
+  });
+
+  test("当日確認と2種類の備考が保存される（現行 shift_flg2 / remarks1 / flg8）", async () => {
+    const { db } = await seed();
+    const r = await upsertShift(db, "t_1", {
+      ...base, isDayLocked: true, note: "予定側メモ", dayNote: "実績側メモ",
+    }, "2026-08-25");
+    const row = await db.prepare(`SELECT is_day_locked, note, day_note FROM shifts WHERE id = ?1`).bind(r.shiftId).first();
+    assert.equal(row.is_day_locked, 1);
+    assert.equal(row.note, "予定側メモ");
+    assert.equal(row.day_note, "実績側メモ");
+  });
+});
+
+describe("勤務時間帯は最大21種（現行 tb_m_cate1 の CATE1_REMARKS1..21 を実証）", () => {
+  test("code 1〜21 が登録できる", async () => {
+    const db = new ShimD1(SCHEMA) as AnyDb;
+    const t = nowUtc();
+    await db.prepare(`INSERT INTO tenants (id,name,cutoff_day,timezone,status,created_at,updated_at) VALUES ('t_x','X社',20,'Asia/Tokyo','active',?1,?1)`).bind(t).run();
+    for (let i = 1; i <= 21; i++) {
+      await db.prepare(
+        `INSERT INTO shift_types (id,tenant_id,code,name,sort_order,created_at,updated_at) VALUES (?1,'t_x',?2,?3,?4,?5,?5)`
+      ).bind(`st_${i}`, String(i), `区分${i}`, i, t).run();
+    }
+    const n = await db.prepare(`SELECT COUNT(*) AS n FROM shift_types WHERE tenant_id='t_x'`).first();
+    assert.equal(n.n, 21);
+  });
+
+  test("🔴 22以上は拒否される（現行の上限は21）", async () => {
+    const db = new ShimD1(SCHEMA) as AnyDb;
+    const t = nowUtc();
+    await db.prepare(`INSERT INTO tenants (id,name,cutoff_day,timezone,status,created_at,updated_at) VALUES ('t_x','X社',20,'Asia/Tokyo','active',?1,?1)`).bind(t).run();
+    await assert.rejects(async () =>
+      db.prepare(`INSERT INTO shift_types (id,tenant_id,code,name,sort_order,created_at,updated_at) VALUES ('st_22','t_x','22','区分22',22,?1,?1)`).bind(t).run()
+    );
   });
 });
 
@@ -1166,7 +1222,7 @@ describe("締め済み期間への登録拒否（現行 shift23update のチェ�
   const shiftOn = (workedOn: string) => ({
     employeeId: "e_1", workedOn, shiftTypeId: null,
     clockIn: "09:00", clockOut: "18:00", breakMinutes: 60, overtimeMinutes: 0,
-    isAbsent: false, isLate: false, isEarlyLeave: false, note: null, worksiteId: null,
+    isAbsent: false, isLate: false, isEarlyLeave: false, note: null, dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
   });
 
   test("締めが終わった期間には登録できない", async () => {
@@ -1225,7 +1281,7 @@ describe("初期セットアップ（設計の欠落として検出・2026-08-15
     const r = await bootstrapSetup(db, "secret-token", "secret-token", INPUT);
     assert.equal(r.ok, true);
     const st = await db.prepare(`SELECT COUNT(*) AS n FROM shift_types`).first();
-    assert.equal(st.n, 4, "A〜Dの4件が作られる");
+    assert.equal(st.n, 4, "初期の勤務時間帯が4件作られる");
     const ar = await db.prepare(`SELECT r.code FROM account_roles ar JOIN roles r ON r.id=ar.role_id`).first();
     assert.equal(ar.code, "tenant_admin");
   });
@@ -1282,7 +1338,7 @@ describe("勤怠評価（WBS ブロック8・設計書 5.1 優先5）", () => {
     const base = {
       employeeId: "e_1", shiftTypeId: "st_a1", clockIn: "09:00", clockOut: "18:00",
       breakMinutes: 60, overtimeMinutes: 0, isAbsent: false, isLate: false,
-      isEarlyLeave: false, note: null, worksiteId: null,
+      isEarlyLeave: false, note: null, dayNote: null, isConfirmed: false, isDayLocked: false, worksiteId: null,
     };
     // 締め日20日 → 2026-09 の期間は 2026-08-21〜2026-09-20
     await upsertShift(db, "t_1", { ...base, workedOn: "2026-08-25" }, "2026-08-25");
@@ -1362,5 +1418,163 @@ describe("勤怠評価（WBS ブロック8・設計書 5.1 優先5）", () => {
     const row = await db.prepare(`SELECT * FROM attendance_summaries WHERE id = ?1`).bind(a.id).first();
     assert.equal(row.work_days, 3);
     assert.equal(row.absence_count, 1);
+  });
+});
+
+describe("ログイン: 会社を指定しない（現行画面は ID と PW のみ）", () => {
+  test("tenantId を省略してもログインIDから会社が特定される", async () => {
+    const { db } = await seed();
+    const r = await login(db, { loginId: "admin1", password: "Pono-Plus-2026!", tenantId: null, ip: null, userAgent: null });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    assert.equal(r.tenantId, "t_1", "ログインIDから会社が解決される");
+  });
+
+  test("別会社のアカウントも同様に解決される", async () => {
+    const { db } = await seed();
+    const r = await login(db, { loginId: "admin2", password: "Pono-Plus-2026!", tenantId: null, ip: null, userAgent: null });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    assert.equal(r.tenantId, "t_2");
+  });
+
+  test("存在しないIDは会社不明でも invalid_credentials（存在を漏らさない）", async () => {
+    const { db } = await seed();
+    const r = await login(db, { loginId: "nobody", password: "x", tenantId: null, ip: null, userAgent: null });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.reason, "invalid_credentials");
+  });
+
+  test("🔴 IDが複数社に重複していたら、推測せず会社の選択を求める", async () => {
+    const { db } = await seed();
+    // 既存データを直接いじって重複を作る（通常は登録時に拒否される）
+    const t = nowUtc();
+    await db.prepare(
+      `INSERT INTO accounts (id,tenant_id,login_id,password_hash,password_algo,password_updated_at,status,created_at,updated_at)
+       VALUES ('acc_dup','t_2','admin1','$scrypt$N=16384,r=8,p=5$aa$bb','x',?1,'active',?1,?1)`
+    ).bind(t).run();
+
+    const r = await login(db, { loginId: "admin1", password: "Pono-Plus-2026!", tenantId: null, ip: null, userAgent: null });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.reason, "tenant_required");
+    if (r.reason !== "tenant_required") return;
+    assert.equal(r.tenants.length, 2, "候補の会社が返る");
+  });
+
+  test("重複時でも tenantId を指定すればログインできる", async () => {
+    const { db } = await seed();
+    const t = nowUtc();
+    await db.prepare(
+      `INSERT INTO accounts (id,tenant_id,login_id,password_hash,password_algo,password_updated_at,status,created_at,updated_at)
+       VALUES ('acc_dup','t_2','admin1','$scrypt$N=16384,r=8,p=5$aa$bb','x',?1,'active',?1,?1)`
+    ).bind(t).run();
+    const r = await login(db, { loginId: "admin1", password: "Pono-Plus-2026!", tenantId: "t_1", ip: null, userAgent: null });
+    assert.equal(r.ok, true);
+  });
+});
+
+describe("画面（現行 loginuser*Template.php の構造を踏襲）", () => {
+  test("ログイン画面が HTML で返る", async () => {
+    const { db, r2 } = await seed();
+    const res = await worker.fetch(req("GET", "/login"), { DB: db, PHOTOS: r2 } as never, execCtx);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("Content-Type") ?? "", /text\/html/);
+    const body = await res.text();
+    assert.ok(body.includes('name="login_id"'), "ID の入力欄がある");
+    assert.ok(body.includes('type="password"'), "パスワードがマスクされる");
+    assert.ok(body.includes("ログイン"), "送信ボタンがある");
+  });
+
+  test("🔴 会社の入力欄は既定で表示しない（現行は ID と PW のみ）", () => {
+    const body = loginPage();
+    assert.ok(body.includes('id="tenant_row"'), "重複時用の欄は存在する");
+    assert.ok(/id="tenant_row"[^>]*hidden/.test(body), "既定では hidden");
+  });
+
+  test("🔴 B-35: 入力値を埋め戻す際にエスケープされる（現行は未エスケープ）", () => {
+    const body = loginPage({ loginId: '"><script>alert(1)</script>' });
+    assert.equal(body.includes("<script>alert(1)</script>"), false, "スクリプトがそのまま入ってはならない");
+    assert.ok(body.includes("&lt;script&gt;"), "エスケープされている");
+  });
+
+  test("🔴 B-36: エラーメッセージもエスケープされる（現行は HTML 直挿入）", () => {
+    const body = loginPage({ errorMessage: '<img src=x onerror=alert(1)>' });
+    assert.equal(body.includes("<img src=x"), false);
+    assert.ok(body.includes("&lt;img"));
+  });
+
+  test("🔴 B-38: jQuery などの外部CDNに依存しない（現行は 2014年版を読み込み）", () => {
+    const body = loginPage();
+    assert.equal(/<script[^>]+src=/.test(body), false, "外部スクリプトの読み込みが無い");
+  });
+
+  test("セキュリティヘッダが付く", async () => {
+    const { db, r2 } = await seed();
+    const res = await worker.fetch(req("GET", "/login"), { DB: db, PHOTOS: r2 } as never, execCtx);
+    assert.equal(res.headers.get("X-Content-Type-Options"), "nosniff");
+    assert.equal(res.headers.get("X-Frame-Options"), "DENY");
+  });
+});
+
+describe("シフト入力画面（現行 shift1Template.php の列構成を踏襲）", () => {
+  test("締め期間の全日が行として返る（登録の無い日も空行）", async () => {
+    const { db } = await seed();
+    const sheet = await getShiftSheet(db, "t_1", "e_1", "2026-09", 20);
+    assert.equal(sheet.periodStartOn, "2026-08-21");
+    assert.equal(sheet.periodEndOn, "2026-09-20");
+    assert.equal(sheet.rows.length, 31, "8/21〜9/20 の31日分");
+    assert.equal(sheet.rows[0].day, 21);
+    assert.equal(sheet.rows[0].weekday.length, 1, "曜日が1文字で入る");
+  });
+
+  test("登録済みの日には値が入り、実働も返る", async () => {
+    const { db } = await seed();
+    await upsertShift(db, "t_1", {
+      employeeId: "e_1", workedOn: "2026-08-25", shiftTypeId: "st_a1",
+      clockIn: "22:00", clockOut: "06:00", breakMinutes: 60, overtimeMinutes: 0,
+      isAbsent: false, isLate: false, isEarlyLeave: false,
+      note: "夜勤", dayNote: null, isConfirmed: true, isDayLocked: false, worksiteId: null,
+    }, "2026-08-25");
+    const sheet = await getShiftSheet(db, "t_1", "e_1", "2026-09", 20);
+    const row = sheet.rows.find((r) => r.workedOn === "2026-08-25");
+    assert.equal(row?.workedMinutes, 420, "日跨ぎ420分");
+    assert.equal(row?.clockOut, "30:00", "24時超え表記で保持");
+    assert.equal(row?.isConfirmed, true);
+    assert.equal(row?.note, "夜勤");
+    assert.equal(sheet.totalWorkedMinutes, 420);
+  });
+
+  test("勤務時間帯の選択肢が返る", async () => {
+    const { db } = await seed();
+    const sheet = await getShiftSheet(db, "t_1", "e_1", "2026-09", 20);
+    assert.ok(sheet.shiftTypes.length >= 1);
+    assert.equal(sheet.shiftTypes[0].code, "1");
+  });
+
+  test("緊急確認の状態が返る", async () => {
+    const { db } = await seed();
+    await setUrgentCheck(db, "t_1", "e_1", "2026-09", 20, true, "acc_1");
+    const sheet = await getShiftSheet(db, "t_1", "e_1", "2026-09", 20);
+    assert.equal(sheet.needsUrgentCheck, true);
+  });
+
+  test("🔴 他テナントの従業員のシートは取得できない（B-6）", async () => {
+    const { db } = await seed();
+    await assert.rejects(() => getShiftSheet(db, "t_1", "e_2", "2026-09", 20), ShiftServiceError);
+  });
+
+  test("🔴 B-39: 外部CDN（rawgit 等）に依存しない", () => {
+    const body = shiftSheetPage();
+    assert.equal(/<script[^>]+src=/.test(body), false);
+    assert.equal(body.includes("rawgit"), false);
+  });
+
+  test("画面に現行と同じ列が並ぶ", () => {
+    const body = shiftSheetPage();
+    for (const col of ["確定", "時間帯", "フリー入力", "当日確認", "出勤", "退勤", "休憩", "残業", "実働", "当日フリー"]) {
+      assert.ok(body.includes(col), `列「${col}」がある`);
+    }
   });
 });
