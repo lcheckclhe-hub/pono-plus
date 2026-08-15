@@ -302,6 +302,11 @@ export const TENANT_SCOPED_TABLES = [
   "shifts",
   "shift_period_flags",
   "attendance_summaries",
+  "worksite_monthly_reports",
+  "daily_report_categories",
+  "daily_reports",
+  "photo_posts",
+  "thanks",
 ] as const;
 
 export type TenantScopedTable = (typeof TENANT_SCOPED_TABLES)[number];
