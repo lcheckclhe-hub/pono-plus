@@ -41,7 +41,7 @@ src/index.ts               ディスパッチャ（ルート表・認証・CSRF�
 src/core.ts                基盤：日時 / パスワード(scrypt) / 認可(is_hr_line) / データアクセス
 src/services.ts            業務：シフト計算 / 認証 / 従業員 / 勤怠評価 / 退会・解約削除
 src/pages.ts               画面：ログイン / ホーム / シフト / 従業員 / 勤怠評価 / プロフィール / 店舗情報 / 業務日報
-test/all.test.ts           単体 + 統合 + ディスパッチャ + 画面 + スキーマ検査（358件）
+test/all.test.ts           単体 + 統合 + ディスパッチャ + 画面 + スキーマ検査（364件）
 ```
 
 `package-lock.json` は置かない。`package.json` で依存バージョンを**完全固定**しているため、
@@ -50,7 +50,7 @@ lock ファイルが無くても `npm install` で同じ版が入る。
 ## コマンド
 
 ```bash
-npm run check      # 型チェック + テスト358件（これだけ通せばよい）
+npm run check      # 型チェック + テスト364件（これだけ通せばよい）
 npm test
 npm run typecheck
 ```
@@ -103,7 +103,7 @@ wrangler login          # ブラウザで Cloudflare アカウントを認証
 ```bash
 cd pono-plus
 npm install
-npm run check           # 型チェック + テスト358件。ここが通らないなら先に進まない
+npm run check           # 型チェック + テスト364件。ここが通らないなら先に進まない
 ```
 
 ---
