@@ -11,7 +11,7 @@
  *   ハンドラ側で認証を書き忘れても、ここを通らなければ実行されない。
  */
 import { AuthzError, nowUtc, toJstCalendarDate, sha256Hex, canAccessAttendance } from "./core.ts";
-import { loginPage, homePage, shiftSheetPage, employeeListPage, employeeFormPage } from "./pages.ts";
+import { loginPage, homePage, shiftSheetPage, employeeListPage, employeeFormPage, attendancePage } from "./pages.ts";
 import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet, listEmployees, getEmployee, updateEmployee, listShiftTypes } from "./services.ts";
 import type { Principal } from "./core.ts";
 
@@ -65,6 +65,7 @@ export const routes: RouteDef[] = [
   { method: "GET", path: "/shifts", public: true, handler: async () => html(shiftSheetPage()) },
   { method: "GET", path: "/employees", public: true, handler: async () => html(employeeListPage()) },
   { method: "GET", path: "/employees/new", public: true, handler: async () => html(employeeFormPage()) },
+  { method: "GET", path: "/attendance", public: true, handler: async () => html(attendancePage()) },
   {
     // 設定の反映状況を確認できるようにする。⚠ 値そのものは絶対に返さない
     method: "GET",
