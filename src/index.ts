@@ -112,6 +112,7 @@ export const routes: RouteDef[] = [
         adminLoginId: String(b.adminLoginId ?? ""),
         adminPassword: String(b.adminPassword ?? ""),
         adminEmail: (b.adminEmail as string | null) ?? null,
+        adminName: (b.adminName as string | null) ?? undefined,
       });
       if (!r.ok) {
         const status = r.reason === "already_initialized" ? 409 : r.reason === "invalid_input" ? 422 : 403;
