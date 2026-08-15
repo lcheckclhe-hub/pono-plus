@@ -6,16 +6,18 @@
     "test": "node --experimental-strip-types --test test/all.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
-    "migrate:dev": "wrangler d1 migrations apply pono-plus-dev --env dev",
-    "deploy:dev": "wrangler deploy --env dev"
+    "migrate": "wrangler d1 migrations apply pono-plus-dev",
+    "deploy": "wrangler deploy"
   },
+  "comment2": "⚠ wrangler の --env は付けない。wrangler.toml をトップレベル構成にしているため（GitHub 連携の既定デプロイが --env を付けないことへの対応・2026-08-15 実機で確認）。--env dev を付けると D1/R2 のバインドが読まれない",
   "comment": "バージョンは意図的に完全固定。package-lock.json を持ち運ばなくても再現できるようにするため。@noble/hashes は純JS実装であり、Cloudflare Workers が実行時WASMコンパイルを禁止しているため WASM 版は使えない（2026-08-15 実機で確認）",
   "dependencies": {
     "@noble/hashes": "1.8.0"
   },
   "devDependencies": {
-    "typescript": "7.0.2",
+    "@cloudflare/workers-types": "5.20260814.1",
     "@types/node": "26.2.0",
-    "@cloudflare/workers-types": "5.20260814.1"
+    "esbuild": "^0.25.0",
+    "typescript": "7.0.2"
   }
 }
