@@ -1,0 +1,53 @@
+name = "pono-plus"
+main = "src/index.ts"
+compatibility_date = "2026-08-14"
+compatibility_flags = ["nodejs_compat"]
+
+# ⚠ Workers Free の CPU 制限では Argon2id（実測56ms）が通らない。
+#    Paid 前提であることは改修設計書 5.5⑥ と PoC-F 報告書 6章③ で確認済み。
+
+# ------------------------------------------------------------------
+# dev / staging には現行の実データを投入しない。
+# .sql は要配慮個人情報（ストレスチェック92件）と平文パスワード201件を含む
+# （改修設計書 3.2）。検証用データはダミーで生成する。
+# ------------------------------------------------------------------
+
+[env.dev]
+[[env.dev.d1_databases]]
+binding = "DB"
+database_name = "pono-plus-dev"
+database_id = "REPLACE_ME"
+migrations_dir = "migrations"
+
+[[env.dev.r2_buckets]]
+binding = "PHOTOS"
+bucket_name = "pono-plus-photos-dev"
+
+[env.staging]
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "pono-plus-staging"
+database_id = "REPLACE_ME"
+migrations_dir = "migrations"
+
+[[env.staging.r2_buckets]]
+binding = "PHOTOS"
+bucket_name = "pono-plus-photos-staging"
+
+[env.production]
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "pono-plus-prod"
+database_id = "REPLACE_ME"
+migrations_dir = "migrations"
+
+[[env.production.r2_buckets]]
+binding = "PHOTOS"
+bucket_name = "pono-plus-photos-prod"
+
+[observability]
+enabled = true
+
+# ⚠ ログに個人データ・SQL 全文を出さないこと。
+#    現行は debug.log（1.28GB）を公開ディレクトリに置き、SQL 全文と
+#    従業員ID・会社IDを追記していた（改修設計書 6.1）。
