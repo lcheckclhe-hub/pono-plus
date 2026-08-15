@@ -42,9 +42,11 @@ import {
   createPhotoPost, listPhotoPosts, getPhotoPost, getPhotoPostKey, deletePhotoPost, CAPTION_MAX,
   sendThanks, listThanks, thanksRanking, countThanksSent, thanksPeriodOf,
   THANKS_MONTHLY_LIMIT, THANKS_MESSAGE_MAX,
+  upsertSkillSheet, getSkillSheet, listSkillSheetsByYear, suggestSkillCounts,
+  redactForEmployee, validateSkillSheet, SKILL_COMMENT_MAX,
 } from "../src/services.ts";
 import { worker, routes } from "../src/index.ts";
-import { loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage } from "../src/pages.ts";
+import { loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage } from "../src/pages.ts";
 import { bootstrapSetup, evaluateAttendance, ageOn, persistAttendanceSummary, getShiftSheet } from "../src/services.ts";
 import { upsertShift, summarizePeriod, ShiftServiceError, setUrgentCheck, hasUrgentCheck, periodForDate } from "../src/services.ts";
 import type { Principal } from "../src/core.ts";
@@ -602,20 +604,21 @@ function columns(db: DatabaseSync, table: string): Array<{ name: string; type: s
 }
 
 describe("スキーマ: 設計原則の検査（CIで守る不変条件）", () => {
-  test("マイグレーションが実行でき、テーブル25本・インデックス25本になる", () => {
+  test("マイグレーションが実行でき、テーブル26本・インデックス27本になる", () => {
     // 🔴 この数を変えるときは、意図した追加か必ず確認すること。
     //    0001: テーブル20 / インデックス16
     //    0004: worksite_monthly_reports を追加（テーブル21 / インデックス17）
     //    0005: daily_report_categories + daily_reports を追加（テーブル23 / インデックス20）
     //    0006: photo_posts を追加（テーブル24 / インデックス22）
     //    0007: thanks を追加（テーブル25 / インデックス25）
+    //    0008: skill_sheets を追加（テーブル26 / インデックス27）
     //    0002・0003 は列の追加のみ
     const db = schemaDb();
-    assert.equal(tableNames(db).length, 25);
+    assert.equal(tableNames(db).length, 26);
     const idx = db.prepare(
       "select count(*) as n from sqlite_master where type='index' and name not like 'sqlite_%'"
     ).get() as { n: number };
-    assert.equal(idx.n, 25);
+    assert.equal(idx.n, 27);
   });
 
   test("業務テーブルは tenant_id NOT NULL（B-6・スキーマ 2.5）", () => {
@@ -902,6 +905,7 @@ describe("ディスパッチャ: 認証の一元化（B-5/B-29・設計書 4.2/5
       "/healthz", "/home", "/login", "/photos", "/photos/new",
       "/profile", "/profile/view",
       "/reports", "/reports/edit", "/shifts",
+      "/skill-sheets", "/skill-sheets/edit",
       "/thanks", "/thanks/new", "/thanks/ranking",
     ]);
   });
@@ -1960,8 +1964,8 @@ describe("スキーマ: マイグレーション 0002", () => {
   });
 
   test("このマイグレーション自体はテーブルを増やさない（列の追加のみ）", () => {
-    // 全マイグレーション適用後の総数。テーブルを増やしたのは 0001・0004〜0007
-    assert.equal(tableNames(schemaDb()).length, 25);
+    // 全マイグレーション適用後の総数。テーブルを増やしたのは 0001・0004〜0008
+    assert.equal(tableNames(schemaDb()).length, 26);
   });
 });
 
@@ -2310,8 +2314,8 @@ describe("スキーマ: マイグレーション 0003", () => {
   });
 
   test("このマイグレーション自体はテーブルを増やさない（列の追加のみ）", () => {
-    // 全マイグレーション適用後の総数。テーブルを増やしたのは 0001・0004〜0007
-    assert.equal(tableNames(schemaDb()).length, 25);
+    // 全マイグレーション適用後の総数。テーブルを増やしたのは 0001・0004〜0008
+    assert.equal(tableNames(schemaDb()).length, 26);
   });
 });
 
@@ -2552,8 +2556,8 @@ describe("画面: 店舗情報（T-21）", () => {
 });
 
 describe("スキーマ: マイグレーション 0004", () => {
-  test("テーブルが25本になる（0005 で2本・0006/0007 で各1本追加）", () => {
-    assert.equal(tableNames(schemaDb()).length, 25);
+  test("テーブルが26本になる（0005 で2本・0006〜0008 で各1本追加）", () => {
+    assert.equal(tableNames(schemaDb()).length, 26);
   });
 });
 
@@ -3431,5 +3435,261 @@ describe("F-9: ファイルを選び直したらエラー表示を消す", () =>
     const h = profilePage();
     assert.ok(h.includes("res.status === 404"));
     assert.ok(h.includes("従業員の登録がない"));
+  });
+});
+
+// ===============================================================
+// スキルシート（機能権限表 区分9 / T-41〜T-46）
+// ===============================================================
+const SK = {
+  employeeId: "e_1", periodYearMonth: "2026-08",
+  lateCount: 2, earlyLeaveCount: 1, absenceCount: 0, overtimeCount: 3,
+  comment: "接客の対応が丁寧", commentVisibleToEmployee: false,
+};
+
+describe("スキルシート: 検証（T-42）", () => {
+  test("正しい入力は通る", () => {
+    assert.deepEqual(validateSkillSheet(SK), []);
+  });
+  test("負の数・小数・桁外れ・不正な月を弾く", () => {
+    assert.ok(validateSkillSheet({ ...SK, lateCount: -1 }).length > 0);
+    assert.ok(validateSkillSheet({ ...SK, absenceCount: 1.5 }).length > 0);
+    assert.ok(validateSkillSheet({ ...SK, overtimeCount: 1001 }).length > 0);
+    assert.ok(validateSkillSheet({ ...SK, periodYearMonth: "2026-13" }).length > 0);
+  });
+  test("業務内容の上限", () => {
+    assert.ok(validateSkillSheet({ ...SK, comment: "あ".repeat(SKILL_COMMENT_MAX + 1) }).length > 0);
+    assert.equal(SKILL_COMMENT_MAX, 2000);
+  });
+});
+
+describe("スキルシート: 🔴 本人に見せない項目（T-44）", () => {
+  test("残業数は必ず落とす（現行のマスタ③画面に列が無い）", () => {
+    const s = { ...SK, id: "x", employeeName: "山田", overtimeCount: 3 } as never;
+    assert.equal(redactForEmployee(s).overtimeCount, null);
+  });
+
+  test("🔴 非公開の業務内容は落とす", () => {
+    const closed = { ...SK, id: "x", employeeName: "山田", commentVisibleToEmployee: false } as never;
+    assert.equal(redactForEmployee(closed).comment, null);
+  });
+
+  test("公開された業務内容は残す", () => {
+    const open = { ...SK, id: "x", employeeName: "山田", commentVisibleToEmployee: true } as never;
+    assert.equal(redactForEmployee(open).comment, "接客の対応が丁寧");
+  });
+
+  test("既定は非公開（安全側）", async () => {
+    const { db } = await seed();
+    await upsertSkillSheet(db, "t_1", { ...SK, commentVisibleToEmployee: false });
+    const s = await getSkillSheet(db, "t_1", "e_1", "2026-08");
+    assert.equal(s?.commentVisibleToEmployee, false);
+    const row = await db.prepare(`SELECT comment_visible_to_employee AS v FROM skill_sheets`).first();
+    assert.equal(row.v, 0);
+  });
+
+  test("🔴 一覧APIが本人向けに項目を落としている（ハンドラの実装を固定）", () => {
+    const src = readFileSync(join(here, "..", "src", "index.ts"), "utf-8");
+    const i = src.indexOf('path: "/api/skill-sheets"');
+    const j = src.indexOf('path: "/api/skill-sheets/detail"');
+    const block = src.slice(i, j);
+    assert.ok(block.includes("redactForEmployee"));
+    assert.ok(block.includes("canAccessAttendance"));
+  });
+
+  test("🔴 単票APIは管理側のみ（業務内容の原文と公開設定を含む）", () => {
+    const src = readFileSync(join(here, "..", "src", "index.ts"), "utf-8");
+    const i = src.indexOf('path: "/api/skill-sheets/detail"');
+    const block = src.slice(i, i + 600);
+    assert.ok(block.includes("canAccessAttendance"));
+    assert.ok(block.includes('"forbidden"'));
+  });
+});
+
+describe("スキルシート: 登録と一覧（T-42 / T-43）", () => {
+  test("登録・上書きできる", async () => {
+    const { db } = await seed();
+    const a = await upsertSkillSheet(db, "t_1", SK);
+    assert.equal(a.created, true);
+    const b = await upsertSkillSheet(db, "t_1", { ...SK, lateCount: 5 });
+    assert.equal(b.created, false);
+    assert.equal(a.id, b.id);
+    assert.equal((await getSkillSheet(db, "t_1", "e_1", "2026-08"))?.lateCount, 5);
+  });
+
+  test("🔴 他テナントの従業員には登録できない（B-6）", async () => {
+    const { db } = await seed();
+    await assert.rejects(
+      () => upsertSkillSheet(db, "t_1", { ...SK, employeeId: "e_2" }),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.field === "employeeId")
+    );
+  });
+
+  test("🔴 他テナントからは取得できない", async () => {
+    const { db } = await seed();
+    await upsertSkillSheet(db, "t_1", SK);
+    assert.notEqual(await getSkillSheet(db, "t_1", "e_1", "2026-08"), null);
+    assert.equal(await getSkillSheet(db, "t_2", "e_1", "2026-08"), null);
+    assert.equal((await listSkillSheetsByYear(db, "t_2", "e_1", "2026")).length, 0);
+  });
+
+  test("年度の月別一覧が月順に返る", async () => {
+    const { db } = await seed();
+    await upsertSkillSheet(db, "t_1", { ...SK, periodYearMonth: "2026-09" });
+    await upsertSkillSheet(db, "t_1", { ...SK, periodYearMonth: "2026-07" });
+    await upsertSkillSheet(db, "t_1", { ...SK, periodYearMonth: "2025-12" });
+    const rows = await listSkillSheetsByYear(db, "t_1", "e_1", "2026");
+    assert.deepEqual(rows.map((r) => r.periodYearMonth), ["2026-07", "2026-09"]);
+  });
+
+  test("不正な年度を弾く", async () => {
+    const { db } = await seed();
+    await assert.rejects(() => listSkillSheetsByYear(db, "t_1", "e_1", "20xx"), RegistrationError);
+  });
+});
+
+describe("スキルシート: 出勤数とありがとう数は都度算出（T-43）", () => {
+  test("🔴 保存列を作らない", () => {
+    const cols = columns(schemaDb(), "skill_sheets").map((c) => c.name);
+    for (const bad of ["work_days", "thanks_count", "age", "skill_age"]) {
+      assert.equal(cols.includes(bad), false, `${bad} を作ってはならない`);
+    }
+  });
+
+  test("シフトとありがとうから算出される", async () => {
+    const { db } = await seed();
+    await db.prepare(`UPDATE employees SET account_id = 'acc_1' WHERE id = 'e_1'`).run();
+    await db.prepare(
+      `INSERT INTO employees (id,tenant_id,name,employment_type,status,created_at,updated_at)
+       VALUES ('e_3','t_1','鈴木','regular','active',?1,?1)`
+    ).bind(nowUtc()).run();
+    // seed のシフト 'sh_1' は 2026-08-14・欠勤でない
+    await upsertSkillSheet(db, "t_1", SK);
+    await sendThanks(db, "t_1", "e_3", { toEmployeeId: "e_1", message: null, thankedOn: "2026-08-14" });
+    const rows = await listSkillSheetsByYear(db, "t_1", "e_1", "2026");
+    assert.equal(rows[0].workDays, 1);
+    assert.equal(rows[0].thanksCount, 1);
+  });
+
+  test("記録が無い月は 0 になる（null にしない）", async () => {
+    const { db } = await seed();
+    await upsertSkillSheet(db, "t_1", { ...SK, periodYearMonth: "2026-03" });
+    const rows = await listSkillSheetsByYear(db, "t_1", "e_1", "2026");
+    assert.equal(rows[0].workDays, 0);
+    assert.equal(rows[0].thanksCount, 0);
+  });
+});
+
+describe("スキルシート: 入力の初期値はシフトから提示（T-42）", () => {
+  test("実績を数えて返す。保存はしない", async () => {
+    const { db } = await seed();
+    const t = nowUtc();
+    await db.prepare(
+      `INSERT INTO shifts (id,tenant_id,employee_id,worked_on,clock_in,clock_out,break_minutes,overtime_minutes,worked_minutes,is_late,is_early_leave,is_absent,created_at,updated_at)
+       VALUES ('sh_l','t_1','e_1','2026-08-20','09:10','18:00',60,30,470,1,0,0,?1,?1)`
+    ).bind(t).run();
+    await db.prepare(
+      `INSERT INTO shifts (id,tenant_id,employee_id,worked_on,clock_in,clock_out,break_minutes,overtime_minutes,worked_minutes,is_late,is_early_leave,is_absent,created_at,updated_at)
+       VALUES ('sh_a','t_1','e_1','2026-08-21',NULL,NULL,0,0,0,0,0,1,?1,?1)`
+    ).bind(t).run();
+    const g = await suggestSkillCounts(db, "t_1", "e_1", "2026-08");
+    assert.equal(g.lateCount, 1);
+    assert.equal(g.absenceCount, 1);
+    assert.equal(g.overtimeCount, 1);
+    assert.equal(g.workDays, 2); // sh_1 と sh_l（sh_a は欠勤）
+    // 提示しただけで保存されていない
+    assert.equal(await getSkillSheet(db, "t_1", "e_1", "2026-08"), null);
+  });
+
+  test("🔴 他テナントの実績を数えない（B-6）", async () => {
+    const { db } = await seed();
+    assert.equal((await suggestSkillCounts(db, "t_2", "e_1", "2026-08")).workDays, 0);
+  });
+
+  test("不正な月を弾く", async () => {
+    const { db } = await seed();
+    await assert.rejects(() => suggestSkillCounts(db, "t_1", "e_1", "2026-13"), RegistrationError);
+  });
+
+  test("🔴 手で上書きできる（提示値と保存値は別）", async () => {
+    const { db } = await seed();
+    // システムは遅刻0だが、管理者が1と記録する
+    const g = await suggestSkillCounts(db, "t_1", "e_1", "2026-08");
+    assert.equal(g.lateCount, 0);
+    await upsertSkillSheet(db, "t_1", { ...SK, lateCount: 1 });
+    assert.equal((await getSkillSheet(db, "t_1", "e_1", "2026-08"))?.lateCount, 1);
+  });
+});
+
+describe("スキルシート: 境界と削除計画（T-41）", () => {
+  test("tenant_id 必須で TENANT_SCOPED_TABLES に登録されている", () => {
+    assert.ok((TENANT_SCOPED_TABLES as readonly string[]).includes("skill_sheets"));
+    assert.equal(columns(schemaDb(), "skill_sheets").find((c) => c.name === "tenant_id")?.notnull, 1);
+  });
+
+  test("退会・解約の削除計画に載っている", () => {
+    assert.ok(EMPLOYEE_DELETION_ORDER.some((s) => s.table === "skill_sheets"));
+    const i = TENANT_DELETION_ORDER.indexOf("skill_sheets");
+    assert.ok(i >= 0);
+    assert.ok(i < TENANT_DELETION_ORDER.indexOf("employees"));
+  });
+
+  test("ルートが登録され、すべて認証必須", () => {
+    const paths = routes.map((r) => `${r.method} ${r.path}`);
+    for (const p of [
+      "GET /skill-sheets", "GET /skill-sheets/edit",
+      "GET /api/skill-sheets", "GET /api/skill-sheets/detail", "POST /api/skill-sheets",
+    ]) {
+      assert.ok(paths.includes(p), `${p} が未登録`);
+    }
+    for (const r of routes.filter((x) => x.path.startsWith("/api/skill-sheets"))) {
+      assert.notEqual(r.public, true);
+    }
+  });
+});
+
+describe("画面: スキルシート（T-45）", () => {
+  test("現行 user3skill2Template の列を踏襲する", () => {
+    const h = skillSheetPage();
+    for (const s of ["対象月", "出勤数", "遅刻数", "早退数", "当欠数", "ありがとう数", "業務内容"]) {
+      assert.ok(h.includes(s), `${s} が無い`);
+    }
+  });
+
+  test("🔴 残業数の列は管理側のときだけ出す", () => {
+    const h = skillSheetPage();
+    assert.ok(h.includes("if (d.canEdit) cols.push('残業数')"));
+    assert.ok(h.includes("残業数は本人には表示されません"));
+  });
+
+  test("🔴 公開/非公開の切り替えがあり、既定は非公開", () => {
+    const h = skillSheetFormPage();
+    assert.ok(h.includes("この業務内容を本人にも表示する"));
+    assert.ok(h.includes("既定は非公開"));
+    assert.ok(h.includes("$('visible').checked = false"));
+  });
+
+  test("シフトの実績を提示し、上書きできると分かる", () => {
+    const h = skillSheetFormPage();
+    assert.ok(h.includes("シフトの実績"));
+    assert.ok(h.includes("/api/skill-sheets/detail"));
+  });
+
+  test("innerHTML に値を混ぜない（B-35）／外部CDNに依存しない（B-38）", () => {
+    for (const h of [skillSheetPage(), skillSheetFormPage()]) {
+      assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
+      assert.equal(h.includes("http://"), false);
+      assert.equal(h.includes("cdn"), false);
+    }
+  });
+
+  test("🔴 平文パスワードを表示しない（現行 user2skillTemplate の SU2_REM1）", () => {
+    for (const h of [skillSheetPage(), skillSheetFormPage()]) {
+      assert.equal(/REM1|パスワード/.test(h), false);
+    }
+  });
+
+  test("ホームから行ける", () => {
+    assert.ok(homePage().includes('href="/skill-sheets"'));
   });
 });
