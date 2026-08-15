@@ -16,7 +16,7 @@ compatibility_flags = ["nodejs_compat"]
 [[env.dev.d1_databases]]
 binding = "DB"
 database_name = "pono-plus-dev"
-database_id = "d65519b4-cf84-4ddf-91bb-e32c976d921a"
+database_id = "REPLACE_ME"
 migrations_dir = "migrations"
 
 [[env.dev.r2_buckets]]
