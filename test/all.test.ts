@@ -34,7 +34,7 @@ import {
   listEmployees, getEmployee, updateEmployee, listShiftTypes, EMPLOYEE_STATUSES,
 } from "../src/services.ts";
 import { worker, routes } from "../src/index.ts";
-import { loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage } from "../src/pages.ts";
+import { loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage } from "../src/pages.ts";
 import { bootstrapSetup, evaluateAttendance, ageOn, persistAttendanceSummary, getShiftSheet } from "../src/services.ts";
 import { upsertShift, summarizePeriod, ShiftServiceError, setUrgentCheck, hasUrgentCheck, periodForDate } from "../src/services.ts";
 import type { Principal } from "../src/core.ts";
@@ -879,7 +879,7 @@ describe("ディスパッチャ: 認証の一元化（B-5/B-29・設計書 4.2/5
     // /employees /employees/new も同様に HTML の配信のみ。データは
     // /api/employees・/api/employees/detail・/api/shift-types（すべて認証必須）から取る
     assert.deepEqual(publicRoutes, [
-      "/", "/api/login", "/api/setup", "/employees", "/employees/new",
+      "/", "/api/login", "/api/setup", "/attendance", "/employees", "/employees/new",
       "/healthz", "/home", "/login", "/shifts",
     ]);
   });
@@ -1939,5 +1939,66 @@ describe("スキーマ: マイグレーション 0002", () => {
 
   test("テーブル数は増えていない（列の追加のみ）", () => {
     assert.equal(tableNames(schemaDb()).length, 20);
+  });
+});
+
+// ===============================================================
+// 勤怠評価の表示画面・画面間の導線（Session 04 / T-9 / T-10）
+// ===============================================================
+describe("画面: 勤怠評価（T-10）", () => {
+  test("ルートが登録され、既定で認証必須の API から取る", () => {
+    assert.ok(routes.some((r) => r.method === "GET" && r.path === "/attendance"));
+    const h = attendancePage();
+    assert.ok(h.includes("/api/attendance/evaluation"));
+    assert.ok(h.includes("/api/employees?status=active"));
+  });
+
+  test("実績値の項目が並ぶ", () => {
+    const h = attendancePage();
+    for (const s of ["出勤日数", "実働", "残業", "遅刻", "早退", "欠勤", "出勤率", "勤続", "年齢"]) {
+      assert.ok(h.includes(s), `${s} が無い`);
+    }
+  });
+
+  test("🔴 点数化は実装していないことを画面に明示する【未確認】", () => {
+    // 現行の評価系 Action / Template が未受領。推測で点数式を作らない
+    assert.ok(attendancePage().includes("点数化のルールは未確認"));
+  });
+
+  test("🔴 締め日基準の期間を画面に明示する（yearMonth との食い違いを防ぐ）", () => {
+    assert.ok(attendancePage().includes("締め日基準"));
+  });
+
+  test("勤続・年齢・出勤率が null のとき理由を出す", () => {
+    const h = attendancePage();
+    assert.ok(h.includes("入社日が未登録"));
+    assert.ok(h.includes("生年月日が未登録"));
+    assert.ok(h.includes("登録なし"));
+  });
+
+  test("innerHTML に値を混ぜない（B-35）／外部CDNに依存しない（B-38）", () => {
+    const h = attendancePage();
+    assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
+    assert.equal(h.includes("http://"), false);
+    assert.equal(h.includes("cdn"), false);
+  });
+});
+
+describe("画面: 導線（T-9）", () => {
+  test("ホームから3画面へ行ける", () => {
+    const h = homePage();
+    for (const p of ['href="/employees"', 'href="/shifts"', 'href="/attendance"']) {
+      assert.ok(h.includes(p), `${p} が無い`);
+    }
+  });
+
+  test("従業員一覧から勤怠評価へ行ける", () => {
+    assert.ok(employeeListPage().includes("/attendance?employeeId="));
+  });
+
+  test("各画面からホームへ戻れる", () => {
+    for (const h of [employeeListPage(), employeeFormPage(), attendancePage()]) {
+      assert.ok(h.includes('href="/home"'));
+    }
   });
 });
