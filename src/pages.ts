@@ -172,12 +172,30 @@ export function homePage(): string {
     color: #2f6fbf; text-decoration: none; font-size: 15px; font-weight: 600; background: #fff;
   }
   .nav a:hover { background: #f2f6fb; border-color: #2f6fbf; }
+  .notice { border: 1px solid #e4e9ee; border-radius: 8px; padding: 14px; margin-bottom: 18px; background: #fff; }
+  .notice h2 { font-size: 14px; color: #6b7885; margin: 0 0 8px; }
+  .notice .msg { font-size: 15px; color: #23303a; white-space: pre-wrap; word-break: break-word; }
+  .notice iframe { width: 100%; aspect-ratio: 16 / 9; border: 0; border-radius: 6px; margin-top: 10px; }
+  .notice ul { list-style: none; padding: 0; margin: 10px 0 0; }
+  .notice li { margin-bottom: 6px; font-size: 14px; }
+  .notice li a { color: #2f6fbf; }
+  .notice img { width: 100%; border-radius: 6px; margin-top: 10px; display: block; }
+  .acts { list-style: none; padding: 0; margin: 0; font-size: 13px; }
+  .acts li { padding: 6px 0; border-bottom: 1px solid #eef1f4; color: #46535f; }
+  .acts .t { color: #6b7885; font-size: 12px; }
+  .editlink { font-size: 13px; margin-top: 10px; }
+  .editlink a { color: #2f6fbf; }
 </style>
 </head>
 <body>
 <div class="login">
   <h1>PONO-PLUS</h1>
   <div class="box">
+    <div class="notice" id="notice" style="display:none">
+      <h2>お知らせ</h2>
+      <div id="noticebody"></div>
+      <p class="editlink" id="noticeedit" style="display:none"><a href="/notices/edit">トップ表示を編集する</a></p>
+    </div>
     <table id="me"><tbody><tr><td colspan="2">読み込み中…</td></tr></tbody></table>
     <nav class="nav">
       <a href="/employees">従業員一覧</a>
@@ -189,7 +207,12 @@ export function homePage(): string {
       <a href="/photos">社内フォト共有</a>
       <a href="/thanks">ありがとう情報</a>
       <a href="/skill-sheets">スキルシート</a>
+      <a href="/support">サポート</a>
     </nav>
+    <div class="notice" style="margin-top:20px">
+      <h2>更新履歴</h2>
+      <ul class="acts" id="acts"><li>読み込み中…</li></ul>
+    </div>
     <div class="logout"><button id="out">ログアウト</button></div>
   </div>
   <p class="note">段階1（基盤・認証・シフト・勤怠評価）まで実装済み</p>
@@ -208,6 +231,86 @@ document.getElementById('out').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST', headers: { 'Origin': location.origin } });
   location.href = '/login';
 });
+
+// --- トップ表示（区分1）---
+(async () => {
+  const res = await fetch('/api/notices');
+  if (!res.ok) return;
+  const d = await res.json();
+  const n = d.notice;
+  const box = document.getElementById('noticebody');
+  box.replaceChildren();
+  let any = false;
+  if (n.message !== null && n.message !== '') {
+    const p = document.createElement('div');
+    p.className = 'msg';
+    p.textContent = n.message;
+    box.appendChild(p);
+    any = true;
+  }
+  if (n.embedUrl !== null) {
+    // 🔴 埋め込みURLはサーバーが動画IDから組み立てたもの。利用者のHTMLは使わない
+    const f = document.createElement('iframe');
+    f.src = n.embedUrl;
+    f.allowFullscreen = true;
+    f.referrerPolicy = 'strict-origin-when-cross-origin';
+    box.appendChild(f);
+    any = true;
+  }
+  if (n.links.length > 0) {
+    const ul = document.createElement('ul');
+    for (const [i, l] of n.links.entries()) {
+      const li = document.createElement('li');
+      const num = document.createElement('span');
+      num.textContent = String(i + 1) + '. ';
+      const a = document.createElement('a');
+      a.href = l.url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.textContent = l.label === null || l.label === '' ? l.url : l.label;
+      li.appendChild(num); li.appendChild(a);
+      ul.appendChild(li);
+    }
+    box.appendChild(ul);
+    any = true;
+  }
+  for (const img of n.images) {
+    const e = document.createElement('img');
+    e.alt = 'お知らせの画像';
+    e.loading = 'lazy';
+    e.src = '/api/notices/image?imageId=' + encodeURIComponent(img.id);
+    box.appendChild(e);
+    any = true;
+  }
+  if (d.canEdit) { document.getElementById('noticeedit').style.display = 'block'; any = true; }
+  if (any) document.getElementById('notice').style.display = 'block';
+})();
+
+// --- 更新履歴（区分2）---
+(async () => {
+  const res = await fetch('/api/activities');
+  const ul = document.getElementById('acts');
+  ul.replaceChildren();
+  if (!res.ok) { const li = document.createElement('li'); li.textContent = '取得できませんでした'; ul.appendChild(li); return; }
+  const d = await res.json();
+  if (d.activities.length === 0) {
+    const li = document.createElement('li');
+    li.textContent = 'まだ記録がありません';
+    ul.appendChild(li);
+    return;
+  }
+  for (const a of d.activities) {
+    const li = document.createElement('li');
+    const t = document.createElement('div');
+    t.className = 't';
+    t.textContent = a.occurredAt.slice(0, 16).replace('T', ' ');
+    const b = document.createElement('div');
+    // 現行の文言を踏襲：「{名前}さんが{機能名}を{更新/投稿}しました」
+    b.textContent = (a.actorName === null ? '管理者' : a.actorName) + ' さんが' + a.label + 'を' + a.verb;
+    li.appendChild(t); li.appendChild(b);
+    ul.appendChild(li);
+  }
+})();
 </script>
 </body>
 </html>`;
@@ -2648,6 +2751,247 @@ $('save').addEventListener('click', async () => {
   show($('err'), d.issues ? '入力を確認してください' : '保存できませんでした');
 });
 init();
+</script>
+</body>
+</html>`;
+}
+
+// ===============================================================
+// トップ表示の編集（区分1）・サポート（区分12）／ T-52
+// ===============================================================
+/**
+ * 🔴 現行から変えた点:
+ *   ・動画は URL を貼るだけ。現行は「右クリック→埋め込みコードをコピー→ペースト→
+ *     height 以下は削除」という手順を利用者に求めており、
+ *     受け取った HTML をそのまま画面に出力していた。
+ *   ・URL は3本固定ではなく最大5本まで行として持つ
+ *   ・画像は R2 に保存し、配信は認証必須
+ */
+export function noticeEditPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>トップ表示の編集 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}
+  .login { max-width: 620px; }
+  textarea { width: 100%; padding: 11px 12px; font-size: 16px; box-sizing: border-box;
+    border: 1px solid #c8d0d8; border-radius: 6px; min-height: 90px; font-family: inherit; }
+  .linkrow { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+  @media (max-width: 560px) { .linkrow { grid-template-columns: 1fr; } }
+  .thumbs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 10px; }
+  .thumbs figure { margin: 0; }
+  .thumbs img { width: 100%; aspect-ratio: 1/1; object-fit: cover; border-radius: 6px;
+                border: 1px solid #c8d0d8; display: block; }
+  .thumbs button { width: 100%; padding: 4px; font-size: 12px; background: #a32020; margin-top: 4px; }
+  .preview iframe { width: 100%; aspect-ratio: 16/9; border: 0; border-radius: 6px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1>トップ表示の編集</h1>
+  <div class="box">
+    <p class="error" id="err" style="display:none"></p>
+    <p class="ok" id="ok" style="display:none"></p>
+
+    <div class="row">
+      <label for="msg">メッセージ</label>
+      <input type="text" id="msg" maxlength="500">
+    </div>
+
+    <div class="row">
+      <label for="video">動画URL</label>
+      <input type="text" id="video" placeholder="https://www.youtube.com/watch?v=...">
+      <p class="hint">YouTube か Vimeo の URL を貼ってください。埋め込みコードは不要です</p>
+      <div class="preview" id="preview"></div>
+    </div>
+
+    <div class="row">
+      <label>URL（最大5本）</label>
+      <div id="links"></div>
+      <button id="addlink" style="width:auto;padding:8px 14px;background:#6b7885">URLを追加</button>
+    </div>
+
+    <button id="save">保存</button>
+
+    <div class="row" style="margin-top:24px">
+      <label for="file">画像（最大4枚）</label>
+      <input type="file" id="file" accept="image/jpeg,image/png,image/gif">
+      <p class="hint">JPEG / PNG / GIF・5MB まで</p>
+      <button id="up" style="width:auto;padding:8px 14px">この画像を追加</button>
+      <div class="thumbs" id="thumbs"></div>
+    </div>
+  </div>
+  <p class="links"><a href="/home">ホームへ戻る</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+function show(el, t) { el.textContent = t; el.style.display = t === '' ? 'none' : 'block'; }
+
+function addLinkRow(url, label) {
+  if ($('links').children.length >= 5) return;
+  const d = document.createElement('div');
+  d.className = 'linkrow';
+  const a = document.createElement('input');
+  a.type = 'text'; a.placeholder = 'https://…'; a.value = url || '';
+  a.className = 'lurl';
+  const b = document.createElement('input');
+  b.type = 'text'; b.placeholder = '表示テキスト'; b.value = label || '';
+  b.className = 'llabel';
+  d.appendChild(a); d.appendChild(b);
+  $('links').appendChild(d);
+}
+
+function drawPreview(embedUrl) {
+  const p = $('preview');
+  p.replaceChildren();
+  if (embedUrl === null) return;
+  const f = document.createElement('iframe');
+  f.src = embedUrl;
+  f.allowFullscreen = true;
+  f.referrerPolicy = 'strict-origin-when-cross-origin';
+  p.appendChild(f);
+}
+
+function drawThumbs(images) {
+  const t = $('thumbs');
+  t.replaceChildren();
+  for (const img of images) {
+    const fig = document.createElement('figure');
+    const e = document.createElement('img');
+    e.alt = 'お知らせの画像';
+    e.src = '/api/notices/image?imageId=' + encodeURIComponent(img.id);
+    const b = document.createElement('button');
+    b.textContent = '削除';
+    b.addEventListener('click', () => delImage(img.id));
+    fig.appendChild(e); fig.appendChild(b);
+    t.appendChild(fig);
+  }
+}
+
+async function load() {
+  const res = await fetch('/api/notices');
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (!res.ok) { show($('err'), '読み込めませんでした'); return; }
+  const d = await res.json();
+  if (!d.canEdit) { show($('err'), 'この画面を使う権限がありません'); return; }
+  const n = d.notice;
+  $('msg').value = n.message === null ? '' : n.message;
+  $('video').value = n.video === null ? ''
+    : (n.video.kind === 'youtube' ? 'https://www.youtube.com/watch?v=' + n.video.id
+                                  : 'https://vimeo.com/' + n.video.id);
+  drawPreview(n.embedUrl);
+  $('links').replaceChildren();
+  for (const l of n.links) addLinkRow(l.url, l.label);
+  if (n.links.length === 0) addLinkRow('', '');
+  drawThumbs(n.images);
+}
+
+$('addlink').addEventListener('click', () => addLinkRow('', ''));
+$('file').addEventListener('change', () => { show($('err'), ''); show($('ok'), ''); });
+
+$('save').addEventListener('click', async () => {
+  show($('err'), ''); show($('ok'), '');
+  const urls = Array.from(document.querySelectorAll('.lurl')).map((e) => e.value.trim());
+  const labels = Array.from(document.querySelectorAll('.llabel')).map((e) => e.value.trim());
+  const links = urls.map((u, i) => ({ url: u, label: labels[i] })).filter((l) => l.url !== '');
+  const res = await fetch('/api/notices', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify({ message: $('msg').value, videoInput: $('video').value, links: links })
+  });
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.status === 403) { show($('err'), 'この操作を行う権限がありません'); return; }
+  if (res.ok) { show($('ok'), '保存しました'); load(); return; }
+  const d = await res.json().catch(() => ({}));
+  if (d.issues && d.issues.some((i) => i.code === 'unsupported_video')) {
+    show($('err'), 'YouTube か Vimeo の URL を貼ってください');
+  } else if (d.issues && d.issues.some((i) => i.field === 'links')) {
+    show($('err'), 'URL は http:// または https:// で始まるものを入れてください');
+  } else {
+    show($('err'), '保存できませんでした');
+  }
+});
+
+$('up').addEventListener('click', async () => {
+  show($('err'), ''); show($('ok'), '');
+  const f = $('file').files[0];
+  if (!f) { show($('err'), '画像を選んでください'); return; }
+  const res = await fetch('/api/notices/image', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream', 'Origin': location.origin },
+    body: f
+  });
+  if (res.ok) { show($('ok'), '画像を追加しました'); $('file').value = ''; load(); return; }
+  if (res.status === 413) { show($('err'), '画像が大きすぎます（5MBまで）'); return; }
+  const d = await res.json().catch(() => ({}));
+  show($('err'), d.issues && d.issues.some((i) => i.code === 'too_many')
+    ? '画像は4枚までです' : 'JPEG / PNG / GIF の画像を選んでください');
+});
+
+async function delImage(imageId) {
+  if (!confirm('この画像を削除します。よろしいですか?')) return;
+  const res = await fetch('/api/notices/image/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify({ imageId: imageId })
+  });
+  if (res.ok) { load(); return; }
+  show($('err'), '削除できませんでした');
+}
+load();
+</script>
+</body>
+</html>`;
+}
+
+/** サポート（区分12）。⚠ 表示のみ。編集は super 管理者側とまとめて作る */
+export function supportPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>サポート | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}
+  .login { max-width: 560px; }
+  .body { white-space: pre-wrap; font-size: 15px; line-height: 1.7; color: #23303a; }
+  .vlink { display: inline-block; margin-bottom: 12px; color: #2f6fbf; word-break: break-all; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1>サポート</h1>
+  <div class="box">
+    <p id="empty" class="hint" style="display:none">サポート情報はまだ登録されていません。</p>
+    <p><a id="vlink" class="vlink" target="_blank" rel="noopener noreferrer" style="display:none"></a></p>
+    <p class="body" id="body"></p>
+  </div>
+  <p class="links"><a href="/home">ホームへ戻る</a></p>
+</div>
+<script>
+(async () => {
+  const res = await fetch('/api/support');
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (!res.ok) { document.getElementById('empty').style.display = 'block'; return; }
+  const s = (await res.json()).support;
+  let any = false;
+  if (s.videoUrl !== null && s.videoUrl !== '') {
+    const a = document.getElementById('vlink');
+    a.href = s.videoUrl;
+    a.textContent = s.videoUrl;
+    a.style.display = 'inline-block';
+    any = true;
+  }
+  if (s.body !== null && s.body !== '') {
+    document.getElementById('body').textContent = s.body;
+    any = true;
+  }
+  if (!any) document.getElementById('empty').style.display = 'block';
+})();
 </script>
 </body>
 </html>`;
