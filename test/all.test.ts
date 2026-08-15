@@ -8,7 +8,7 @@
  */
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -30,16 +30,24 @@ import {
 } from "../src/services.ts";
 import {
   registerEmployee, validateRegistration, isRealDate, RegistrationError,
-  EMPLOYMENT_TYPE_BY_LEGACY, GENDER_BY_LEGACY, SHIFT_GROUP_BY_LEGACY,
+  EMPLOYMENT_TYPE_BY_LEGACY, GENDER_BY_LEGACY,
+  listEmployees, getEmployee, updateEmployee, listShiftTypes, EMPLOYEE_STATUSES,
 } from "../src/services.ts";
 import { worker, routes } from "../src/index.ts";
-import { loginPage, shiftSheetPage, formatClockOut, parseClockOut } from "../src/pages.ts";
+import { loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage } from "../src/pages.ts";
 import { bootstrapSetup, evaluateAttendance, ageOn, persistAttendanceSummary, getShiftSheet } from "../src/services.ts";
 import { upsertShift, summarizePeriod, ShiftServiceError, setUrgentCheck, hasUrgentCheck, periodForDate } from "../src/services.ts";
 import type { Principal } from "../src/core.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SCHEMA = readFileSync(join(here, "..", "migrations", "0001_init.sql"), "utf-8");
+/**
+ * マイグレーションは番号順に全件を連結する。
+ * 0001 だけを読むと、後から追加した列がテストにだけ存在しない状態になり、
+ * 実機との差分に気づけなくなる（Session 04 で 0002 追加時に対処）。
+ */
+const MIGRATIONS_DIR = join(here, "..", "migrations");
+const MIGRATION_FILES = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith(".sql")).sort();
+const SCHEMA = MIGRATION_FILES.map((f) => readFileSync(join(MIGRATIONS_DIR, f), "utf-8")).join("\n");
 
 type AnyDb = any;
 
@@ -668,13 +676,15 @@ describe("スキーマ: 設計原則の検査（CIで守る不変条件）", () 
 // ===============================================================
 const BASE_REG = {
   name: "山田太郎",
+  nameKana: "ヤマダタロウ",
+  employeeCode: "E-001",
   email: "yamada@example.com",
   loginId: "yamada01",
   password: "Pono-Plus-2026!",
-  lineId: null,
-  shiftGroupCode: "A",
+  shiftTypeId: null,
   employmentType: "regular",
   birthOn: "1990-05-15",
+  hiredOn: "2015-04-01",
   gender: "male",
   worksiteId: null,
 };
@@ -687,8 +697,12 @@ describe("登録: 現行画面の値域（index2.html で実証）", () => {
     assert.equal(EMPLOYMENT_TYPE_BY_LEGACY["1"], undefined);
   });
 
-  test("勤務時間帯 ki は 1〜4 が A〜Dグループ（設計書 4.5 の3ソース目）", () => {
-    assert.deepEqual(SHIFT_GROUP_BY_LEGACY, { "1": "A", "2": "B", "3": "C", "4": "D" });
+  test("🔴 勤務時間帯を A〜D に固定しない（設計書 4.5 の訂正・Session 03 第6章）", () => {
+    // 「A〜Dグループ」は特定の会社の設定値であり仕様ではなかった。
+    // 会社ごとに shift_types へ最大21種を定義する。
+    // レガシー定数 SHIFT_GROUP_BY_LEGACY は撤去済み。
+    assert.equal(Object.prototype.hasOwnProperty.call(
+      globalThis as Record<string, unknown>, "SHIFT_GROUP_BY_LEGACY"), false);
   });
 
   test("性別 pd_sec1 は 1=男性 / 2=女性", () => {
@@ -723,7 +737,6 @@ describe("登録: 現行の欠陥を再現しない（B-22/B-24）", () => {
   test("不正な勤務形態・性別・勤務時間帯を弾く", () => {
     assert.ok(validateRegistration({ ...BASE_REG, employmentType: "master2" }, TODAY).length > 0);
     assert.ok(validateRegistration({ ...BASE_REG, gender: "9" }, TODAY).length > 0);
-    assert.ok(validateRegistration({ ...BASE_REG, shiftGroupCode: "E" }, TODAY).length > 0);
   });
 
   test("短いパスワードを弾く", () => {
@@ -863,7 +876,12 @@ describe("ディスパッチャ: 認証の一元化（B-5/B-29・設計書 4.2/5
     const publicRoutes = routes.filter((r) => r.public === true).map((r) => r.path).sort();
     // 画面（/ /login /home）は認証前に配信する必要がある。
     // /home は HTML を返すだけで、中身のデータは /api/me（認証必須）から取る
-    assert.deepEqual(publicRoutes, ["/", "/api/login", "/api/setup", "/healthz", "/home", "/login", "/shifts"]);
+    // /employees /employees/new も同様に HTML の配信のみ。データは
+    // /api/employees・/api/employees/detail・/api/shift-types（すべて認証必須）から取る
+    assert.deepEqual(publicRoutes, [
+      "/", "/api/login", "/api/setup", "/employees", "/employees/new",
+      "/healthz", "/home", "/login", "/shifts",
+    ]);
   });
 
   test("ログインAPIが動作し、Cookie が HttpOnly / Secure / SameSite=Strict で発行される", async () => {
@@ -1621,5 +1639,305 @@ describe("退勤の表示と入力（保存は24時超え表記のまま）", ()
     assert.ok(body.includes("fmtOut"), "表示変換がある");
     assert.ok(body.includes("normTime"), "入力正規化がある");
     assert.ok(body.includes("翌"), "翌日表記を使う");
+  });
+});
+
+// ===============================================================
+// 従業員一覧・単票・修正（Session 04 / T-2〜T-7）
+// ===============================================================
+describe("登録: 未書込みだった列を保存する（F-1 / F-2）", () => {
+  test("🔴 hired_on を保存する（保存しないと勤続が常に null になる）", async () => {
+    const { db } = await seed();
+    const r = await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    const emp = await db.prepare(`SELECT * FROM employees WHERE id = ?1`).bind(r.employeeId).first();
+    assert.equal(emp.hired_on, "2015-04-01");
+  });
+
+  test("employee_code と name_kana を保存する", async () => {
+    const { db } = await seed();
+    const r = await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    const emp = await db.prepare(`SELECT * FROM employees WHERE id = ?1`).bind(r.employeeId).first();
+    assert.equal(emp.employee_code, "E-001");
+    assert.equal(emp.name_kana, "ヤマダタロウ");
+  });
+
+  test("勤続年数が実際に算出される（F-1 の回帰）", async () => {
+    const { db } = await seed();
+    const r = await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    const ev = await evaluateAttendance(db, "t_1", {
+      employeeId: r.employeeId, yearMonth: "2026-08", cutoffDay: 20, asOf: "2026-08-14",
+    });
+    assert.notEqual(ev.tenure, null);
+  });
+
+  test("従業員番号は会社内で重複できない", async () => {
+    const { db } = await seed();
+    await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    await assert.rejects(
+      () => registerEmployee(db, "t_1", { ...BASE_REG, loginId: "other01" }, TODAY),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.field === "employeeCode")
+    );
+  });
+
+  test("従業員番号が空でも2人目を登録できる（空文字を null に落とす）", async () => {
+    const { db } = await seed();
+    await registerEmployee(db, "t_1", { ...BASE_REG, employeeCode: "" }, TODAY);
+    const r = await registerEmployee(db, "t_1", { ...BASE_REG, employeeCode: "", loginId: "other01" }, TODAY);
+    assert.ok(r.employeeId.length > 0);
+  });
+});
+
+describe("登録: 入社日の検証", () => {
+  test("未来の入社日を弾く", () => {
+    const iss = validateRegistration({ ...BASE_REG, hiredOn: "2027-01-01" }, TODAY);
+    assert.ok(iss.some((i) => i.field === "hiredOn" && i.code === "in_the_future"));
+  });
+  test("生年月日より前の入社日を弾く", () => {
+    const iss = validateRegistration({ ...BASE_REG, hiredOn: "1980-01-01" }, TODAY);
+    assert.ok(iss.some((i) => i.field === "hiredOn" && i.code === "before_birth"));
+  });
+  test("入社日が未入力でも登録できる", () => {
+    assert.deepEqual(validateRegistration({ ...BASE_REG, hiredOn: null }, TODAY), []);
+  });
+});
+
+describe("登録: 勤務時間帯は自テナントの shift_types のみ（F-3）", () => {
+  test("自テナントの勤務時間帯を保存できる", async () => {
+    const { db } = await seed();
+    const r = await registerEmployee(db, "t_1", { ...BASE_REG, shiftTypeId: "st_a1" }, TODAY);
+    const emp = await db.prepare(`SELECT * FROM employees WHERE id = ?1`).bind(r.employeeId).first();
+    assert.equal(emp.default_shift_type_id, "st_a1");
+  });
+
+  test("🔴 他テナントの勤務時間帯は拒否する（B-6）", async () => {
+    const { db } = await seed();
+    await assert.rejects(
+      () => registerEmployee(db, "t_2", { ...BASE_REG, shiftTypeId: "st_a1" }, TODAY),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.field === "shiftTypeId")
+    );
+  });
+
+  test("存在しない勤務時間帯は拒否する", async () => {
+    const { db } = await seed();
+    await assert.rejects(
+      () => registerEmployee(db, "t_1", { ...BASE_REG, shiftTypeId: "st_zzz" }, TODAY),
+      RegistrationError
+    );
+  });
+
+  test("listShiftTypes は自テナントのものだけを返す", async () => {
+    const { db } = await seed();
+    assert.equal((await listShiftTypes(db, "t_1")).length, 1);
+    assert.equal((await listShiftTypes(db, "t_2")).length, 0);
+  });
+});
+
+describe("一覧: listEmployees（T-4）", () => {
+  test("🔴 自テナントの従業員だけを返す（B-6）", async () => {
+    const { db } = await seed();
+    const a = await listEmployees(db, "t_1");
+    const b = await listEmployees(db, "t_2");
+    assert.deepEqual(a.map((e) => e.name), ["山田"]);
+    assert.deepEqual(b.map((e) => e.name), ["佐藤"]);
+  });
+
+  test("ログインIDと勤務時間帯名を結合して返す", async () => {
+    const { db } = await seed();
+    const r = await registerEmployee(db, "t_1", { ...BASE_REG, shiftTypeId: "st_a1" }, TODAY);
+    const rows = await listEmployees(db, "t_1");
+    const me = rows.find((e) => e.id === r.employeeId);
+    assert.equal(me?.loginId, "yamada01");
+    assert.equal(me?.shiftTypeName, "早番");
+  });
+
+  test("パスワードハッシュを一覧に含めない（SELECT * を使わない）", async () => {
+    const { db } = await seed();
+    await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    const rows = await listEmployees(db, "t_1");
+    for (const row of rows) {
+      for (const v of Object.values(row)) {
+        assert.equal(typeof v === "string" && v.includes("$scrypt$"), false);
+      }
+    }
+  });
+
+  test("状態で絞り込める", async () => {
+    const { db } = await seed();
+    const r = await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    await updateEmployee(db, "t_1", r.employeeId, { status: "resigned" }, TODAY);
+    assert.equal((await listEmployees(db, "t_1", { status: "resigned" })).length, 1);
+    assert.equal((await listEmployees(db, "t_1", { status: "active" })).length, 1);
+    assert.equal((await listEmployees(db, "t_1")).length, 2);
+  });
+
+  test("氏名・カナ・従業員番号の部分一致で絞り込める", async () => {
+    const { db } = await seed();
+    await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    assert.equal((await listEmployees(db, "t_1", { keyword: "山田太" })).length, 1);
+    assert.equal((await listEmployees(db, "t_1", { keyword: "ヤマダ" })).length, 1);
+    assert.equal((await listEmployees(db, "t_1", { keyword: "E-001" })).length, 1);
+    assert.equal((await listEmployees(db, "t_1", { keyword: "該当なし" })).length, 0);
+  });
+
+  test("🔴 LIKE のワイルドカードを打ち消す（% で全件が返らない）", async () => {
+    const { db } = await seed();
+    await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    assert.equal((await listEmployees(db, "t_1", { keyword: "%" })).length, 0);
+    assert.equal((await listEmployees(db, "t_1", { keyword: "_" })).length, 0);
+  });
+
+  test("不正な状態を指定したら弾く", async () => {
+    const { db } = await seed();
+    await assert.rejects(() => listEmployees(db, "t_1", { status: "zombie" }), RegistrationError);
+  });
+});
+
+describe("単票・修正: getEmployee / updateEmployee（T-5 / T-6）", () => {
+  test("🔴 他テナントの従業員は取得できない（B-6）", async () => {
+    const { db } = await seed();
+    assert.notEqual(await getEmployee(db, "t_1", "e_1"), null);
+    assert.equal(await getEmployee(db, "t_2", "e_1"), null);
+  });
+
+  test("送ったキーだけが変わる（部分更新）", async () => {
+    const { db } = await seed();
+    const r = await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    await updateEmployee(db, "t_1", r.employeeId, { nameKana: "ヤマダジロウ" }, TODAY);
+    const e = await getEmployee(db, "t_1", r.employeeId);
+    assert.equal(e?.nameKana, "ヤマダジロウ");
+    assert.equal(e?.name, "山田太郎");
+    assert.equal(e?.hiredOn, "2015-04-01");
+  });
+
+  test("🔴 他テナントからの修正は not_found になる", async () => {
+    const { db } = await seed();
+    const r = await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    await assert.rejects(
+      () => updateEmployee(db, "t_2", r.employeeId, { name: "乗っ取り" }, TODAY),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.code === "not_found")
+    );
+  });
+
+  test("退職にすると退職日が入り、在籍に戻すと消える", async () => {
+    const { db } = await seed();
+    const r = await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    await updateEmployee(db, "t_1", r.employeeId, { status: "resigned" }, TODAY);
+    let row = await db.prepare(`SELECT * FROM employees WHERE id = ?1`).bind(r.employeeId).first();
+    assert.equal(row.resigned_on, TODAY);
+    await updateEmployee(db, "t_1", r.employeeId, { status: "active" }, TODAY);
+    row = await db.prepare(`SELECT * FROM employees WHERE id = ?1`).bind(r.employeeId).first();
+    assert.equal(row.resigned_on, null);
+  });
+
+  test("修正でも従業員番号の重複を拒否する", async () => {
+    const { db } = await seed();
+    await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    const r2 = await registerEmployee(db, "t_1", { ...BASE_REG, loginId: "b01", employeeCode: "E-002" }, TODAY);
+    await assert.rejects(
+      () => updateEmployee(db, "t_1", r2.employeeId, { employeeCode: "E-001" }, TODAY),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.field === "employeeCode")
+    );
+  });
+
+  test("自分自身の番号のままなら重複扱いしない", async () => {
+    const { db } = await seed();
+    const r = await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    await updateEmployee(db, "t_1", r.employeeId, { employeeCode: "E-001", name: "山田次郎" }, TODAY);
+    assert.equal((await getEmployee(db, "t_1", r.employeeId))?.name, "山田次郎");
+  });
+
+  test("不正な状態・雇用形態・未来の入社日を弾く", async () => {
+    const { db } = await seed();
+    const r = await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    await assert.rejects(() => updateEmployee(db, "t_1", r.employeeId, { status: "zombie" }, TODAY), RegistrationError);
+    await assert.rejects(() => updateEmployee(db, "t_1", r.employeeId, { employmentType: "master2" }, TODAY), RegistrationError);
+    await assert.rejects(() => updateEmployee(db, "t_1", r.employeeId, { hiredOn: "2099-01-01" }, TODAY), RegistrationError);
+  });
+
+  test("修正でログインID・パスワードは変えられない（入力自体を受け付けない）", async () => {
+    const { db } = await seed();
+    const r = await registerEmployee(db, "t_1", BASE_REG, TODAY);
+    await updateEmployee(db, "t_1", r.employeeId, { name: "山田次郎" } as never, TODAY);
+    const acc = await db.prepare(
+      `SELECT a.login_id, a.password_hash FROM accounts a JOIN employees e ON e.account_id = a.id WHERE e.id = ?1`
+    ).bind(r.employeeId).first();
+    assert.equal(acc.login_id, "yamada01");
+    assert.ok(acc.password_hash.startsWith("$scrypt$"));
+  });
+
+  test("employees.status の値域は暫定3値【未確認・㉖】", () => {
+    assert.deepEqual([...EMPLOYEE_STATUSES], ["active", "suspended", "resigned"]);
+  });
+});
+
+describe("ディスパッチャ: 従業員ルート（Session 04）", () => {
+  test("ルートが登録されている", () => {
+    const paths = routes.map((r) => `${r.method} ${r.path}`);
+    for (const p of [
+      "GET /employees", "GET /employees/new", "GET /api/employees",
+      "GET /api/employees/detail", "POST /api/employees/update", "GET /api/shift-types",
+    ]) {
+      assert.ok(paths.includes(p), `${p} が未登録`);
+    }
+  });
+
+  test("🔴 従業員ルートは既定で認証必須（public を書いていない）", () => {
+    for (const p of ["/api/employees", "/api/employees/detail", "/api/employees/update", "/api/shift-types"]) {
+      for (const r of routes.filter((x) => x.path === p)) {
+        assert.notEqual(r.public, true, `${p} が public になっている`);
+      }
+    }
+  });
+});
+
+describe("画面: 従業員一覧・登録（T-7）", () => {
+  test("一覧に現行の項目と新設の入社日が並ぶ", () => {
+    const h = employeeListPage();
+    for (const s of ["従業員番号", "氏名", "ログインID", "雇用形態", "勤務時間帯", "入社日", "状態"]) {
+      assert.ok(h.includes(s), `${s} が無い`);
+    }
+  });
+
+  test("🔴 一覧は innerHTML に値を混ぜない（B-35 の再発防止）", () => {
+    const h = employeeListPage();
+    assert.ok(h.includes("textContent"));
+    assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
+  });
+
+  test("登録画面に入社日の入力欄がある（F-1）", () => {
+    const h = employeeFormPage();
+    assert.ok(h.includes('id="hiredOn"'));
+    assert.ok(h.includes("入社日"));
+  });
+
+  test("🔴 勤務時間帯の選択肢を A〜D で固定しない（設計書 4.5 の訂正）", () => {
+    const h = employeeFormPage();
+    assert.ok(h.includes("/api/shift-types"));
+    assert.equal(/<option value="[ABCD]"/.test(h), false);
+  });
+
+  test("パスワードは新規登録時のみ入力させる", () => {
+    const h = employeeFormPage();
+    assert.ok(h.includes('id="newOnly"'));
+    assert.ok(h.includes("メール送信はしません"));
+  });
+
+  test("外部CDNに依存しない（B-38/B-39）", () => {
+    for (const h of [employeeListPage(), employeeFormPage()]) {
+      assert.equal(h.includes("http://"), false);
+      assert.equal(h.includes("cdn"), false);
+    }
+  });
+});
+
+describe("スキーマ: マイグレーション 0002", () => {
+  test("employees.default_shift_type_id が存在する", () => {
+    const db = schemaDb();
+    const cols = columns(db, "employees").map((c) => c.name);
+    assert.ok(cols.includes("default_shift_type_id"));
+  });
+
+  test("テーブル数は増えていない（列の追加のみ）", () => {
+    assert.equal(tableNames(schemaDb()).length, 20);
   });
 });
