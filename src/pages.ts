@@ -208,6 +208,36 @@ document.getElementById('out').addEventListener('click', async () => {
  *   B-42 timepicker の maxTime が 23:59 で日跨ぎを入力できなかった → 24時超えを許可
  *   実働はサーバ側の計算結果を表示する（現行も同じ。入力欄は持たない）
  */
+/**
+ * 退勤時刻の表示変換。
+ * 保存は 24時超え表記（例 30:00）のままにし、画面でだけ「翌 06:00」と見せる。
+ * ⚠ 保存形式を 06:00 に戻すと、当日か翌日かが判別できなくなり、
+ *   現行 shift23updateAction が抱えていた曖昧さが復活する。
+ */
+export function formatClockOut(value: string | null): string {
+  if (value === null || value === "") return "";
+  const m = /^(\d{1,3}):([0-5]\d)$/.exec(value);
+  if (m === null) return value;
+  const h = Number(m[1]);
+  if (h < 24) return value;
+  return `翌 ${String(h - 24).padStart(2, "0")}:${m[2]}`;
+}
+
+/** 「翌 06:00」「翌06:00」「6:00」などを 06:00 に正規化する（サーバ側で日跨ぎ判定される） */
+export function parseClockOut(input: string): string {
+  let v = input.trim();
+  // 全角を半角へ（現行は変換していないため入力できなかった）
+  v = v.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+       .replace(/[：︓]/g, ":")
+       .replace(/[\s　]/g, "");
+  v = v.replace(/^翌日?/, "");
+  const m = /^(\d{1,3}):?([0-5]?\d)?$/.exec(v);
+  if (m === null) return v;
+  const hh = String(Number(m[1])).padStart(2, "0");
+  const mm = (m[2] ?? "0").padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
 export function shiftSheetPage(): string {
   return `<!DOCTYPE html>
 <html lang="ja">
@@ -266,6 +296,28 @@ export function shiftSheetPage(): string {
 <script>
 let sheet = null;
 
+// 保存は 24時超え表記のまま。表示だけ「翌 06:00」にする
+function fmtOut(v) {
+  if (!v) return '';
+  const m = /^(\\d{1,3}):([0-5]\\d)$/.exec(v);
+  if (!m) return v;
+  const h = Number(m[1]);
+  return h < 24 ? v : '翌 ' + String(h - 24).padStart(2, '0') + ':' + m[2];
+}
+
+// 「翌 06:00」「6:00」「２２：００」などを 06:00 形式へ
+function normTime(s) {
+  let v = (s || '').trim()
+    .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/[：︓]/g, ':')
+    .replace(/[\\s　]/g, '')
+    .replace(/^翌日?/, '');
+  if (!v) return '';
+  const m = /^(\\d{1,3}):?([0-5]?\\d)?$/.exec(v);
+  if (!m) return v;
+  return String(Number(m[1])).padStart(2, '0') + ':' + (m[2] || '0').padStart(2, '0');
+}
+
 function hhmm(min) {
   if (!min) return '0:00';
   return Math.floor(min / 60) + ':' + String(min % 60).padStart(2, '0');
@@ -305,7 +357,7 @@ function render() {
       '<td><textarea class="c-note"></textarea></td>' +
       '<td><input type="checkbox" class="c-lock"' + (r.isDayLocked ? ' checked' : '') + '></td>' +
       '<td><input type="text" class="c-in" value="' + (r.clockIn || '') + '" placeholder="09:00"></td>' +
-      '<td><input type="text" class="c-out" value="' + (r.clockOut || '') + '" placeholder="18:00"></td>' +
+      '<td><input type="text" class="c-out" value="' + fmtOut(r.clockOut) + '" placeholder="18:00"></td>' +
       '<td><input type="text" class="c-brk" value="' + r.breakMinutes + '"></td>' +
       '<td><input type="text" class="c-ot" value="' + r.overtimeMinutes + '"></td>' +
       '<td class="worked">' + hhmm(r.workedMinutes) + '</td>' +
@@ -341,8 +393,8 @@ document.getElementById('save').addEventListener('click', async () => {
   for (let i = 0; i < sheet.rows.length; i++) {
     const tr = document.querySelector('tr[data-i="' + i + '"]');
     const type = tr.querySelector('.c-type').value;
-    const cin = tr.querySelector('.c-in').value.trim();
-    const cout = tr.querySelector('.c-out').value.trim();
+    const cin = normTime(tr.querySelector('.c-in').value);
+    const cout = normTime(tr.querySelector('.c-out').value);
     const note = tr.querySelector('.c-note').value;
     const dnote = tr.querySelector('.c-dnote').value;
     const confirmed = tr.querySelector('.c-confirm').checked;
