@@ -11,7 +11,8 @@
  *   ハンドラ側で認証を書き忘れても、ここを通らなければ実行されない。
  */
 import { AuthzError, nowUtc, sha256Hex, canAccessAttendance } from "./core.ts";
-import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setShiftConfirmation } from "./services.ts";
+import { loginPage, homePage, shiftSheetPage } from "./pages.ts";
+import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet } from "./services.ts";
 import type { Principal } from "./core.ts";
 
 export interface Env {
@@ -43,7 +44,25 @@ interface RouteDef {
 // ------------------------------------------------------------------
 // ルート登録
 // ------------------------------------------------------------------
+function html(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      // 画面にも最低限のセキュリティヘッダを付ける
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "same-origin",
+      "X-Frame-Options": "DENY",
+    },
+  });
+}
+
 export const routes: RouteDef[] = [
+  // 画面（現行 loginuser*Template.php の構造を踏襲）
+  { method: "GET", path: "/", public: true, handler: async () => Response.redirect("/login", 302) },
+  { method: "GET", path: "/login", public: true, handler: async () => html(loginPage()) },
+  { method: "GET", path: "/home", public: true, handler: async () => html(homePage()) },
+  { method: "GET", path: "/shifts", public: true, handler: async () => html(shiftSheetPage()) },
   {
     // 設定の反映状況を確認できるようにする。⚠ 値そのものは絶対に返さない
     method: "GET",
@@ -187,7 +206,10 @@ export const routes: RouteDef[] = [
           isAbsent: b.isAbsent === true,
           isLate: b.isLate === true,
           isEarlyLeave: b.isEarlyLeave === true,
+          isConfirmed: b.isConfirmed === true,
+          isDayLocked: b.isDayLocked === true,
           note: (b.note as string | null) ?? null,
+          dayNote: (b.dayNote as string | null) ?? null,
           worksiteId: (b.worksiteId as string | null) ?? null,
         });
         return json({ ok: true, ...r }, 200);
@@ -226,6 +248,32 @@ export const routes: RouteDef[] = [
     },
   },
   {
+    // シフト入力画面のデータ（現行 shift1View.php の aryCalendar 相当）
+    method: "GET",
+    path: "/api/shifts/sheet",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const u = new URL(req.url);
+      const employeeId = u.searchParams.get("employeeId") ?? "";
+      const yearMonth = u.searchParams.get("yearMonth") ?? "";
+      if (!canAccessAttendance(ctx.principal)) {
+        const own = await ctx.env.DB.prepare(`SELECT id FROM employees WHERE account_id = ?1 AND tenant_id = ?2`)
+          .bind(ctx.principal.accountId, ctx.principal.tenantId)
+          .first<{ id: string }>();
+        if (own === null || own.id !== employeeId) return json({ error: "forbidden" }, 403);
+      }
+      const tenant = await ctx.env.DB.prepare(`SELECT cutoff_day FROM tenants WHERE id = ?1`)
+        .bind(ctx.principal.tenantId).first<{ cutoff_day: number }>();
+      if (tenant === null) return json({ error: "tenant_not_found" }, 404);
+      try {
+        return json(await getShiftSheet(ctx.env.DB, ctx.principal.tenantId, employeeId, yearMonth, tenant.cutoff_day));
+      } catch (e) {
+        if (e instanceof ShiftServiceError) return json({ error: e.code }, 422);
+        return json({ error: "invalid_input" }, 422);
+      }
+    },
+  },
+  {
     // 勤怠評価（WBS ブロック8）
     method: "GET",
     path: "/api/attendance/evaluation",
@@ -256,9 +304,9 @@ export const routes: RouteDef[] = [
     },
   },
   {
-    // シフトの確定／確定解除（現行 user1flg1shift1insert 相当）
+    // 期間単位の「緊急確認」（現行 shift1_r1_flg1 相当）
     method: "POST",
-    path: "/api/shifts/confirm",
+    path: "/api/shifts/urgent-check",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
@@ -267,9 +315,9 @@ export const routes: RouteDef[] = [
         .bind(ctx.principal.tenantId).first<{ cutoff_day: number }>();
       if (tenant === null) return json({ error: "tenant_not_found" }, 404);
       try {
-        const r = await setShiftConfirmation(
+        const r = await setUrgentCheck(
           ctx.env.DB, ctx.principal.tenantId, String(b.employeeId ?? ""),
-          String(b.yearMonth ?? ""), tenant.cutoff_day, b.confirmed === true, ctx.principal.accountId
+          String(b.yearMonth ?? ""), tenant.cutoff_day, b.needsUrgentCheck === true, ctx.principal.accountId
         );
         return json({ ok: true, ...r });
       } catch (e) {
