@@ -166,6 +166,12 @@ export function homePage(): string {
   th { color: #6b7885; font-weight: 600; width: 40%; }
   .logout { margin-top: 20px; }
   .logout button { background: #6b7885; }
+  .nav { display: flex; flex-direction: column; gap: 8px; margin-top: 20px; }
+  .nav a {
+    display: block; padding: 12px 14px; border: 1px solid #c8d0d8; border-radius: 6px;
+    color: #2f6fbf; text-decoration: none; font-size: 15px; font-weight: 600; background: #fff;
+  }
+  .nav a:hover { background: #f2f6fb; border-color: #2f6fbf; }
 </style>
 </head>
 <body>
@@ -173,6 +179,11 @@ export function homePage(): string {
   <h1>PONO-PLUS</h1>
   <div class="box">
     <table id="me"><tbody><tr><td colspan="2">読み込み中…</td></tr></tbody></table>
+    <nav class="nav">
+      <a href="/employees">従業員一覧</a>
+      <a href="/shifts">シフト登録/修正</a>
+      <a href="/attendance">勤怠評価</a>
+    </nav>
     <div class="logout"><button id="out">ログアウト</button></div>
   </div>
   <p class="note">段階1（基盤・認証・シフト・勤怠評価）まで実装済み</p>
@@ -529,7 +540,7 @@ export function employeeListPage(): string {
       </table>
     </div>
   </div>
-  <p class="links"><a href="/home">ホームへ戻る</a></p>
+  <p class="links"><a href="/home">ホームへ戻る</a> ／ <a href="/attendance">勤怠評価</a></p>
 </div>
 <script>
 const EMPLOYMENT = { regular:'社員', part_time:'アルバイト', cleaner:'清掃員', other:'その他' };
@@ -590,6 +601,12 @@ async function load() {
     a.textContent = '修正';
     a.style.color = '#2f6fbf';
     tdA.appendChild(a);
+    tdA.appendChild(document.createTextNode(' '));
+    const a2 = document.createElement('a');
+    a2.href = '/attendance?employeeId=' + encodeURIComponent(e.id);
+    a2.textContent = '勤怠';
+    a2.style.color = '#2f6fbf';
+    tdA.appendChild(a2);
     tr.appendChild(tdA);
     tbody.appendChild(tr);
   }
@@ -697,7 +714,7 @@ export function employeeFormPage(): string {
 
     <button id="save">保存</button>
   </div>
-  <p class="links"><a href="/employees">従業員一覧へ戻る</a></p>
+  <p class="links"><a href="/employees">従業員一覧へ戻る</a> ／ <a href="/home">ホーム</a></p>
 </div>
 <script>
 const LABEL = {
@@ -783,6 +800,153 @@ $('save').addEventListener('click', async () => {
     show($('err'), '保存できませんでした');
   }
 });
+init();
+</script>
+</body>
+</html>`;
+}
+
+// ===============================================================
+// 勤怠評価の表示（Session 04 / T-10）
+// ===============================================================
+/**
+ * ⚠ 「点数化」は実装していない【未確認】。
+ *   現行の評価系 Action / Template が未受領のため、点数の材料となる
+ *   実績値のみを表示する（仕様書 v1 5.3・引継ぎシート §4.4 優先2）。
+ *   受領後に点数欄を追加する。推測で点数式を作らない。
+ *
+ * ⚠ 期間は締め日基準。yearMonth=2026-08・締め日20日 なら 2026-07-21〜2026-08-20
+ *   （仕様書 v1 5.2）。画面にも期間を明示し、誤読を防ぐ。
+ */
+export function attendancePage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>勤怠評価 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}
+  .login { max-width: 720px; }
+  .kpi { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 20px; }
+  @media (max-width: 560px) { .kpi { grid-template-columns: repeat(2, 1fr); } }
+  .kpi div { background: #f7f9fb; border: 1px solid #e4e9ee; border-radius: 8px; padding: 12px; }
+  .kpi .k { font-size: 12px; color: #6b7885; }
+  .kpi .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .kpi .u { font-size: 12px; font-weight: 400; color: #6b7885; margin-left: 2px; }
+  .period { font-size: 13px; color: #46535f; margin-bottom: 16px; }
+  .pending { background: #fdf6e3; border: 1px solid #e6d5a8; color: #6b5510;
+             padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-top: 18px; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1>勤怠評価</h1>
+  <div class="box">
+    <div class="bar">
+      <div class="row" style="flex:1 1 220px">
+        <label for="emp">従業員</label>
+        <select id="emp"><option value="">読み込み中…</option></select>
+      </div>
+      <div class="row" style="flex:0 0 140px">
+        <label for="ym">年月</label>
+        <input type="text" id="ym" placeholder="2026-09">
+      </div>
+      <div class="row"><button id="go">表示</button></div>
+    </div>
+    <p class="error" id="err" style="display:none"></p>
+    <p class="period" id="period"></p>
+    <div class="kpi" id="kpi"></div>
+    <table id="detail"><tbody></tbody></table>
+    <p class="pending">⚠ 点数化のルールは未確認のため、実績値のみを表示しています。</p>
+  </div>
+  <p class="links"><a href="/home">ホームへ戻る</a> ／ <a href="/employees">従業員一覧</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+function show(el, text) { el.textContent = text; el.style.display = text === '' ? 'none' : 'block'; }
+function hm(min) {
+  const h = Math.floor(min / 60), m = min % 60;
+  return h + ':' + String(m).padStart(2, '0');
+}
+function card(k, v, u) {
+  const d = document.createElement('div');
+  const a = document.createElement('div'); a.className = 'k'; a.textContent = k;
+  const b = document.createElement('div'); b.className = 'v'; b.textContent = v;
+  if (u) { const s = document.createElement('span'); s.className = 'u'; s.textContent = u; b.appendChild(s); }
+  d.appendChild(a); d.appendChild(b);
+  return d;
+}
+function row(k, v) {
+  const tr = document.createElement('tr');
+  const th = document.createElement('th'); th.textContent = k;
+  const td = document.createElement('td'); td.textContent = v;
+  tr.appendChild(th); tr.appendChild(td);
+  return tr;
+}
+
+async function init() {
+  const res = await fetch('/api/employees?status=active');
+  if (res.status === 401) { location.href = '/login'; return; }
+  const sel = $('emp');
+  sel.replaceChildren();
+  if (!res.ok) {
+    const o = document.createElement('option');
+    o.textContent = '取得できません';
+    sel.appendChild(o);
+    return;
+  }
+  const d = await res.json();
+  for (const e of d.employees) {
+    const o = document.createElement('option');
+    o.value = e.id;
+    o.textContent = e.name + (e.employeeCode ? ' (' + e.employeeCode + ')' : '');
+    sel.appendChild(o);
+  }
+  const q = new URLSearchParams(location.search);
+  if (q.get('employeeId')) sel.value = q.get('employeeId');
+  const now = new Date();
+  $('ym').value = q.get('yearMonth') ||
+    now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+  if (d.employees.length > 0) load();
+}
+
+async function load() {
+  show($('err'), '');
+  const employeeId = $('emp').value;
+  const yearMonth = $('ym').value.trim();
+  if (employeeId === '' || yearMonth === '') { show($('err'), '従業員と年月を指定してください'); return; }
+  const res = await fetch('/api/attendance/evaluation?employeeId=' + encodeURIComponent(employeeId) +
+                          '&yearMonth=' + encodeURIComponent(yearMonth));
+  if (res.status === 401) { location.href = '/login'; return; }
+  $('kpi').replaceChildren();
+  $('detail').querySelector('tbody').replaceChildren();
+  if (!res.ok) {
+    show($('err'), res.status === 403 ? 'この従業員を見る権限がありません' : '取得できませんでした');
+    $('period').textContent = '';
+    return;
+  }
+  const r = await res.json();
+  $('period').textContent = '対象期間 ' + r.periodStartOn + ' 〜 ' + r.periodEndOn + '（締め日基準）';
+  const kpi = $('kpi');
+  kpi.appendChild(card('出勤日数', String(r.workDays), '日'));
+  kpi.appendChild(card('実働', hm(r.workedMinutes)));
+  kpi.appendChild(card('残業', hm(r.overtimeMinutes)));
+  kpi.appendChild(card('遅刻', String(r.lateCount), '回'));
+  kpi.appendChild(card('早退', String(r.earlyLeaveCount), '回'));
+  kpi.appendChild(card('欠勤', String(r.absenceCount), '回'));
+  const tb = $('detail').querySelector('tbody');
+  tb.appendChild(row('出勤率', r.attendanceRate === null ? '－（登録なし）'
+    : (Math.round(r.attendanceRate * 1000) / 10) + ' %'));
+  tb.appendChild(row('勤続', r.tenure === null ? '－（入社日が未登録）'
+    : r.tenure.years + '年' + r.tenure.months + 'か月'));
+  tb.appendChild(row('年齢', r.age === null ? '－（生年月日が未登録）' : r.age + '歳'));
+  const bt = Object.entries(r.byShiftType).filter(([, v]) => v > 0);
+  tb.appendChild(row('勤務時間帯の内訳',
+    bt.length === 0 ? '－' : bt.map(([k, v]) => k + ': ' + v + '日').join(' / ')));
+}
+$('go').addEventListener('click', load);
+$('ym').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') load(); });
 init();
 </script>
 </body>
