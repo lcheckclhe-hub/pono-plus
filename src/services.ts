@@ -173,8 +173,10 @@ export interface LoginInput {
 }
 
 export type LoginResult =
-  | { ok: true; token: string; accountId: string; expiresAt: string }
-  | { ok: false; reason: "invalid_credentials" | "rate_limited" | "account_inactive" };
+  | { ok: true; token: string; accountId: string; tenantId: string | null; expiresAt: string }
+  | { ok: false; reason: "invalid_credentials" | "rate_limited" | "account_inactive" }
+  /** 同じログインIDが複数テナントに存在する場合のみ。会社の選択を求める */
+  | { ok: false; reason: "tenant_required"; tenants: Array<{ id: string; name: string }> };
 
 function minutesAgoUtc(minutes: number): string {
   return nowUtc(new Date(Date.now() - minutes * 60_000));
@@ -198,13 +200,45 @@ export async function login(db: D1Database, input: LoginInput): Promise<LoginRes
     return { ok: false, reason: "rate_limited" };
   }
 
-  const account = await db
-    .prepare(
-      `SELECT id, tenant_id, password_hash, status FROM accounts
-        WHERE login_id = ?1 AND (tenant_id = ?2 OR (?2 IS NULL AND tenant_id IS NULL))`
-    )
-    .bind(input.loginId, input.tenantId)
-    .first<{ id: string; tenant_id: string | null; password_hash: string; status: string }>();
+  // 🔴 現行のログイン画面は ID と PW の2項目のみで、会社を選ばせない
+  //    （loginuser2Template.php / loginuser3Template.php で実証）。
+  //    tenantId が指定されない場合は、ログインIDから会社を特定する。
+  let account: { id: string; tenant_id: string | null; password_hash: string; status: string } | null;
+
+  if (input.tenantId === null) {
+    const candidates = await db
+      .prepare(
+        `SELECT a.id, a.tenant_id, a.password_hash, a.status, COALESCE(t.name, '') AS tenant_name
+           FROM accounts a LEFT JOIN tenants t ON t.id = a.tenant_id
+          WHERE a.login_id = ?1`
+      )
+      .bind(input.loginId)
+      .all<{ id: string; tenant_id: string | null; password_hash: string; status: string; tenant_name: string }>();
+    const rows = candidates.results ?? [];
+
+    if (rows.length > 1) {
+      // 登録時に全社で一意を強制しているため通常は起こらない。
+      // 万一起きた場合のみ会社の選択を求める（推測で1件目を選ばない）
+      await equalizeTiming();
+      await recordAttempt(db, input, false);
+      return {
+        ok: false,
+        reason: "tenant_required",
+        tenants: rows
+          .filter((r) => r.tenant_id !== null)
+          .map((r) => ({ id: r.tenant_id as string, name: r.tenant_name })),
+      };
+    }
+    account = rows.length === 1 ? rows[0] : null;
+  } else {
+    account = await db
+      .prepare(
+        `SELECT id, tenant_id, password_hash, status FROM accounts
+          WHERE login_id = ?1 AND tenant_id = ?2`
+      )
+      .bind(input.loginId, input.tenantId)
+      .first<{ id: string; tenant_id: string | null; password_hash: string; status: string }>();
+  }
 
   if (account === null) {
     // アカウント不存在でもハッシュ相当の時間を消費する（応答時間から存在を推測させない）
@@ -247,7 +281,7 @@ export async function login(db: D1Database, input: LoginInput): Promise<LoginRes
   await db.prepare(`UPDATE accounts SET last_login_at = ?1 WHERE id = ?2`).bind(nowUtc(), account.id).run();
   await recordAttempt(db, input, true);
 
-  return { ok: true, token, accountId: account.id, expiresAt };
+  return { ok: true, token, accountId: account.id, tenantId: account.tenant_id, expiresAt };
 }
 
 export async function logout(db: D1Database, token: string): Promise<void> {
@@ -387,9 +421,13 @@ export async function registerEmployee(
   const issues = validateRegistration(input, today);
   if (issues.length > 0) throw new RegistrationError(issues);
 
+  // 🔴 ログインIDは全社で一意にする。
+  //    現行のログイン画面が会社を選ばせないため（loginuser*Template.php で実証）、
+  //    重複があると会社を特定できなくなる。
+  //    スキーマ側の UNIQUE (tenant_id, login_id) は将来の拡張余地として残す。
   const dup = await db
-    .prepare(`SELECT id FROM accounts WHERE tenant_id = ?1 AND login_id = ?2`)
-    .bind(tenantId, input.loginId)
+    .prepare(`SELECT id FROM accounts WHERE login_id = ?1`)
+    .bind(input.loginId)
     .first<{ id: string }>();
   if (dup !== null) throw new RegistrationError([{ field: "loginId", code: "already_taken" }]);
 
@@ -459,7 +497,7 @@ export const DELETION_EXEMPT: Record<string, string> = {
  */
 export const EMPLOYEE_DELETION_ORDER: Array<{ table: string; by: "employee_id" | "account_id" | "login_id" }> = [
   { table: "attendance_summaries", by: "employee_id" },
-  { table: "shift_confirmations", by: "employee_id" },
+  { table: "shift_period_flags", by: "employee_id" },
   { table: "shifts", by: "employee_id" },
   { table: "employees", by: "employee_id" },
   { table: "sessions", by: "account_id" },
@@ -476,7 +514,7 @@ export const EMPLOYEE_DELETION_ORDER: Array<{ table: string; by: "employee_id" |
  *    残っていると外部キー制約で解約が失敗する（統合テストで検出）。
  */
 export const TENANT_DELETION_ORDER: string[] = [
-  "shift_confirmations",
+  "shift_period_flags",
   "shifts",
   "attendance_summaries",
   "employees",
@@ -634,7 +672,14 @@ export interface ShiftUpsertInput {
   isAbsent: boolean;
   isLate: boolean;
   isEarlyLeave: boolean;
+  /** 現行 shift_s_id: その日の確定 */
+  isConfirmed: boolean;
+  /** 現行 shift_flg2: 当日確認（立つと実績側が編集不可）*/
+  isDayLocked: boolean;
+  /** 現行 shift_remarks1: フリー入力 */
   note: string | null;
+  /** 現行 shift_flg8: 当日フリー */
+  dayNote: string | null;
   worksiteId: string | null;
 }
 
@@ -716,13 +761,15 @@ export async function upsertShift(
       .prepare(
         `UPDATE shifts SET worksite_id=?1, clock_in=?2, clock_out=?3, break_minutes=?4,
            overtime_minutes=?5, worked_minutes=?6, is_absent=?7, is_late=?8, is_early_leave=?9,
-           note=?10, updated_at=?11, deleted_at=NULL
-         WHERE id=?12 AND tenant_id=?13`
+           note=?10, is_confirmed=?11, is_day_locked=?12, day_note=?13, updated_at=?14, deleted_at=NULL
+         WHERE id=?15 AND tenant_id=?16`
       )
       .bind(
         input.worksiteId, input.clockIn, storedClockOut, input.breakMinutes,
         input.overtimeMinutes, workedMinutes, input.isAbsent ? 1 : 0, input.isLate ? 1 : 0,
-        input.isEarlyLeave ? 1 : 0, input.note, t, existing.id, tenantId
+        input.isEarlyLeave ? 1 : 0, input.note,
+        input.isConfirmed ? 1 : 0, input.isDayLocked ? 1 : 0, input.dayNote,
+        t, existing.id, tenantId
       )
       .run();
     return { shiftId: existing.id, workedMinutes };
@@ -732,13 +779,15 @@ export async function upsertShift(
   await db
     .prepare(
       `INSERT INTO shifts (id,tenant_id,worksite_id,employee_id,worked_on,shift_type_id,clock_in,clock_out,
-         break_minutes,overtime_minutes,worked_minutes,is_absent,is_late,is_early_leave,note,created_at,updated_at)
-       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?16)`
+         break_minutes,overtime_minutes,worked_minutes,is_absent,is_late,is_early_leave,note,
+         is_confirmed,is_day_locked,day_note,created_at,updated_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?19)`
     )
     .bind(
       id, tenantId, input.worksiteId, input.employeeId, input.workedOn, input.shiftTypeId,
       input.clockIn, storedClockOut, input.breakMinutes, input.overtimeMinutes, workedMinutes,
-      input.isAbsent ? 1 : 0, input.isLate ? 1 : 0, input.isEarlyLeave ? 1 : 0, input.note, t
+      input.isAbsent ? 1 : 0, input.isLate ? 1 : 0, input.isEarlyLeave ? 1 : 0, input.note,
+      input.isConfirmed ? 1 : 0, input.isDayLocked ? 1 : 0, input.dayNote, t
     )
     .run();
   return { shiftId: id, workedMinutes };
@@ -807,20 +856,22 @@ export async function summarizePeriod(
 }
 
 /**
- * シフトの確定／確定解除
+ * 期間単位の「緊急確認」フラグ
  *
- * 現行 `user1flg1shift1insert`（`shift_r1_flg1`）に相当。4本すべてが呼んでいた。
- * 照合報告 5.1 で「新実装に無い」と判明したため追加。
+ * 現行 `user1flg1shift1insert`（`shift1_r1_flg1`）に相当。
+ * ⚠ 当初これを「確定」と解釈したが、shift1Template.php の実証により
+ *   画面上のラベルは「緊急確認」であることが判明した（2026-08-15）。
+ *   日ごとの確定は shifts.is_confirmed（現行 shift_s_id）である。
  */
-export async function setShiftConfirmation(
+export async function setUrgentCheck(
   db: D1Database,
   tenantId: string,
   employeeId: string,
   yearMonth: string,
   cutoffDay: number,
-  confirmed: boolean,
+  needsUrgentCheck: boolean,
   actorAccountId: string
-): Promise<{ periodStartOn: CalendarDate; isConfirmed: boolean }> {
+): Promise<{ periodStartOn: CalendarDate; needsUrgentCheck: boolean }> {
   const emp = await db
     .prepare(`SELECT id FROM employees WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
     .bind(employeeId, tenantId)
@@ -830,40 +881,39 @@ export async function setShiftConfirmation(
   const { start } = getCutoffRange(yearMonth, cutoffDay);
   const t = nowUtc();
   const existing = await db
-    .prepare(`SELECT id FROM shift_confirmations WHERE employee_id = ?1 AND period_start_on = ?2`)
+    .prepare(`SELECT id FROM shift_period_flags WHERE employee_id = ?1 AND period_start_on = ?2`)
     .bind(employeeId, start)
     .first<{ id: string }>();
 
   if (existing !== null) {
     await db
       .prepare(
-        `UPDATE shift_confirmations SET is_confirmed=?1, confirmed_at=?2, confirmed_by=?3, updated_at=?4
-          WHERE id=?5 AND tenant_id=?6`
+        `UPDATE shift_period_flags SET needs_urgent_check=?1, updated_by=?2, updated_at=?3
+          WHERE id=?4 AND tenant_id=?5`
       )
-      .bind(confirmed ? 1 : 0, confirmed ? t : null, confirmed ? actorAccountId : null, t, existing.id, tenantId)
+      .bind(needsUrgentCheck ? 1 : 0, actorAccountId, t, existing.id, tenantId)
       .run();
   } else {
     await db
       .prepare(
-        `INSERT INTO shift_confirmations (id,tenant_id,employee_id,period_start_on,is_confirmed,confirmed_at,confirmed_by,created_at,updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)`
+        `INSERT INTO shift_period_flags (id,tenant_id,employee_id,period_start_on,needs_urgent_check,updated_by,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?7)`
       )
-      .bind(crypto.randomUUID(), tenantId, employeeId, start, confirmed ? 1 : 0,
-            confirmed ? t : null, confirmed ? actorAccountId : null, t)
+      .bind(crypto.randomUUID(), tenantId, employeeId, start, needsUrgentCheck ? 1 : 0, actorAccountId, t)
       .run();
   }
-  return { periodStartOn: start, isConfirmed: confirmed };
+  return { periodStartOn: start, needsUrgentCheck };
 }
 
-/** 指定期間が確定済みか */
-export async function isPeriodConfirmed(
+/** 指定期間に緊急確認フラグが立っているか */
+export async function hasUrgentCheck(
   db: D1Database, tenantId: string, employeeId: string, periodStartOn: CalendarDate
 ): Promise<boolean> {
   const row = await db
-    .prepare(`SELECT is_confirmed FROM shift_confirmations WHERE tenant_id=?1 AND employee_id=?2 AND period_start_on=?3`)
+    .prepare(`SELECT needs_urgent_check FROM shift_period_flags WHERE tenant_id=?1 AND employee_id=?2 AND period_start_on=?3`)
     .bind(tenantId, employeeId, periodStartOn)
-    .first<{ is_confirmed: number }>();
-  return row !== null && row.is_confirmed === 1;
+    .first<{ needs_urgent_check: number }>();
+  return row !== null && row.needs_urgent_check === 1;
 }
 
 /**
@@ -914,6 +964,12 @@ export async function bootstrapSetup(
     return { ok: false, reason: "invalid_input" };
   }
 
+  const dup = await db
+    .prepare(`SELECT id FROM accounts WHERE login_id = ?1`)
+    .bind(input.adminLoginId)
+    .first<{ id: string }>();
+  if (dup !== null) return { ok: false, reason: "invalid_input" };
+
   const t = nowUtc();
   const tenantId = crypto.randomUUID();
   const accountId = crypto.randomUUID();
@@ -942,14 +998,15 @@ export async function bootstrapSetup(
     .bind(crypto.randomUUID(), accountId, role.id, tenantId, t)
     .run();
 
-  // 勤務時間帯 A〜D（現行 shift_flg1 の 1〜4 に相当）
-  for (const [i, code] of ["A", "B", "C", "D"].entries()) {
+  // 勤務時間帯の初期値。現行 tb_m_cate1 の CATE1_REMARKS1..21 に相当し、
+  // code は 1〜21 の数値。名称は会社ごとに自由に変更できる（shift1Template.php で実証）。
+  for (const [i, name] of ["早番", "日勤", "遅番", "夜勤"].entries()) {
     await db
       .prepare(
         `INSERT INTO shift_types (id,tenant_id,code,name,sort_order,is_active,created_at,updated_at)
          VALUES (?1,?2,?3,?4,?5,1,?6,?6)`
       )
-      .bind(crypto.randomUUID(), tenantId, code, `${code}グループ`, i + 1, t)
+      .bind(crypto.randomUUID(), tenantId, String(i + 1), name, i + 1, t)
       .run();
   }
 
@@ -1085,4 +1142,110 @@ export async function persistAttendanceSummary(
           sum.workedMinutes, sum.overtimeMinutes, sum.lateCount, sum.earlyLeaveCount, sum.absenceCount, t)
     .run();
   return { id };
+}
+
+/** シフト入力画面に必要な1期間分のデータ */
+export interface ShiftSheetRow {
+  workedOn: CalendarDate;
+  day: number;
+  weekday: string;
+  shiftTypeId: string | null;
+  clockIn: string | null;
+  clockOut: string | null;
+  breakMinutes: number;
+  overtimeMinutes: number;
+  workedMinutes: number;
+  isConfirmed: boolean;
+  isDayLocked: boolean;
+  isAbsent: boolean;
+  note: string | null;
+  dayNote: string | null;
+}
+
+export interface ShiftSheet {
+  employeeId: string;
+  employeeName: string;
+  yearMonth: string;
+  periodStartOn: CalendarDate;
+  periodEndOn: CalendarDate;
+  needsUrgentCheck: boolean;
+  totalWorkedMinutes: number;
+  shiftTypes: Array<{ id: string; code: string; name: string }>;
+  rows: ShiftSheetRow[];
+}
+
+const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
+
+/**
+ * 締め期間の全日を1行ずつ返す（現行 shift1View.php の aryCalendar 相当）。
+ * 登録の無い日も空行として返すため、画面側は期間を意識しなくてよい。
+ */
+export async function getShiftSheet(
+  db: D1Database,
+  tenantId: string,
+  employeeId: string,
+  yearMonth: string,
+  cutoffDay: number
+): Promise<ShiftSheet> {
+  const emp = await db
+    .prepare(`SELECT id, name FROM employees WHERE id=?1 AND tenant_id=?2 AND deleted_at IS NULL`)
+    .bind(employeeId, tenantId)
+    .first<{ id: string; name: string }>();
+  if (emp === null) throw new ShiftServiceError("employee_not_found", "employee not found in tenant scope");
+
+  const { start, end } = getCutoffRange(yearMonth, cutoffDay);
+
+  const types = await db
+    .prepare(`SELECT id, code, name FROM shift_types WHERE tenant_id=?1 AND is_active=1 ORDER BY sort_order`)
+    .bind(tenantId)
+    .all<{ id: string; code: string; name: string }>();
+
+  const shifts = await db
+    .prepare(
+      `SELECT worked_on, shift_type_id, clock_in, clock_out, break_minutes, overtime_minutes,
+              worked_minutes, is_confirmed, is_day_locked, is_absent, note, day_note
+         FROM shifts
+        WHERE tenant_id=?1 AND employee_id=?2 AND worked_on>=?3 AND worked_on<=?4 AND deleted_at IS NULL`
+    )
+    .bind(tenantId, employeeId, start, end)
+    .all<{
+      worked_on: string; shift_type_id: string | null; clock_in: string | null; clock_out: string | null;
+      break_minutes: number; overtime_minutes: number; worked_minutes: number;
+      is_confirmed: number; is_day_locked: number; is_absent: number; note: string | null; day_note: string | null;
+    }>();
+
+  const byDate = new Map((shifts.results ?? []).map((r) => [r.worked_on, r]));
+
+  const rows: ShiftSheetRow[] = eachDate(start, end).map((d) => {
+    const r = byDate.get(d);
+    const dow = new Date(`${d}T00:00:00Z`).getUTCDay();
+    return {
+      workedOn: d,
+      day: Number(d.slice(8, 10)),
+      weekday: WEEKDAYS[dow],
+      shiftTypeId: r?.shift_type_id ?? null,
+      clockIn: r?.clock_in ?? null,
+      clockOut: r?.clock_out ?? null,
+      breakMinutes: r?.break_minutes ?? 0,
+      overtimeMinutes: r?.overtime_minutes ?? 0,
+      workedMinutes: r?.worked_minutes ?? 0,
+      isConfirmed: r?.is_confirmed === 1,
+      isDayLocked: r?.is_day_locked === 1,
+      isAbsent: r?.is_absent === 1,
+      note: r?.note ?? null,
+      dayNote: r?.day_note ?? null,
+    };
+  });
+
+  return {
+    employeeId,
+    employeeName: emp.name,
+    yearMonth,
+    periodStartOn: start,
+    periodEndOn: end,
+    needsUrgentCheck: await hasUrgentCheck(db, tenantId, employeeId, start),
+    totalWorkedMinutes: rows.reduce((a, r) => a + r.workedMinutes, 0),
+    shiftTypes: types.results ?? [],
+    rows,
+  };
 }
