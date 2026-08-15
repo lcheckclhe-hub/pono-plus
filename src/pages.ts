@@ -444,3 +444,347 @@ document.getElementById('save').addEventListener('click', async () => {
 </body>
 </html>`;
 }
+
+// ===============================================================
+// 従業員一覧・登録・修正（T-7）
+// ===============================================================
+/**
+ * 🔴 現行から意図的に変えた点:
+ *   B-35 入力値のエスケープ。画面は textContent 経由で描画し innerHTML に値を混ぜない
+ *   B-38 外部 CDN 依存なし
+ *   現行の登録画面（index2.html）にあった「勤務時間帯 ki（1〜4=A〜D）」は
+ *   会社ごとの shift_types から選ばせる形に変えた（設計書 4.5 の訂正）
+ *   現行に無かった「入社日」を追加した。これが無いと勤続年数が常に空になる
+ */
+const ADMIN_STYLE = `
+  body { align-items: flex-start; }
+  .login { max-width: 960px; padding-top: 32px; }
+  .bar { display: flex; gap: 8px; align-items: flex-end; margin-bottom: 16px; flex-wrap: wrap; }
+  .bar .row { margin-bottom: 0; }
+  .bar button { width: auto; padding: 10px 16px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #e4e9ee; white-space: nowrap; }
+  th { color: #6b7885; font-weight: 600; background: #f7f9fb; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+  .tag.active { background: #e6f2e6; color: #256b25; }
+  .tag.suspended { background: #fdf0e0; color: #8a5a12; }
+  .tag.resigned { background: #eceff2; color: #6b7885; }
+  .scroll { overflow-x: auto; }
+  a.btn { display: inline-block; padding: 10px 16px; background: #2f6fbf; color: #fff;
+          border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: 600; }
+  .links { margin-top: 16px; font-size: 13px; }
+  .links a { color: #2f6fbf; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+  @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+  .req { color: #a32020; }
+  .hint { font-size: 12px; color: #6b7885; margin-top: 4px; }
+  input[type=date], input[type=email] {
+    width: 100%; padding: 11px 12px; font-size: 16px;
+    border: 1px solid #c8d0d8; border-radius: 6px; background: #fff;
+  }
+  .ok { background: #e6f2e6; border: 1px solid #a8cfa8; color: #256b25;
+        padding: 10px 12px; border-radius: 6px; font-size: 14px; margin-bottom: 16px; }
+`;
+
+export function employeeListPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>従業員一覧 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}</style>
+</head>
+<body>
+<div class="login">
+  <h1>従業員一覧</h1>
+  <div class="box">
+    <div class="bar">
+      <div class="row" style="flex:1 1 200px">
+        <label for="kw">氏名・カナ・従業員番号</label>
+        <input type="text" id="kw" placeholder="部分一致">
+      </div>
+      <div class="row" style="flex:0 0 140px">
+        <label for="st">状態</label>
+        <select id="st">
+          <option value="">すべて</option>
+          <option value="active" selected>在籍</option>
+          <option value="suspended">休止</option>
+          <option value="resigned">退職</option>
+        </select>
+      </div>
+      <div class="row"><button id="go">表示</button></div>
+      <div class="row"><a class="btn" href="/employees/new">新規登録</a></div>
+    </div>
+    <p id="msg"></p>
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th>番号</th><th>氏名</th><th>カナ</th><th>ログインID</th>
+          <th>雇用形態</th><th>勤務時間帯</th><th>入社日</th><th>状態</th><th></th>
+        </tr></thead>
+        <tbody id="rows"><tr><td colspan="9">読み込み中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <p class="links"><a href="/home">ホームへ戻る</a></p>
+</div>
+<script>
+const EMPLOYMENT = { regular:'社員', part_time:'アルバイト', cleaner:'清掃員', other:'その他' };
+const STATUS = { active:'在籍', suspended:'休止', resigned:'退職' };
+
+function cell(text, cls) {
+  const td = document.createElement('td');
+  if (cls) td.className = cls;
+  td.textContent = text === null || text === undefined || text === '' ? '-' : String(text);
+  return td;
+}
+
+async function load() {
+  const q = new URLSearchParams();
+  const kw = document.getElementById('kw').value.trim();
+  const st = document.getElementById('st').value;
+  if (kw !== '') q.set('keyword', kw);
+  if (st !== '') q.set('status', st);
+  const res = await fetch('/api/employees?' + q.toString());
+  if (res.status === 401) { location.href = '/login'; return; }
+  const tbody = document.getElementById('rows');
+  tbody.replaceChildren();
+  if (res.status === 403) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell('この画面を見る権限がありません'));
+    tr.firstChild.colSpan = 9;
+    tbody.appendChild(tr);
+    return;
+  }
+  const data = await res.json();
+  document.getElementById('msg').textContent = data.count + ' 件';
+  if (data.employees.length === 0) {
+    const tr = document.createElement('tr');
+    const td = cell('該当する従業員がいません');
+    td.colSpan = 9;
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  for (const e of data.employees) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell(e.employeeCode));
+    tr.appendChild(cell(e.name));
+    tr.appendChild(cell(e.nameKana));
+    tr.appendChild(cell(e.loginId));
+    tr.appendChild(cell(EMPLOYMENT[e.employmentType] || e.employmentType));
+    tr.appendChild(cell(e.shiftTypeName));
+    tr.appendChild(cell(e.hiredOn));
+    const tdS = document.createElement('td');
+    const span = document.createElement('span');
+    span.className = 'tag ' + e.status;
+    span.textContent = STATUS[e.status] || e.status;
+    tdS.appendChild(span);
+    tr.appendChild(tdS);
+    const tdA = document.createElement('td');
+    const a = document.createElement('a');
+    a.href = '/employees/new?employeeId=' + encodeURIComponent(e.id);
+    a.textContent = '修正';
+    a.style.color = '#2f6fbf';
+    tdA.appendChild(a);
+    tr.appendChild(tdA);
+    tbody.appendChild(tr);
+  }
+}
+document.getElementById('go').addEventListener('click', load);
+document.getElementById('kw').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') load(); });
+load();
+</script>
+</body>
+</html>`;
+}
+
+/** 登録と修正を1つの画面で兼ねる。employeeId があれば修正モード */
+export function employeeFormPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>従業員登録 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}
+  .login { max-width: 620px; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1 id="title">従業員登録</h1>
+  <div class="box">
+    <p class="error" id="err" style="display:none"></p>
+    <p class="ok" id="ok" style="display:none"></p>
+    <div class="grid">
+      <div class="row">
+        <label for="name">氏名 <span class="req">*</span></label>
+        <input type="text" id="name" required>
+      </div>
+      <div class="row">
+        <label for="nameKana">カナ</label>
+        <input type="text" id="nameKana">
+      </div>
+      <div class="row">
+        <label for="employeeCode">従業員番号</label>
+        <input type="text" id="employeeCode">
+        <p class="hint">会社内で重複できません</p>
+      </div>
+      <div class="row">
+        <label for="employmentType">雇用形態 <span class="req">*</span></label>
+        <select id="employmentType">
+          <option value="regular">社員</option>
+          <option value="part_time">アルバイト</option>
+          <option value="cleaner">清掃員</option>
+          <option value="other">その他</option>
+        </select>
+      </div>
+      <div class="row">
+        <label for="birthOn">生年月日</label>
+        <input type="date" id="birthOn">
+      </div>
+      <div class="row">
+        <label for="hiredOn">入社日</label>
+        <input type="date" id="hiredOn">
+        <p class="hint">未入力だと勤続年数が出ません</p>
+      </div>
+      <div class="row">
+        <label for="gender">性別</label>
+        <select id="gender">
+          <option value="">未選択</option>
+          <option value="male">男性</option>
+          <option value="female">女性</option>
+          <option value="other">その他</option>
+          <option value="undisclosed">回答しない</option>
+        </select>
+      </div>
+      <div class="row">
+        <label for="shiftTypeId">既定の勤務時間帯</label>
+        <select id="shiftTypeId"><option value="">未設定</option></select>
+      </div>
+    </div>
+
+    <div id="newOnly">
+      <div class="row">
+        <label for="loginId">ログインID <span class="req">*</span></label>
+        <input type="text" id="loginId" autocapitalize="off">
+        <p class="hint">全社で重複できません</p>
+      </div>
+      <div class="row">
+        <label for="email">メールアドレス</label>
+        <input type="email" id="email">
+      </div>
+      <div class="row">
+        <label for="password">初期パスワード <span class="req">*</span></label>
+        <input type="password" id="password" autocomplete="new-password">
+        <p class="hint">12文字以上。控えて本人に直接伝えてください（メール送信はしません）</p>
+      </div>
+    </div>
+
+    <div class="row" id="editOnly" style="display:none">
+      <label for="status">状態</label>
+      <select id="status">
+        <option value="active">在籍</option>
+        <option value="suspended">休止</option>
+        <option value="resigned">退職</option>
+      </select>
+    </div>
+
+    <button id="save">保存</button>
+  </div>
+  <p class="links"><a href="/employees">従業員一覧へ戻る</a></p>
+</div>
+<script>
+const LABEL = {
+  name:'氏名', nameKana:'カナ', employeeCode:'従業員番号', loginId:'ログインID',
+  password:'パスワード', email:'メールアドレス', employmentType:'雇用形態',
+  gender:'性別', birthOn:'生年月日', hiredOn:'入社日', shiftTypeId:'勤務時間帯',
+  worksiteId:'事業場', status:'状態', employeeId:'従業員'
+};
+const CODE = {
+  required:'を入力してください', too_short:'が短すぎます',
+  invalid_format:'の形式が正しくありません', invalid_value:'の値が正しくありません',
+  already_taken:'は既に使われています', not_a_real_date:'が実在しない日付です',
+  out_of_range:'が範囲外です', in_the_future:'が未来の日付です',
+  before_birth:'が生年月日より前です', not_found:'が見つかりません'
+};
+const employeeId = new URLSearchParams(location.search).get('employeeId');
+const $ = (id) => document.getElementById(id);
+
+function show(el, text) { el.textContent = text; el.style.display = text === '' ? 'none' : 'block'; }
+
+async function init() {
+  const st = await fetch('/api/shift-types');
+  if (st.status === 401) { location.href = '/login'; return; }
+  if (st.ok) {
+    const d = await st.json();
+    for (const t of d.shiftTypes) {
+      const o = document.createElement('option');
+      o.value = t.id;
+      o.textContent = t.code + ': ' + t.name;
+      $('shiftTypeId').appendChild(o);
+    }
+  }
+  if (employeeId === null) return;
+
+  $('title').textContent = '従業員の修正';
+  $('newOnly').style.display = 'none';
+  $('editOnly').style.display = 'block';
+  const res = await fetch('/api/employees/detail?employeeId=' + encodeURIComponent(employeeId));
+  if (!res.ok) { show($('err'), '従業員を読み込めませんでした'); return; }
+  const e = (await res.json()).employee;
+  for (const k of ['name','nameKana','employeeCode','employmentType','birthOn','hiredOn','gender','shiftTypeId','status']) {
+    $(k).value = e[k] === null ? '' : e[k];
+  }
+}
+
+$('save').addEventListener('click', async () => {
+  show($('err'), ''); show($('ok'), '');
+  $('save').disabled = true;
+  const base = {
+    name: $('name').value,
+    nameKana: $('nameKana').value,
+    employeeCode: $('employeeCode').value,
+    employmentType: $('employmentType').value,
+    birthOn: $('birthOn').value === '' ? null : $('birthOn').value,
+    hiredOn: $('hiredOn').value === '' ? null : $('hiredOn').value,
+    gender: $('gender').value === '' ? null : $('gender').value,
+    shiftTypeId: $('shiftTypeId').value === '' ? null : $('shiftTypeId').value
+  };
+  const isEdit = employeeId !== null;
+  const url = isEdit ? '/api/employees/update' : '/api/employees';
+  const body = isEdit
+    ? Object.assign({ employeeId: employeeId, status: $('status').value }, base)
+    : Object.assign({ loginId: $('loginId').value, email: $('email').value === '' ? null : $('email').value,
+                      password: $('password').value }, base);
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify(body)
+  });
+  $('save').disabled = false;
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.ok) {
+    if (isEdit) { show($('ok'), '保存しました'); }
+    else { location.href = '/employees'; }
+    return;
+  }
+  const d = await res.json().catch(() => ({}));
+  if (d.issues) {
+    show($('err'), d.issues.map((i) => (LABEL[i.field] || i.field) + (CODE[i.code] || 'が不正です')).join(' / '));
+  } else if (res.status === 403) {
+    show($('err'), 'この操作を行う権限がありません');
+  } else {
+    show($('err'), '保存できませんでした');
+  }
+});
+init();
+</script>
+</body>
+</html>`;
+}
