@@ -830,7 +830,8 @@ export function attendancePage(): string {
   .login { max-width: 720px; }
   .kpi { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 20px; }
   @media (max-width: 560px) { .kpi { grid-template-columns: repeat(2, 1fr); } }
-  .kpi div { background: #f7f9fb; border: 1px solid #e4e9ee; border-radius: 8px; padding: 12px; }
+  /* ⚠ 子セレクタにすること。.kpi div だと内側の .k / .v にも枠が付き二重になる */
+  .kpi > div { background: #f7f9fb; border: 1px solid #e4e9ee; border-radius: 8px; padding: 12px 14px; }
   .kpi .k { font-size: 12px; color: #6b7885; }
   .kpi .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
   .kpi .u { font-size: 12px; font-weight: 400; color: #6b7885; margin-left: 2px; }
@@ -936,8 +937,9 @@ async function load() {
   kpi.appendChild(card('早退', String(r.earlyLeaveCount), '回'));
   kpi.appendChild(card('欠勤', String(r.absenceCount), '回'));
   const tb = $('detail').querySelector('tbody');
+  // ⚠ attendanceRate は services 側で既に百分率（例 75）。ここで100倍しない
   tb.appendChild(row('出勤率', r.attendanceRate === null ? '－（登録なし）'
-    : (Math.round(r.attendanceRate * 1000) / 10) + ' %'));
+    : r.attendanceRate + ' %'));
   tb.appendChild(row('勤続', r.tenure === null ? '－（入社日が未登録）'
     : r.tenure.years + '年' + r.tenure.months + 'か月'));
   tb.appendChild(row('年齢', r.age === null ? '－（生年月日が未登録）' : r.age + '歳'));
