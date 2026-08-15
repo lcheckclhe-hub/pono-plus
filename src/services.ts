@@ -848,6 +848,7 @@ export const EMPLOYEE_DELETION_ORDER: Array<{
   by: "employee_id" | "account_id" | "login_id";
   cols?: string[];
 }> = [
+  { table: "skill_sheets", by: "employee_id" },
   { table: "thanks", by: "employee_id", cols: ["from_employee_id", "to_employee_id"] },
   { table: "photo_posts", by: "employee_id" },
   { table: "daily_reports", by: "employee_id" },
@@ -872,7 +873,8 @@ export const TENANT_DELETION_ORDER: string[] = [
   "shift_period_flags",
   "shifts",
   "attendance_summaries",
-  // thanks / photo_posts / daily_reports は employees を参照する
+  // skill_sheets / thanks / photo_posts / daily_reports は employees を参照する
+  "skill_sheets",
   "thanks",
   "photo_posts",
   "daily_reports",
@@ -2890,4 +2892,280 @@ export async function thanksRanking(
     out.push({ rank, employeeId: r.employee_id, employeeName: r.employee_name, receivedCount: r.n });
   });
   return out;
+}
+
+// ===============================================================
+// スキルシート（機能権限表 区分9 / T-41〜T-46）
+// ===============================================================
+/**
+ * ⚠ 勤怠評価とは別機能【会話合意 2026-08-16】。
+ *   単位が年度の月別一覧であること、本人が直接見る画面があること、
+ *   管理者が本人について書く「業務内容」を持つことが決定的に違う。
+ *
+ * 🔴 現行から意図的に変えた点:
+ *   ① 業務内容に公開/非公開の切り替えを設ける。
+ *      現行は必ず本人に見えており（user3skill2Template.php_back L64）、
+ *      管理者が率直に書けない構造だった。既定は「管理者のみ」（安全側）。
+ *   ② 遅刻・早退・当欠は、シフト実績から算出した値を初期値として提示し、
+ *      手で上書きできる。現行は完全な手入力だった。
+ *      「システムが把握していない遅刻」を記録できる余地は残す。
+ *   ③ 残業数は本人の画面に出さない（現行のマスタ③画面に列が無い）。
+ *   ④ 年齢を保存しない。現行は hidden で送って保存していたが陳腐化する。
+ */
+
+export const SKILL_COMMENT_MAX = 2000;
+
+export interface SkillSheet {
+  id: string;
+  employeeId: string;
+  employeeName: string | null;
+  periodYearMonth: string;
+  lateCount: number;
+  earlyLeaveCount: number;
+  absenceCount: number;
+  /** 🔴 本人向けの応答では null にすること */
+  overtimeCount: number | null;
+  comment: string | null;
+  commentVisibleToEmployee: boolean;
+}
+
+interface SkillSheetDbRow {
+  id: string;
+  employee_id: string;
+  employee_name: string | null;
+  period_year_month: string;
+  late_count: number;
+  early_leave_count: number;
+  absence_count: number;
+  overtime_count: number;
+  comment: string | null;
+  comment_visible_to_employee: number;
+}
+
+const SKILL_SELECT = `
+  SELECT s.id, s.employee_id, e.name AS employee_name, s.period_year_month,
+         s.late_count, s.early_leave_count, s.absence_count, s.overtime_count,
+         s.comment, s.comment_visible_to_employee
+    FROM skill_sheets s
+    LEFT JOIN employees e ON e.id = s.employee_id`;
+
+function toSkillSheet(r: SkillSheetDbRow): SkillSheet {
+  return {
+    id: r.id,
+    employeeId: r.employee_id,
+    employeeName: r.employee_name,
+    periodYearMonth: r.period_year_month,
+    lateCount: r.late_count,
+    earlyLeaveCount: r.early_leave_count,
+    absenceCount: r.absence_count,
+    overtimeCount: r.overtime_count,
+    comment: r.comment,
+    commentVisibleToEmployee: r.comment_visible_to_employee === 1,
+  };
+}
+
+/**
+ * 🔴 本人向けに項目を落とす。ハンドラで必ず通すこと。
+ *   ・残業数は見せない（現行のマスタ③画面に列が無い）
+ *   ・業務内容は公開設定が入っているものだけ見せる
+ */
+export function redactForEmployee(s: SkillSheet): SkillSheet {
+  return {
+    ...s,
+    overtimeCount: null,
+    comment: s.commentVisibleToEmployee ? s.comment : null,
+  };
+}
+
+export interface SkillSheetInput {
+  employeeId: string;
+  periodYearMonth: string;
+  lateCount: number;
+  earlyLeaveCount: number;
+  absenceCount: number;
+  overtimeCount: number;
+  comment: string | null;
+  commentVisibleToEmployee: boolean;
+}
+
+export function validateSkillSheet(input: SkillSheetInput): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!isYearMonth(input.periodYearMonth)) issues.push({ field: "periodYearMonth", code: "invalid_format" });
+  for (const [field, v] of [
+    ["lateCount", input.lateCount],
+    ["earlyLeaveCount", input.earlyLeaveCount],
+    ["absenceCount", input.absenceCount],
+    ["overtimeCount", input.overtimeCount],
+  ] as const) {
+    if (!Number.isInteger(v)) issues.push({ field, code: "not_an_integer" });
+    else if (v < 0 || v > 1000) issues.push({ field, code: "out_of_range" });
+  }
+  if (input.comment !== null && input.comment.length > SKILL_COMMENT_MAX) {
+    issues.push({ field: "comment", code: "too_long" });
+  }
+  return issues;
+}
+
+export async function upsertSkillSheet(
+  db: D1Database,
+  tenantId: string,
+  input: SkillSheetInput
+): Promise<{ id: string; created: boolean }> {
+  const issues = validateSkillSheet(input);
+  if (issues.length > 0) throw new RegistrationError(issues);
+
+  const emp = await db
+    .prepare(`SELECT id FROM employees WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+    .bind(input.employeeId, tenantId)
+    .first<{ id: string }>();
+  if (emp === null) throw new RegistrationError([{ field: "employeeId", code: "not_found" }]);
+
+  const t = nowUtc();
+  const visible = input.commentVisibleToEmployee ? 1 : 0;
+  const existing = await db
+    .prepare(
+      `SELECT id FROM skill_sheets
+        WHERE tenant_id = ?1 AND employee_id = ?2 AND period_year_month = ?3 AND deleted_at IS NULL`
+    )
+    .bind(tenantId, input.employeeId, input.periodYearMonth)
+    .first<{ id: string }>();
+
+  if (existing !== null) {
+    await db
+      .prepare(
+        `UPDATE skill_sheets
+            SET late_count = ?1, early_leave_count = ?2, absence_count = ?3, overtime_count = ?4,
+                comment = ?5, comment_visible_to_employee = ?6, updated_at = ?7
+          WHERE id = ?8 AND tenant_id = ?9`
+      )
+      .bind(input.lateCount, input.earlyLeaveCount, input.absenceCount, input.overtimeCount,
+            emptyToNull(input.comment), visible, t, existing.id, tenantId)
+      .run();
+    return { id: existing.id, created: false };
+  }
+
+  const id = crypto.randomUUID();
+  await db
+    .prepare(
+      `INSERT INTO skill_sheets
+         (id,tenant_id,employee_id,period_year_month,late_count,early_leave_count,absence_count,
+          overtime_count,comment,comment_visible_to_employee,created_at,updated_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)`
+    )
+    .bind(id, tenantId, input.employeeId, input.periodYearMonth, input.lateCount,
+          input.earlyLeaveCount, input.absenceCount, input.overtimeCount,
+          emptyToNull(input.comment), visible, t)
+    .run();
+  return { id, created: true };
+}
+
+export async function getSkillSheet(
+  db: D1Database,
+  tenantId: string,
+  employeeId: string,
+  periodYearMonth: string
+): Promise<SkillSheet | null> {
+  const r = await db
+    .prepare(
+      `${SKILL_SELECT} WHERE s.tenant_id = ?1 AND s.employee_id = ?2
+         AND s.period_year_month = ?3 AND s.deleted_at IS NULL`
+    )
+    .bind(tenantId, employeeId, periodYearMonth)
+    .first<SkillSheetDbRow>();
+  return r === null ? null : toSkillSheet(r);
+}
+
+export interface SkillSheetRow extends SkillSheet {
+  /** シフトから算出した出勤数（保存しない） */
+  workDays: number;
+  /** 受け取った「ありがとう」の件数（保存しない） */
+  thanksCount: number;
+}
+
+/**
+ * 年度の月別一覧。現行 user3skill2Template.php_back の表に相当する。
+ * 出勤数と「ありがとう数」は保存せず、shifts / thanks から都度算出する。
+ */
+export async function listSkillSheetsByYear(
+  db: D1Database,
+  tenantId: string,
+  employeeId: string,
+  year: string
+): Promise<SkillSheetRow[]> {
+  if (!/^\d{4}$/.test(year)) throw new RegistrationError([{ field: "year", code: "invalid_format" }]);
+
+  const sheets = await db
+    .prepare(
+      `${SKILL_SELECT} WHERE s.tenant_id = ?1 AND s.employee_id = ?2
+         AND s.period_year_month LIKE ?3 AND s.deleted_at IS NULL
+       ORDER BY s.period_year_month ASC`
+    )
+    .bind(tenantId, employeeId, `${year}-%`)
+    .all<SkillSheetDbRow>();
+
+  // 出勤数：その月に登録があり欠勤でないシフトの日数
+  const shiftRes = await db
+    .prepare(
+      `SELECT substr(worked_on,1,7) AS ym, COUNT(*) AS n FROM shifts
+        WHERE tenant_id = ?1 AND employee_id = ?2 AND worked_on LIKE ?3
+          AND is_absent = 0 AND deleted_at IS NULL
+        GROUP BY substr(worked_on,1,7)`
+    )
+    .bind(tenantId, employeeId, `${year}-%`)
+    .all<{ ym: string; n: number }>();
+  const workDaysBy = new Map((shiftRes.results ?? []).map((r) => [r.ym, r.n]));
+
+  // ありがとう数：その月に受け取った件数
+  const thanksRes = await db
+    .prepare(
+      `SELECT period_year_month AS ym, COUNT(*) AS n FROM thanks
+        WHERE tenant_id = ?1 AND to_employee_id = ?2 AND period_year_month LIKE ?3
+          AND deleted_at IS NULL
+        GROUP BY period_year_month`
+    )
+    .bind(tenantId, employeeId, `${year}-%`)
+    .all<{ ym: string; n: number }>();
+  const thanksBy = new Map((thanksRes.results ?? []).map((r) => [r.ym, r.n]));
+
+  return (sheets.results ?? []).map((r) => {
+    const s = toSkillSheet(r);
+    return {
+      ...s,
+      workDays: workDaysBy.get(s.periodYearMonth) ?? 0,
+      thanksCount: thanksBy.get(s.periodYearMonth) ?? 0,
+    };
+  });
+}
+
+/**
+ * 入力欄の初期値。シフト実績から算出する。
+ * 🔴 保存はしない。管理者が上書きできる余地を残すための提示値。
+ */
+export async function suggestSkillCounts(
+  db: D1Database,
+  tenantId: string,
+  employeeId: string,
+  periodYearMonth: string
+): Promise<{ lateCount: number; earlyLeaveCount: number; absenceCount: number; overtimeCount: number; workDays: number }> {
+  if (!isYearMonth(periodYearMonth)) throw new RegistrationError([{ field: "periodYearMonth", code: "invalid_format" }]);
+  const r = await db
+    .prepare(
+      `SELECT
+         COUNT(CASE WHEN is_late = 1 THEN 1 END) AS late,
+         COUNT(CASE WHEN is_early_leave = 1 THEN 1 END) AS early,
+         COUNT(CASE WHEN is_absent = 1 THEN 1 END) AS absent,
+         COUNT(CASE WHEN is_absent = 0 THEN 1 END) AS work_days,
+         COUNT(CASE WHEN overtime_minutes > 0 THEN 1 END) AS overtime
+       FROM shifts
+        WHERE tenant_id = ?1 AND employee_id = ?2 AND worked_on LIKE ?3 AND deleted_at IS NULL`
+    )
+    .bind(tenantId, employeeId, `${periodYearMonth}-%`)
+    .first<{ late: number; early: number; absent: number; work_days: number; overtime: number }>();
+  return {
+    lateCount: r?.late ?? 0,
+    earlyLeaveCount: r?.early ?? 0,
+    absenceCount: r?.absent ?? 0,
+    overtimeCount: r?.overtime ?? 0,
+    workDays: r?.work_days ?? 0,
+  };
 }
