@@ -881,6 +881,9 @@ export const TENANT_DELETION_ORDER: string[] = [
   "daily_report_categories",
   "employees",
   "shift_types",
+  "tenant_notice_images",
+  "tenant_notice_links",
+  "tenant_notices",
   // worksites を参照するため、worksites より先に消すこと
   "worksite_monthly_reports",
   "worksites",
@@ -3168,4 +3171,331 @@ export async function suggestSkillCounts(
     overtimeCount: r?.overtime ?? 0,
     workDays: r?.work_days ?? 0,
   };
+}
+
+// ===============================================================
+// トップ表示（区分1）・更新履歴（区分2）・サポート（区分12）
+// T-47〜T-53
+// ===============================================================
+/**
+ * 🔴 現行から意図的に変えた点（user1Template.php / user3Template.php で実証）:
+ *
+ *   ① 動画は「埋め込みコード（iframe の HTML）」をそのまま保存・出力していた。
+ *      画面に「右クリック→埋め込みコードをコピー→ペースト→height 以下は削除」
+ *      という手順書きがあり、利用者にも煩雑で、かつ任意のスクリプトを
+ *      埋め込める経路だった。新実装は URL から動画IDだけを抽出して保存する。
+ *
+ *   ② URL3本・画像4枚を番号付きの列（remarks3/4/5・pic1〜4）ではなく行で持つ。
+ *
+ *   ③ 画像を公開ディレクトリ（../upload/）に置かない。R2 ＋ 認証必須の配信。
+ */
+
+export const NOTICE_MESSAGE_MAX = 500;
+export const NOTICE_LINK_MAX = 5;
+export const NOTICE_IMAGE_MAX = 4;
+
+export interface VideoRef {
+  kind: "youtube" | "vimeo";
+  id: string;
+}
+
+/**
+ * 動画URL から種別とIDを取り出す。
+ * 🔴 iframe の HTML を渡された場合も src を拾って ID だけを取る。HTML は保存しない。
+ */
+export function parseVideoRef(input: string): VideoRef | null {
+  const s = (input ?? "").trim();
+  if (s === "") return null;
+  // iframe を貼られた場合は src の中身だけを見る
+  const srcMatch = /src\s*=\s*["']([^"']+)["']/i.exec(s);
+  const target = srcMatch !== null ? srcMatch[1] : s;
+
+  const yt = /(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/.exec(target);
+  if (yt !== null) return { kind: "youtube", id: yt[1] };
+  // 動画IDだけを直接貼られた場合
+  if (/^[A-Za-z0-9_-]{11}$/.test(target)) return { kind: "youtube", id: target };
+
+  const vm = /vimeo\.com\/(?:video\/)?(\d{6,12})/.exec(target);
+  if (vm !== null) return { kind: "vimeo", id: vm[1] };
+
+  return null;
+}
+
+/** 保存済みの ID から埋め込み URL を組み立てる。🔴 ユーザー入力の HTML を使わない */
+export function videoEmbedUrl(ref: VideoRef): string {
+  return ref.kind === "youtube"
+    ? `https://www.youtube-nocookie.com/embed/${ref.id}`
+    : `https://player.vimeo.com/video/${ref.id}`;
+}
+
+export interface NoticeLink {
+  id: string;
+  url: string;
+  label: string | null;
+  sortOrder: number;
+}
+
+export interface NoticeImage {
+  id: string;
+  sortOrder: number;
+}
+
+export interface TenantNotice {
+  message: string | null;
+  video: VideoRef | null;
+  embedUrl: string | null;
+  links: NoticeLink[];
+  images: NoticeImage[];
+}
+
+export async function getTenantNotice(db: D1Database, tenantId: string): Promise<TenantNotice> {
+  const n = await db
+    .prepare(`SELECT message, video_id, video_kind FROM tenant_notices WHERE tenant_id = ?1`)
+    .bind(tenantId)
+    .first<{ message: string | null; video_id: string | null; video_kind: string | null }>();
+
+  const linkRes = await db
+    .prepare(`SELECT id, url, label, sort_order FROM tenant_notice_links WHERE tenant_id = ?1 ORDER BY sort_order ASC`)
+    .bind(tenantId)
+    .all<{ id: string; url: string; label: string | null; sort_order: number }>();
+
+  const imgRes = await db
+    .prepare(`SELECT id, sort_order FROM tenant_notice_images WHERE tenant_id = ?1 ORDER BY sort_order ASC`)
+    .bind(tenantId)
+    .all<{ id: string; sort_order: number }>();
+
+  const video: VideoRef | null =
+    n?.video_id != null && n.video_kind != null
+      ? { kind: n.video_kind as "youtube" | "vimeo", id: n.video_id }
+      : null;
+
+  return {
+    message: n?.message ?? null,
+    video,
+    embedUrl: video === null ? null : videoEmbedUrl(video),
+    links: (linkRes.results ?? []).map((r) => ({ id: r.id, url: r.url, label: r.label, sortOrder: r.sort_order })),
+    images: (imgRes.results ?? []).map((r) => ({ id: r.id, sortOrder: r.sort_order })),
+  };
+}
+
+export interface NoticeInput {
+  message: string | null;
+  /** 動画URL または動画ID。空なら解除 */
+  videoInput: string | null;
+  links: Array<{ url: string; label: string | null }>;
+}
+
+/** URL は http(s) のみ通す。javascript: などを弾く */
+function isSafeHttpUrl(u: string): boolean {
+  try {
+    const p = new URL(u);
+    return p.protocol === "https:" || p.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+export async function updateTenantNotice(
+  db: D1Database,
+  tenantId: string,
+  input: NoticeInput
+): Promise<{ video: VideoRef | null }> {
+  const issues: ValidationIssue[] = [];
+  if (input.message !== null && input.message.length > NOTICE_MESSAGE_MAX) {
+    issues.push({ field: "message", code: "too_long" });
+  }
+  if (input.links.length > NOTICE_LINK_MAX) issues.push({ field: "links", code: "out_of_range" });
+  for (const l of input.links) {
+    if (!isSafeHttpUrl(l.url)) issues.push({ field: "links", code: "invalid_format" });
+    if (l.label !== null && l.label.length > 100) issues.push({ field: "links", code: "too_long" });
+  }
+
+  let video: VideoRef | null = null;
+  const vi = emptyToNull(input.videoInput);
+  if (vi !== null) {
+    video = parseVideoRef(vi);
+    // 🔴 解釈できないものは保存しない。HTML をそのまま持たない
+    if (video === null) issues.push({ field: "videoInput", code: "unsupported_video" });
+  }
+  if (issues.length > 0) throw new RegistrationError(issues);
+
+  const t = nowUtc();
+  await db
+    .prepare(
+      `INSERT INTO tenant_notices (tenant_id,message,video_id,video_kind,created_at,updated_at)
+       VALUES (?1,?2,?3,?4,?5,?5)
+       ON CONFLICT(tenant_id) DO UPDATE SET
+         message = excluded.message, video_id = excluded.video_id,
+         video_kind = excluded.video_kind, updated_at = excluded.updated_at`
+    )
+    .bind(tenantId, emptyToNull(input.message), video?.id ?? null, video?.kind ?? null, t)
+    .run();
+
+  // リンクは総入れ替え（3本固定ではなく行として持つため）
+  await db.prepare(`DELETE FROM tenant_notice_links WHERE tenant_id = ?1`).bind(tenantId).run();
+  for (const [i, l] of input.links.entries()) {
+    await db
+      .prepare(
+        `INSERT INTO tenant_notice_links (id,tenant_id,sort_order,url,label,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?6)`
+      )
+      .bind(crypto.randomUUID(), tenantId, i + 1, l.url.trim(), emptyToNull(l.label), t)
+      .run();
+  }
+  return { video };
+}
+
+/** トップ表示の画像。プロフィール・日報と同じ作法（キーは自前生成・中身で判定） */
+export async function addNoticeImage(
+  db: D1Database,
+  photos: R2Bucket,
+  tenantId: string,
+  bytes: Uint8Array
+): Promise<{ id: string; objectKey: string }> {
+  if (bytes.length === 0) throw new RegistrationError([{ field: "image", code: "required" }]);
+  if (bytes.length > PHOTO_MAX_BYTES) throw new RegistrationError([{ field: "image", code: "too_large" }]);
+  const kind = sniffImageType(bytes);
+  if (kind === null) throw new RegistrationError([{ field: "image", code: "unsupported_type" }]);
+
+  const cnt = await db
+    .prepare(`SELECT COUNT(*) AS n FROM tenant_notice_images WHERE tenant_id = ?1`)
+    .bind(tenantId)
+    .first<{ n: number }>();
+  if ((cnt?.n ?? 0) >= NOTICE_IMAGE_MAX) {
+    throw new RegistrationError([{ field: "image", code: "too_many" }]);
+  }
+
+  const id = crypto.randomUUID();
+  const objectKey = `tenants/${tenantId}/notices/${id}/${crypto.randomUUID()}.${kind.ext}`;
+  await photos.put(objectKey, bytes, { httpMetadata: { contentType: kind.mime } });
+  try {
+    const t = nowUtc();
+    await db
+      .prepare(
+        `INSERT INTO tenant_notice_images (id,tenant_id,sort_order,object_key,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?5)`
+      )
+      .bind(id, tenantId, (cnt?.n ?? 0) + 1, objectKey, t)
+      .run();
+  } catch (e) {
+    await photos.delete(objectKey);
+    throw e;
+  }
+  return { id, objectKey };
+}
+
+export async function deleteNoticeImage(
+  db: D1Database,
+  photos: R2Bucket,
+  tenantId: string,
+  imageId: string
+): Promise<boolean> {
+  const cur = await db
+    .prepare(`SELECT object_key FROM tenant_notice_images WHERE id = ?1 AND tenant_id = ?2`)
+    .bind(imageId, tenantId)
+    .first<{ object_key: string }>();
+  if (cur === null) return false;
+  await photos.delete(cur.object_key);
+  await db.prepare(`DELETE FROM tenant_notice_images WHERE id = ?1 AND tenant_id = ?2`).bind(imageId, tenantId).run();
+  return true;
+}
+
+export async function getNoticeImageKey(
+  db: D1Database,
+  tenantId: string,
+  imageId: string
+): Promise<string | null> {
+  const r = await db
+    .prepare(`SELECT object_key FROM tenant_notice_images WHERE id = ?1 AND tenant_id = ?2`)
+    .bind(imageId, tenantId)
+    .first<{ object_key: string }>();
+  return r?.object_key ?? null;
+}
+
+// ---------------------------------------------------------------
+// 更新履歴（区分2）
+// ---------------------------------------------------------------
+/**
+ * 現行 tb_m_log（8,202件）に相当。段階1では audit_logs が既に全リクエストを記録している。
+ *
+ * 現行の表示（user3Template.php）:
+ *   「{名前}さんが{機能名}を投稿しました。」（LOG_COMMENT2=="1" のときだけ「トップ表示を更新しました」）
+ *   機能番号: 1=トップ表示 / 2=プロフィール / 3=ありがとう / 4=社内フォト【コード実証】
+ *
+ * 🔴 audit_logs は GET も含む全操作を記録するため、そのまま出すと更新履歴にならない。
+ *   更新系（POST）だけを、パスから機能名に読み替えて返す。
+ */
+const ACTIVITY_LABELS: Array<{ prefix: string; label: string }> = [
+  { prefix: "/api/notices", label: "トップ表示" },
+  { prefix: "/api/profile", label: "プロフィール" },
+  { prefix: "/api/thanks", label: "ありがとう" },
+  { prefix: "/api/photos", label: "社内フォト" },
+  { prefix: "/api/daily-reports", label: "業務日報" },
+  { prefix: "/api/skill-sheets", label: "スキルシート" },
+  { prefix: "/api/reports", label: "店舗情報" },
+  { prefix: "/api/shifts", label: "シフト" },
+  { prefix: "/api/employees", label: "従業員" },
+];
+
+export function activityLabelOf(path: string): string | null {
+  for (const a of ACTIVITY_LABELS) {
+    if (path === a.prefix || path.startsWith(a.prefix + "/")) return a.label;
+  }
+  return null;
+}
+
+export interface Activity {
+  occurredAt: UtcInstant;
+  actorName: string | null;
+  label: string;
+  /** トップ表示だけ「更新しました」、他は「投稿しました」（現行の文言を踏襲）*/
+  verb: string;
+}
+
+export async function listActivities(
+  db: D1Database,
+  tenantId: string,
+  limit = 30
+): Promise<Activity[]> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    throw new RegistrationError([{ field: "limit", code: "out_of_range" }]);
+  }
+  const res = await db
+    .prepare(
+      `SELECT a.occurred_at, a.target_type AS path, e.name AS actor_name
+         FROM audit_logs a
+         LEFT JOIN employees e ON e.account_id = a.actor_id AND e.tenant_id = a.tenant_id
+        WHERE a.tenant_id = ?1 AND a.action <> 'view'
+        ORDER BY a.occurred_at DESC
+        LIMIT 300`
+    )
+    .bind(tenantId)
+    .all<{ occurred_at: string; path: string; actor_name: string | null }>();
+
+  const out: Activity[] = [];
+  for (const r of res.results ?? []) {
+    const label = activityLabelOf(r.path);
+    if (label === null) continue; // ログイン等は履歴に出さない
+    out.push({
+      occurredAt: r.occurred_at,
+      actorName: r.actor_name,
+      label,
+      verb: label === "トップ表示" ? "更新しました" : "投稿しました",
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------
+// サポート（区分12）
+// ---------------------------------------------------------------
+/** ⚠ 表示のみ。編集画面は super 管理者側とまとめて作る【会話合意 2026-08-16】 */
+export async function getSupportContent(
+  db: D1Database
+): Promise<{ videoUrl: string | null; body: string | null }> {
+  const r = await db
+    .prepare(`SELECT video_url, body FROM support_contents ORDER BY updated_at DESC LIMIT 1`)
+    .first<{ video_url: string | null; body: string | null }>();
+  return { videoUrl: r?.video_url ?? null, body: r?.body ?? null };
 }
