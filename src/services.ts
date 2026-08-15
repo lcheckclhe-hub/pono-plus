@@ -331,23 +331,27 @@ export const GENDER_BY_LEGACY: Record<string, string> = {
   "2": "female",
 };
 
-/** 現行 ki（index2.html で実証）→ 勤務時間帯コード */
-export const SHIFT_GROUP_BY_LEGACY: Record<string, string> = {
-  "1": "A",
-  "2": "B",
-  "3": "C",
-  "4": "D",
-};
+/**
+ * ⚠ 旧 SHIFT_GROUP_BY_LEGACY（1〜4 = A〜Dグループ）は撤去した。
+ *
+ * 改修設計書 v6 4.5 の「A〜Dグループ」は特定の会社の設定値であり、仕様ではなかった
+ * （引継ぎシート Session 03 第6章の訂正・shift1Template.php と tb_m_cate1 で実証）。
+ * 勤務時間帯は会社ごとに最大21種を shift_types に定義する。
+ * 登録時は shift_types.id を直接受け取り、自テナントに実在するかを検証する。
+ */
 
 export interface RegisterInput {
   name: string;
+  nameKana: string | null;
+  employeeCode: string | null; // 社内の従業員番号。UNIQUE (tenant_id, employee_code)
   email: string | null;
   loginId: string;
   password: string;
-  lineId: string | null; // 段階1.5 の LINE 連携で使う。段階1では保持のみ
-  shiftGroupCode: string | null; // 'A'..'D'
+  /** 既定の勤務時間帯。shift_types.id（会社ごとに最大21種）。null = 未設定 */
+  shiftTypeId: string | null;
   employmentType: string; // 'regular' | 'part_time' | 'cleaner' | 'other'
   birthOn: CalendarDate | null;
+  hiredOn: CalendarDate | null; // 🔴 勤怠評価の「勤続」に必須（未設定だと常に null になる）
   gender: string | null;
   worksiteId: string | null;
 }
@@ -385,9 +389,6 @@ export function validateRegistration(input: RegisterInput, today: CalendarDate):
   if (input.gender !== null && !["male", "female", "other", "undisclosed"].includes(input.gender)) {
     issues.push({ field: "gender", code: "invalid_value" });
   }
-  if (input.shiftGroupCode !== null && !Object.values(SHIFT_GROUP_BY_LEGACY).includes(input.shiftGroupCode)) {
-    issues.push({ field: "shiftGroupCode", code: "invalid_value" });
-  }
   if (input.birthOn !== null) {
     if (!isRealDate(input.birthOn)) {
       issues.push({ field: "birthOn", code: "not_a_real_date" });
@@ -395,6 +396,18 @@ export function validateRegistration(input: RegisterInput, today: CalendarDate):
       const age = Number(today.slice(0, 4)) - Number(input.birthOn.slice(0, 4));
       if (age < MIN_AGE || age > MAX_AGE) issues.push({ field: "birthOn", code: "out_of_range" });
     }
+  }
+  // 入社日。未来日を弾く（勤続年数が負になるため）
+  if (input.hiredOn !== null) {
+    if (!isRealDate(input.hiredOn)) {
+      issues.push({ field: "hiredOn", code: "not_a_real_date" });
+    } else if (input.hiredOn > today) {
+      issues.push({ field: "hiredOn", code: "in_the_future" });
+    }
+  }
+  // 生年月日と入社日の前後関係
+  if (input.birthOn !== null && input.hiredOn !== null && isRealDate(input.birthOn) && isRealDate(input.hiredOn)) {
+    if (input.hiredOn <= input.birthOn) issues.push({ field: "hiredOn", code: "before_birth" });
   }
   return issues;
 }
@@ -410,6 +423,17 @@ export class RegistrationError extends Error {
 export interface RegisterResult {
   employeeId: string;
   accountId: string;
+}
+
+/**
+ * 空文字を null に落とす。
+ * ⚠ UNIQUE (tenant_id, employee_code) は SQLite では NULL 同士を重複と見なさないが、
+ *   空文字 "" は通常の値として扱われるため、2人目の登録が制約違反になる。
+ */
+function emptyToNull(v: string | null): string | null {
+  if (v === null) return null;
+  const s = v.trim();
+  return s === "" ? null : s;
 }
 
 export async function registerEmployee(
@@ -431,6 +455,25 @@ export async function registerEmployee(
     .first<{ id: string }>();
   if (dup !== null) throw new RegistrationError([{ field: "loginId", code: "already_taken" }]);
 
+  // 従業員番号はテナント内で一意（スキーマの UNIQUE (tenant_id, employee_code)）。
+  // DB の制約違反を待たず、他の入力エラーと同じ形で返す
+  if (input.employeeCode !== null && input.employeeCode !== "") {
+    const dupCode = await db
+      .prepare(`SELECT id FROM employees WHERE tenant_id = ?1 AND employee_code = ?2 AND deleted_at IS NULL`)
+      .bind(tenantId, input.employeeCode)
+      .first<{ id: string }>();
+    if (dupCode !== null) throw new RegistrationError([{ field: "employeeCode", code: "already_taken" }]);
+  }
+
+  // 勤務時間帯は自テナントに実在するものだけを許す（他社の ID を混入させない・B-6）
+  if (input.shiftTypeId !== null && input.shiftTypeId !== "") {
+    const st = await db
+      .prepare(`SELECT id FROM shift_types WHERE id = ?1 AND tenant_id = ?2 AND is_active = 1`)
+      .bind(input.shiftTypeId, tenantId)
+      .first<{ id: string }>();
+    if (st === null) throw new RegistrationError([{ field: "shiftTypeId", code: "not_found" }]);
+  }
+
   const { hash } = await hashPassword(input.password);
   const t = nowUtc();
   const accountId = crypto.randomUUID();
@@ -446,10 +489,26 @@ export async function registerEmployee(
 
   await db
     .prepare(
-      `INSERT INTO employees (id,tenant_id,worksite_id,account_id,name,birth_on,gender,employment_type,status,created_at,updated_at)
-       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'active',?9,?9)`
+      `INSERT INTO employees
+         (id,tenant_id,worksite_id,account_id,employee_code,name,name_kana,birth_on,gender,
+          hired_on,employment_type,default_shift_type_id,status,created_at,updated_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'active',?13,?13)`
     )
-    .bind(employeeId, tenantId, input.worksiteId, accountId, input.name, input.birthOn, input.gender, input.employmentType, t)
+    .bind(
+      employeeId,
+      tenantId,
+      input.worksiteId,
+      accountId,
+      emptyToNull(input.employeeCode),
+      input.name,
+      emptyToNull(input.nameKana),
+      input.birthOn,
+      input.gender,
+      input.hiredOn,
+      input.employmentType,
+      emptyToNull(input.shiftTypeId),
+      t
+    )
     .run();
 
   const role = await db.prepare(`SELECT id FROM roles WHERE code = 'employee'`).first<{ id: string }>();
@@ -462,6 +521,291 @@ export async function registerEmployee(
 
   // ⚠ パスワードを平文でメール送信しない（現行 su1_rem1 の運用・設計書 6.2.1）
   return { employeeId, accountId };
+}
+
+// ---------------------------------------------------------------
+// 従業員の参照・修正（T-4 / T-5 / T-6）
+// ---------------------------------------------------------------
+/**
+ * ⚠ employees.status の値域は暫定である【未確認】。
+ *   現行 su2_flg1 は3値を取り、187名中93名しかログインできない状態だが、
+ *   値2・3の意味が未解消（改修設計書 10.2 ㉖ / スキーマ設計 5.2）。
+ *   Action の受領後に見直す【会話合意 2026-08-15：暫定3値で進める】。
+ */
+export const EMPLOYEE_STATUSES = ["active", "suspended", "resigned"] as const;
+
+export interface EmployeeRow {
+  id: string;
+  employeeCode: string | null;
+  name: string;
+  nameKana: string | null;
+  employmentType: string;
+  status: string;
+  hiredOn: CalendarDate | null;
+  birthOn: CalendarDate | null;
+  gender: string | null;
+  worksiteId: string | null;
+  shiftTypeId: string | null;
+  shiftTypeName: string | null;
+  loginId: string | null;
+  accountStatus: string | null;
+}
+
+interface EmployeeDbRow {
+  id: string;
+  employee_code: string | null;
+  name: string;
+  name_kana: string | null;
+  employment_type: string;
+  status: string;
+  hired_on: string | null;
+  birth_on: string | null;
+  gender: string | null;
+  worksite_id: string | null;
+  default_shift_type_id: string | null;
+  shift_type_name: string | null;
+  login_id: string | null;
+  account_status: string | null;
+}
+
+function toEmployeeRow(r: EmployeeDbRow): EmployeeRow {
+  return {
+    id: r.id,
+    employeeCode: r.employee_code,
+    name: r.name,
+    nameKana: r.name_kana,
+    employmentType: r.employment_type,
+    status: r.status,
+    hiredOn: r.hired_on,
+    birthOn: r.birth_on,
+    gender: r.gender,
+    worksiteId: r.worksite_id,
+    shiftTypeId: r.default_shift_type_id,
+    shiftTypeName: r.shift_type_name,
+    loginId: r.login_id,
+    accountStatus: r.account_status,
+  };
+}
+
+/**
+ * ⚠ SELECT 句に列を列挙する（SELECT * を使わない）。
+ *   employees に将来 password 系や要配慮情報の列が増えたとき、
+ *   一覧 API から自動的に漏れ出すのを防ぐ。
+ */
+const EMPLOYEE_SELECT = `
+  SELECT e.id, e.employee_code, e.name, e.name_kana, e.employment_type, e.status,
+         e.hired_on, e.birth_on, e.gender, e.worksite_id, e.default_shift_type_id,
+         st.name AS shift_type_name,
+         a.login_id, a.status AS account_status
+    FROM employees e
+    LEFT JOIN shift_types st ON st.id = e.default_shift_type_id
+    LEFT JOIN accounts a ON a.id = e.account_id`;
+
+export interface ListEmployeesOptions {
+  /** 状態での絞り込み。null = すべて */
+  status?: string | null;
+  /** 氏名・カナ・従業員番号の部分一致 */
+  keyword?: string | null;
+  limit?: number;
+}
+
+/**
+ * 自テナントの従業員一覧。
+ * 🔴 tenant_id を必ず条件に入れる（B-6：現行 adminall1st は他社を引けた）。
+ */
+export async function listEmployees(
+  db: D1Database,
+  tenantId: string,
+  opts: ListEmployeesOptions = {}
+): Promise<EmployeeRow[]> {
+  const clauses = ["e.tenant_id = ?1", "e.deleted_at IS NULL"];
+  const binds: (string | number)[] = [tenantId];
+
+  if (opts.status !== undefined && opts.status !== null && opts.status !== "") {
+    if (!(EMPLOYEE_STATUSES as readonly string[]).includes(opts.status)) {
+      throw new RegistrationError([{ field: "status", code: "invalid_value" }]);
+    }
+    binds.push(opts.status);
+    clauses.push(`e.status = ?${binds.length}`);
+  }
+
+  const kw = emptyToNull(opts.keyword ?? null);
+  if (kw !== null) {
+    // LIKE のワイルドカードを打ち消してから部分一致にする
+    const escaped = kw.replace(/[\\%_]/g, (c) => `\\${c}`);
+    binds.push(`%${escaped}%`);
+    const p = `?${binds.length}`;
+    clauses.push(
+      `(e.name LIKE ${p} ESCAPE '\\' OR e.name_kana LIKE ${p} ESCAPE '\\' OR e.employee_code LIKE ${p} ESCAPE '\\')`
+    );
+  }
+
+  const limit = opts.limit ?? 500;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+    throw new RegistrationError([{ field: "limit", code: "out_of_range" }]);
+  }
+
+  const sql = `${EMPLOYEE_SELECT} WHERE ${clauses.join(" AND ")}
+     ORDER BY e.status ASC, e.employee_code ASC, e.name_kana ASC, e.name ASC
+     LIMIT ${limit}`;
+  const res = await db.prepare(sql).bind(...binds).all<EmployeeDbRow>();
+  return (res.results ?? []).map(toEmployeeRow);
+}
+
+/** 単票。自テナント以外は null を返す（存在の有無を漏らさない） */
+export async function getEmployee(
+  db: D1Database,
+  tenantId: string,
+  employeeId: string
+): Promise<EmployeeRow | null> {
+  const row = await db
+    .prepare(`${EMPLOYEE_SELECT} WHERE e.id = ?1 AND e.tenant_id = ?2 AND e.deleted_at IS NULL`)
+    .bind(employeeId, tenantId)
+    .first<EmployeeDbRow>();
+  return row === null ? null : toEmployeeRow(row);
+}
+
+export interface UpdateEmployeeInput {
+  name?: string;
+  nameKana?: string | null;
+  employeeCode?: string | null;
+  employmentType?: string;
+  status?: string;
+  birthOn?: CalendarDate | null;
+  hiredOn?: CalendarDate | null;
+  gender?: string | null;
+  shiftTypeId?: string | null;
+  worksiteId?: string | null;
+}
+
+/**
+ * 従業員の修正。
+ *
+ * 🔴 ログインID・パスワードはここで変更できない。
+ *    認証情報の変更は別経路にする（監査ログ上も区別が付かなくなるため）。
+ */
+export async function updateEmployee(
+  db: D1Database,
+  tenantId: string,
+  employeeId: string,
+  input: UpdateEmployeeInput,
+  today: CalendarDate
+): Promise<void> {
+  const current = await getEmployee(db, tenantId, employeeId);
+  if (current === null) throw new RegistrationError([{ field: "employeeId", code: "not_found" }]);
+
+  const issues: ValidationIssue[] = [];
+  const name = input.name === undefined ? current.name : input.name;
+  if (name.trim() === "") issues.push({ field: "name", code: "required" });
+
+  const employmentType = input.employmentType === undefined ? current.employmentType : input.employmentType;
+  if (!Object.values(EMPLOYMENT_TYPE_BY_LEGACY).includes(employmentType)) {
+    issues.push({ field: "employmentType", code: "invalid_value" });
+  }
+
+  const status = input.status === undefined ? current.status : input.status;
+  if (!(EMPLOYEE_STATUSES as readonly string[]).includes(status)) {
+    issues.push({ field: "status", code: "invalid_value" });
+  }
+
+  const gender = input.gender === undefined ? current.gender : input.gender;
+  if (gender !== null && !["male", "female", "other", "undisclosed"].includes(gender)) {
+    issues.push({ field: "gender", code: "invalid_value" });
+  }
+
+  const birthOn = input.birthOn === undefined ? current.birthOn : input.birthOn;
+  const hiredOn = input.hiredOn === undefined ? current.hiredOn : input.hiredOn;
+  if (birthOn !== null) {
+    if (!isRealDate(birthOn)) {
+      issues.push({ field: "birthOn", code: "not_a_real_date" });
+    } else {
+      const age = Number(today.slice(0, 4)) - Number(birthOn.slice(0, 4));
+      if (age < MIN_AGE || age > MAX_AGE) issues.push({ field: "birthOn", code: "out_of_range" });
+    }
+  }
+  if (hiredOn !== null) {
+    if (!isRealDate(hiredOn)) issues.push({ field: "hiredOn", code: "not_a_real_date" });
+    else if (hiredOn > today) issues.push({ field: "hiredOn", code: "in_the_future" });
+  }
+  if (birthOn !== null && hiredOn !== null && isRealDate(birthOn) && isRealDate(hiredOn) && hiredOn <= birthOn) {
+    issues.push({ field: "hiredOn", code: "before_birth" });
+  }
+  if (issues.length > 0) throw new RegistrationError(issues);
+
+  const employeeCode = emptyToNull(input.employeeCode === undefined ? current.employeeCode : input.employeeCode);
+  if (employeeCode !== null) {
+    const dup = await db
+      .prepare(
+        `SELECT id FROM employees WHERE tenant_id = ?1 AND employee_code = ?2 AND id <> ?3 AND deleted_at IS NULL`
+      )
+      .bind(tenantId, employeeCode, employeeId)
+      .first<{ id: string }>();
+    if (dup !== null) throw new RegistrationError([{ field: "employeeCode", code: "already_taken" }]);
+  }
+
+  const shiftTypeId = emptyToNull(input.shiftTypeId === undefined ? current.shiftTypeId : input.shiftTypeId);
+  if (shiftTypeId !== null) {
+    const st = await db
+      .prepare(`SELECT id FROM shift_types WHERE id = ?1 AND tenant_id = ?2 AND is_active = 1`)
+      .bind(shiftTypeId, tenantId)
+      .first<{ id: string }>();
+    if (st === null) throw new RegistrationError([{ field: "shiftTypeId", code: "not_found" }]);
+  }
+
+  const worksiteId = emptyToNull(input.worksiteId === undefined ? current.worksiteId : input.worksiteId);
+  if (worksiteId !== null) {
+    const ws = await db
+      .prepare(`SELECT id FROM worksites WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+      .bind(worksiteId, tenantId)
+      .first<{ id: string }>();
+    if (ws === null) throw new RegistrationError([{ field: "worksiteId", code: "not_found" }]);
+  }
+
+  // 退職にしたら退職日を入れる。復帰させたら消す
+  const resignedOn = status === "resigned" ? today : null;
+
+  // 🔴 WHERE に tenant_id を必ず入れる
+  await db
+    .prepare(
+      `UPDATE employees
+          SET employee_code = ?1, name = ?2, name_kana = ?3, birth_on = ?4, gender = ?5,
+              hired_on = ?6, resigned_on = ?7, employment_type = ?8, status = ?9,
+              default_shift_type_id = ?10, worksite_id = ?11, updated_at = ?12
+        WHERE id = ?13 AND tenant_id = ?14`
+    )
+    .bind(
+      employeeCode,
+      name.trim(),
+      emptyToNull(input.nameKana === undefined ? current.nameKana : input.nameKana),
+      birthOn,
+      gender,
+      hiredOn,
+      resignedOn,
+      employmentType,
+      status,
+      shiftTypeId,
+      worksiteId,
+      nowUtc(),
+      employeeId,
+      tenantId
+    )
+    .run();
+}
+
+/** 登録・修正画面の選択肢に使う勤務時間帯（自テナントの有効なもの） */
+export async function listShiftTypes(
+  db: D1Database,
+  tenantId: string
+): Promise<Array<{ id: string; code: string; name: string }>> {
+  const res = await db
+    .prepare(
+      `SELECT id, code, name FROM shift_types
+        WHERE tenant_id = ?1 AND is_active = 1
+        ORDER BY sort_order ASC, CAST(code AS INTEGER) ASC`
+    )
+    .bind(tenantId)
+    .all<{ id: string; code: string; name: string }>();
+  return res.results ?? [];
 }
 
 // ===============================================================
