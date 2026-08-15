@@ -11,8 +11,8 @@
  *   ハンドラ側で認証を書き忘れても、ここを通らなければ実行されない。
  */
 import { AuthzError, nowUtc, toJstCalendarDate, sha256Hex, canAccessAttendance } from "./core.ts";
-import { loginPage, homePage, shiftSheetPage, employeeListPage, employeeFormPage, attendancePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage } from "./pages.ts";
-import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet, listEmployees, getEmployee, updateEmployee, listShiftTypes, getProfile, getOwnEmployeeId, updateProfile, putProfilePhoto, deleteProfilePhoto, getProfilePhotoKey, PHOTO_MAX_BYTES, upsertMonthlyReport, getMonthlyReport, listMonthlyReports, monthlyWorkforceStats, listReportCategories, upsertReportCategory, upsertDailyReport, getDailyReport, listDailyReports, deleteDailyReport, putDailyReportPhoto, getDailyReportPhotoKey, createPhotoPost, listPhotoPosts, getPhotoPost, getPhotoPostKey, deletePhotoPost, CAPTION_MAX, sendThanks, listThanks, thanksRanking, countThanksSent, thanksPeriodOf, THANKS_MONTHLY_LIMIT, upsertSkillSheet, getSkillSheet, listSkillSheetsByYear, suggestSkillCounts, redactForEmployee } from "./services.ts";
+import { loginPage, homePage, shiftSheetPage, employeeListPage, employeeFormPage, attendancePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage, noticeEditPage, supportPage } from "./pages.ts";
+import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet, listEmployees, getEmployee, updateEmployee, listShiftTypes, getProfile, getOwnEmployeeId, updateProfile, putProfilePhoto, deleteProfilePhoto, getProfilePhotoKey, PHOTO_MAX_BYTES, upsertMonthlyReport, getMonthlyReport, listMonthlyReports, monthlyWorkforceStats, listReportCategories, upsertReportCategory, upsertDailyReport, getDailyReport, listDailyReports, deleteDailyReport, putDailyReportPhoto, getDailyReportPhotoKey, createPhotoPost, listPhotoPosts, getPhotoPost, getPhotoPostKey, deletePhotoPost, CAPTION_MAX, sendThanks, listThanks, thanksRanking, countThanksSent, thanksPeriodOf, THANKS_MONTHLY_LIMIT, upsertSkillSheet, getSkillSheet, listSkillSheetsByYear, suggestSkillCounts, redactForEmployee, getTenantNotice, updateTenantNotice, addNoticeImage, deleteNoticeImage, getNoticeImageKey, listActivities, getSupportContent } from "./services.ts";
 import type { Principal } from "./core.ts";
 
 export interface Env {
@@ -80,6 +80,8 @@ export const routes: RouteDef[] = [
   { method: "GET", path: "/thanks/ranking", public: true, handler: async () => html(thanksRankingPage()) },
   { method: "GET", path: "/skill-sheets", public: true, handler: async () => html(skillSheetPage()) },
   { method: "GET", path: "/skill-sheets/edit", public: true, handler: async () => html(skillSheetFormPage()) },
+  { method: "GET", path: "/notices/edit", public: true, handler: async () => html(noticeEditPage()) },
+  { method: "GET", path: "/support", public: true, handler: async () => html(supportPage()) },
   {
     // 設定の反映状況を確認できるようにする。⚠ 値そのものは絶対に返さない
     method: "GET",
@@ -844,6 +846,114 @@ export const routes: RouteDef[] = [
         if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
         throw e;
       }
+    },
+  },
+  {
+    // トップ表示。同一テナントの全員が閲覧できる
+    method: "GET",
+    path: "/api/notices",
+    handler: async (_req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const n = await getTenantNotice(ctx.env.DB, ctx.principal.tenantId);
+      return json({ ok: true, notice: n, canEdit: canAccessAttendance(ctx.principal) });
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/notices",
+    handler: async (req, ctx) => {
+      // 編集できるのはマスタ①②相当のみ（機能権限表 区分1）
+      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const b = (await req.json()) as Record<string, unknown>;
+      const rawLinks = Array.isArray(b.links) ? b.links : [];
+      try {
+        const r = await updateTenantNotice(ctx.env.DB, ctx.principal.tenantId, {
+          message: (b.message as string | null) ?? null,
+          videoInput: (b.videoInput as string | null) ?? null,
+          links: rawLinks
+            .map((l) => l as Record<string, unknown>)
+            .filter((l) => typeof l.url === "string" && l.url.trim() !== "")
+            .map((l) => ({ url: String(l.url), label: (l.label as string | null) ?? null })),
+        });
+        return json({ ok: true, video: r.video });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/notices/image",
+    handler: async (req, ctx) => {
+      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const declared = Number(req.headers.get("Content-Length") ?? "0");
+      if (declared > PHOTO_MAX_BYTES) return json({ error: "too_large" }, 413);
+      const buf = new Uint8Array(await req.arrayBuffer());
+      try {
+        const r = await addNoticeImage(ctx.env.DB, ctx.env.PHOTOS, ctx.principal.tenantId, buf);
+        return json({ ok: true, id: r.id }, 201);
+      } catch (e) {
+        if (e instanceof RegistrationError) {
+          const tooLarge = e.issues.some((i) => i.code === "too_large");
+          return json({ error: "validation_failed", issues: e.issues }, tooLarge ? 413 : 422);
+        }
+        throw e;
+      }
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/notices/image/delete",
+    handler: async (req, ctx) => {
+      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const b = (await req.json()) as Record<string, unknown>;
+      const imageId = typeof b.imageId === "string" ? b.imageId : null;
+      if (imageId === null) return json({ error: "invalid_input" }, 422);
+      const removed = await deleteNoticeImage(ctx.env.DB, ctx.env.PHOTOS, ctx.principal.tenantId, imageId);
+      return json({ ok: true, removed });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/notices/image",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const imageId = new URL(req.url).searchParams.get("imageId");
+      if (imageId === null) return json({ error: "invalid_input" }, 422);
+      const key = await getNoticeImageKey(ctx.env.DB, ctx.principal.tenantId, imageId);
+      if (key === null) return json({ error: "not_found" }, 404);
+      const obj = await ctx.env.PHOTOS.get(key);
+      if (obj === null) return json({ error: "not_found" }, 404);
+      return new Response(obj.body, {
+        headers: {
+          "Content-Type": obj.httpMetadata?.contentType ?? "application/octet-stream",
+          "Cache-Control": "private, max-age=300",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    },
+  },
+  {
+    // 更新履歴（区分2）。audit_logs から更新系だけを機能名に読み替えて返す
+    method: "GET",
+    path: "/api/activities",
+    handler: async (_req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const rows = await listActivities(ctx.env.DB, ctx.principal.tenantId);
+      return json({ ok: true, activities: rows });
+    },
+  },
+  {
+    // サポート（区分12）。⚠ 表示のみ
+    method: "GET",
+    path: "/api/support",
+    handler: async (_req, ctx) => {
+      const c = await getSupportContent(ctx.env.DB);
+      return json({ ok: true, support: c });
     },
   },
   {
