@@ -1,0 +1,26 @@
+# 依存パッケージ（npm install で再生成される）
+node_modules/
+package-lock.json
+
+# バンドル成果物（src から生成される）
+worker-bundled.js
+dist/
+
+# 🔴 現行システムのデータベースエクスポート
+# 平文パスワード201件・ストレスチェック結果92件（要配慮個人情報）を含むため
+# GitHub には絶対に置かない（改修設計書 3.2）
+*.sql
+!migrations/*.sql
+
+# 環境変数・秘密情報
+.dev.vars
+.env
+.env.*
+
+# Cloudflare / wrangler の作業ファイル
+.wrangler/
+
+# OS が作る不要ファイル
+.DS_Store
+Thumbs.db
+desktop.ini
