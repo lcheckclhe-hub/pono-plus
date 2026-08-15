@@ -1066,6 +1066,11 @@ function drawPhoto(has) {
 async function load() {
   const res = await fetch('/api/profile');
   if (res.status === 401) { location.href = '/login'; return; }
+  if (res.status === 404) {
+    // このアカウントに従業員レコードが無い（F-8 の修正前に作られたテナント）
+    show($('err'), 'このアカウントには従業員の登録がないため、プロフィールを使えません。従業員一覧から登録してください。');
+    return;
+  }
   if (!res.ok) { show($('err'), 'プロフィールを読み込めませんでした'); return; }
   const p = (await res.json()).profile;
   employeeId = p.employeeId;
@@ -1087,6 +1092,9 @@ $('save').addEventListener('click', async () => {
   const d = await res.json().catch(() => ({}));
   show($('err'), d.issues ? '入力が長すぎます（2000文字まで）' : '保存できませんでした');
 });
+
+// F-9: ファイルを選び直したら、前のエラー表示を消す
+$('file').addEventListener('change', () => { show($('err'), ''); show($('ok'), ''); });
 
 $('up').addEventListener('click', async () => {
   show($('err'), ''); show($('ok'), '');
@@ -1703,6 +1711,9 @@ $('save').addEventListener('click', async () => {
       (i.code === 'same_as_start' ? 'が開始と同じです' : 'を確認してください')).join(' / '));
   } else { show($('err'), '保存できませんでした'); }
 });
+
+// F-9: ファイルを選び直したら、前のエラー表示を消す
+$('file').addEventListener('change', () => { show($('err'), ''); show($('ok'), ''); });
 
 $('up').addEventListener('click', async () => {
   show($('err'), ''); show($('ok'), '');
