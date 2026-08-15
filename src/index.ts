@@ -11,8 +11,8 @@
  *   ハンドラ側で認証を書き忘れても、ここを通らなければ実行されない。
  */
 import { AuthzError, nowUtc, toJstCalendarDate, sha256Hex, canAccessAttendance } from "./core.ts";
-import { loginPage, homePage, shiftSheetPage, employeeListPage, employeeFormPage, attendancePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage } from "./pages.ts";
-import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet, listEmployees, getEmployee, updateEmployee, listShiftTypes, getProfile, getOwnEmployeeId, updateProfile, putProfilePhoto, deleteProfilePhoto, getProfilePhotoKey, PHOTO_MAX_BYTES, upsertMonthlyReport, getMonthlyReport, listMonthlyReports, monthlyWorkforceStats, listReportCategories, upsertReportCategory, upsertDailyReport, getDailyReport, listDailyReports, deleteDailyReport, putDailyReportPhoto, getDailyReportPhotoKey, createPhotoPost, listPhotoPosts, getPhotoPost, getPhotoPostKey, deletePhotoPost, CAPTION_MAX, sendThanks, listThanks, thanksRanking, countThanksSent, thanksPeriodOf, THANKS_MONTHLY_LIMIT } from "./services.ts";
+import { loginPage, homePage, shiftSheetPage, employeeListPage, employeeFormPage, attendancePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage } from "./pages.ts";
+import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet, listEmployees, getEmployee, updateEmployee, listShiftTypes, getProfile, getOwnEmployeeId, updateProfile, putProfilePhoto, deleteProfilePhoto, getProfilePhotoKey, PHOTO_MAX_BYTES, upsertMonthlyReport, getMonthlyReport, listMonthlyReports, monthlyWorkforceStats, listReportCategories, upsertReportCategory, upsertDailyReport, getDailyReport, listDailyReports, deleteDailyReport, putDailyReportPhoto, getDailyReportPhotoKey, createPhotoPost, listPhotoPosts, getPhotoPost, getPhotoPostKey, deletePhotoPost, CAPTION_MAX, sendThanks, listThanks, thanksRanking, countThanksSent, thanksPeriodOf, THANKS_MONTHLY_LIMIT, upsertSkillSheet, getSkillSheet, listSkillSheetsByYear, suggestSkillCounts, redactForEmployee } from "./services.ts";
 import type { Principal } from "./core.ts";
 
 export interface Env {
@@ -78,6 +78,8 @@ export const routes: RouteDef[] = [
   { method: "GET", path: "/thanks", public: true, handler: async () => html(thanksListPage()) },
   { method: "GET", path: "/thanks/new", public: true, handler: async () => html(thanksNewPage()) },
   { method: "GET", path: "/thanks/ranking", public: true, handler: async () => html(thanksRankingPage()) },
+  { method: "GET", path: "/skill-sheets", public: true, handler: async () => html(skillSheetPage()) },
+  { method: "GET", path: "/skill-sheets/edit", public: true, handler: async () => html(skillSheetFormPage()) },
   {
     // 設定の反映状況を確認できるようにする。⚠ 値そのものは絶対に返さない
     method: "GET",
@@ -759,6 +761,85 @@ export const routes: RouteDef[] = [
       try {
         const rows = await thanksRanking(ctx.env.DB, ctx.principal.tenantId, new URL(req.url).searchParams.get("period"));
         return json({ ok: true, ranking: rows });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    // スキルシートの年度別一覧。
+    // 🔴 本人が見る場合は redactForEmployee() を必ず通す（残業数と非公開の業務内容を落とす）
+    method: "GET",
+    path: "/api/skill-sheets",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const u = new URL(req.url);
+      const year = u.searchParams.get("year") ?? String(new Date().getUTCFullYear());
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      let employeeId = u.searchParams.get("employeeId");
+      const isManager = canAccessAttendance(ctx.principal);
+      if (!isManager) {
+        if (own === null) return json({ error: "not_found" }, 404);
+        // 人事権系統でなければ自分の分だけ
+        if (employeeId !== null && employeeId !== own) return json({ error: "forbidden" }, 403);
+        employeeId = own;
+      }
+      if (employeeId === null) employeeId = own;
+      if (employeeId === null) return json({ error: "invalid_input" }, 422);
+      try {
+        const rows = await listSkillSheetsByYear(ctx.env.DB, ctx.principal.tenantId, employeeId, year);
+        // 本人が自分の分を見るときは項目を落とす
+        const view = isManager ? rows : rows.map((r) => ({ ...r, ...redactForEmployee(r) }));
+        return json({ ok: true, year, employeeId, sheets: view, canEdit: isManager, ownEmployeeId: own });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/skill-sheets/detail",
+    handler: async (req, ctx) => {
+      // 🔴 単票は管理側だけ（業務内容の原文と公開設定を含むため）
+      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const u = new URL(req.url);
+      const employeeId = u.searchParams.get("employeeId");
+      const period = u.searchParams.get("periodYearMonth");
+      if (employeeId === null || period === null) return json({ error: "invalid_input" }, 422);
+      const sheet = await getSkillSheet(ctx.env.DB, ctx.principal.tenantId, employeeId, period);
+      try {
+        // 入力欄の初期値（保存しない提示値）
+        const suggested = await suggestSkillCounts(ctx.env.DB, ctx.principal.tenantId, employeeId, period);
+        return json({ ok: true, sheet, suggested });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/skill-sheets",
+    handler: async (req, ctx) => {
+      // 🔴 スキルシートを書けるのは人事権系統のみ（本人は書けない）
+      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const b = (await req.json()) as Record<string, unknown>;
+      try {
+        const r = await upsertSkillSheet(ctx.env.DB, ctx.principal.tenantId, {
+          employeeId: String(b.employeeId ?? ""),
+          periodYearMonth: String(b.periodYearMonth ?? ""),
+          lateCount: Number(b.lateCount ?? 0),
+          earlyLeaveCount: Number(b.earlyLeaveCount ?? 0),
+          absenceCount: Number(b.absenceCount ?? 0),
+          overtimeCount: Number(b.overtimeCount ?? 0),
+          comment: (b.comment as string | null) ?? null,
+          commentVisibleToEmployee: b.commentVisibleToEmployee === true,
+        });
+        return json({ ok: true, id: r.id, created: r.created }, r.created ? 201 : 200);
       } catch (e) {
         if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
         throw e;
