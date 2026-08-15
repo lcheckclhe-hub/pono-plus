@@ -188,6 +188,7 @@ export function homePage(): string {
       <a href="/daily-reports">業務日報</a>
       <a href="/photos">社内フォト共有</a>
       <a href="/thanks">ありがとう情報</a>
+      <a href="/skill-sheets">スキルシート</a>
     </nav>
     <div class="logout"><button id="out">ログアウト</button></div>
   </div>
@@ -2357,6 +2358,296 @@ fetch('/api/profile').then((r) => r.ok ? r.json() : null).then((d) => {
   if (d) own = d.profile.employeeId;
   load();
 });
+</script>
+</body>
+</html>`;
+}
+
+// ===============================================================
+// スキルシート（機能権限表 区分9 / T-45）
+// ===============================================================
+/**
+ * 現行 user3skill2Template.php_back（本人用）と user2skill1Template.php（管理用）を踏襲する。
+ *
+ * 🔴 現行から変えた点:
+ *   ・業務内容に公開/非公開の切り替えを設ける（現行は必ず本人に見えた）
+ *   ・遅刻・早退・当欠はシフトから算出した値を提示し、上書きできる
+ *   ・残業数は本人の画面に出さない（現行のマスタ③画面に列が無い＝踏襲）
+ */
+const SKILL_STYLE = `
+  .note { background: #f7f9fb; border: 1px solid #e4e9ee; border-radius: 8px;
+          padding: 10px 12px; font-size: 13px; color: #46535f; margin-bottom: 16px; }
+  td.cmt { max-width: 260px; white-space: pre-wrap; word-break: break-word; font-size: 13px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+  .badge.open { background: #e6f2e6; color: #256b25; }
+  .badge.closed { background: #eceff2; color: #6b7885; }
+  .sugg { font-size: 12px; color: #6b7885; margin-top: 4px; }
+  .sugg button { width: auto; padding: 4px 10px; font-size: 12px; background: #6b7885; margin-left: 6px; }
+`;
+
+export function skillSheetPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>スキルシート | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}${SKILL_STYLE}</style>
+</head>
+<body>
+<div class="login">
+  <h1>スキルシート</h1>
+  <div class="box">
+    <div class="bar">
+      <div class="row" style="flex:1 1 200px">
+        <label for="emp">対象者</label>
+        <select id="emp"><option value="">自分</option></select>
+      </div>
+      <div class="row" style="flex:0 0 120px">
+        <label for="year">年度</label>
+        <input type="text" id="year">
+      </div>
+      <div class="row"><button id="go">表示</button></div>
+      <div class="row" id="editbar" style="display:none">
+        <a class="btn" href="/skill-sheets/edit">登録／修正</a>
+      </div>
+    </div>
+    <p class="error" id="err" style="display:none"></p>
+    <p class="note" id="note"></p>
+    <div class="scroll">
+      <table>
+        <thead><tr id="head"></tr></thead>
+        <tbody id="rows"><tr><td colspan="7">読み込み中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <p class="links"><a href="/home">ホームへ戻る</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let canEdit = false;
+
+function cell(t, cls) {
+  const td = document.createElement('td');
+  if (cls) td.className = cls;
+  td.textContent = t === null || t === undefined || t === '' ? '-' : String(t);
+  return td;
+}
+function th(t) { const e = document.createElement('th'); e.textContent = t; return e; }
+
+async function loadEmployees() {
+  const res = await fetch('/api/employees?status=active');
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (!res.ok) return; // 権限が無ければ自分の分だけ
+  canEdit = true;
+  $('editbar').style.display = 'block';
+  for (const e of (await res.json()).employees) {
+    const o = document.createElement('option');
+    o.value = e.id; o.textContent = e.name;
+    $('emp').appendChild(o);
+  }
+}
+
+async function load() {
+  const q = new URLSearchParams();
+  q.set('year', $('year').value.trim());
+  if ($('emp').value !== '') q.set('employeeId', $('emp').value);
+  const res = await fetch('/api/skill-sheets?' + q.toString());
+  if (res.status === 401) { location.href = '/login'; return; }
+  const tbody = $('rows');
+  tbody.replaceChildren();
+  $('head').replaceChildren();
+  if (!res.ok) { $('err').textContent = '取得できませんでした'; $('err').style.display = 'block'; return; }
+  $('err').style.display = 'none';
+  const d = await res.json();
+
+  // 🔴 管理側だけ残業数の列を出す
+  const cols = ['対象月', '出勤数', '遅刻数', '早退数', '当欠数'];
+  if (d.canEdit) cols.push('残業数');
+  cols.push('ありがとう数', '業務内容');
+  if (d.canEdit) cols.push('公開');
+  for (const c of cols) $('head').appendChild(th(c));
+
+  $('note').textContent = d.canEdit
+    ? '業務内容は「公開」が有効なものだけ本人に表示されます。残業数は本人には表示されません。'
+    : '自分のスキルシートです。管理者が公開した業務内容のみ表示されます。';
+
+  if (d.sheets.length === 0) {
+    const tr = document.createElement('tr');
+    const td = cell('この年度の記録がありません'); td.colSpan = cols.length;
+    tr.appendChild(td); tbody.appendChild(tr);
+    return;
+  }
+  for (const s of d.sheets) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell(s.periodYearMonth.slice(5) + '月'));
+    tr.appendChild(cell(s.workDays, 'num'));
+    tr.appendChild(cell(s.lateCount, 'num'));
+    tr.appendChild(cell(s.earlyLeaveCount, 'num'));
+    tr.appendChild(cell(s.absenceCount, 'num'));
+    if (d.canEdit) tr.appendChild(cell(s.overtimeCount, 'num'));
+    tr.appendChild(cell(s.thanksCount, 'num'));
+    tr.appendChild(cell(s.comment, 'cmt'));
+    if (d.canEdit) {
+      const td = document.createElement('td');
+      const b = document.createElement('span');
+      b.className = 'badge ' + (s.commentVisibleToEmployee ? 'open' : 'closed');
+      b.textContent = s.commentVisibleToEmployee ? '公開' : '非公開';
+      td.appendChild(b);
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+}
+$('go').addEventListener('click', load);
+$('year').value = String(new Date().getFullYear());
+loadEmployees().then(load);
+</script>
+</body>
+</html>`;
+}
+
+export function skillSheetFormPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>スキルシート 登録/修正 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}${SKILL_STYLE}
+  .login { max-width: 560px; }
+  textarea { width: 100%; padding: 11px 12px; font-size: 16px; box-sizing: border-box;
+    border: 1px solid #c8d0d8; border-radius: 6px; min-height: 120px; font-family: inherit; }
+  input[type=number] { width: 100%; padding: 11px 12px; font-size: 16px; box-sizing: border-box;
+    border: 1px solid #c8d0d8; border-radius: 6px; }
+  .chk { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+  .chk input { width: auto; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1>スキルシート 登録/修正</h1>
+  <div class="box">
+    <p class="error" id="err" style="display:none"></p>
+    <p class="ok" id="ok" style="display:none"></p>
+    <div class="bar">
+      <div class="row" style="flex:1 1 180px">
+        <label for="emp">対象スタッフ <span class="req">*</span></label>
+        <select id="emp"></select>
+      </div>
+      <div class="row" style="flex:0 0 150px">
+        <label for="ym">対象月 <span class="req">*</span></label>
+        <input type="text" id="ym" placeholder="2026-08">
+      </div>
+      <div class="row"><button id="fetch">読み込み</button></div>
+    </div>
+    <p class="sugg" id="sugg"></p>
+
+    <div class="grid">
+      <div class="row"><label for="late">遅刻数</label><input type="number" id="late" min="0" value="0"></div>
+      <div class="row"><label for="early">早退数</label><input type="number" id="early" min="0" value="0"></div>
+      <div class="row"><label for="absence">当欠数</label><input type="number" id="absence" min="0" value="0"></div>
+      <div class="row">
+        <label for="overtime">残業数</label>
+        <input type="number" id="overtime" min="0" value="0">
+        <p class="hint">本人の画面には表示されません</p>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="comment">業務内容</label>
+      <textarea id="comment" maxlength="2000"></textarea>
+      <p class="chk" style="margin-top:8px">
+        <input type="checkbox" id="visible">
+        <label for="visible" style="margin:0">この業務内容を本人にも表示する</label>
+      </p>
+      <p class="hint">既定は非公開です。本人に見せる前提の内容だけ公開してください</p>
+    </div>
+    <button id="save">登録／修正</button>
+  </div>
+  <p class="links"><a href="/skill-sheets">一覧へ戻る</a> ／ <a href="/home">ホーム</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+function show(el, t) { el.textContent = t; el.style.display = t === '' ? 'none' : 'block'; }
+
+async function init() {
+  const res = await fetch('/api/employees?status=active');
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.status === 403) { show($('err'), 'この画面を使う権限がありません'); return; }
+  if (res.ok) {
+    for (const e of (await res.json()).employees) {
+      const o = document.createElement('option');
+      o.value = e.id; o.textContent = e.name;
+      $('emp').appendChild(o);
+    }
+  }
+  const now = new Date();
+  $('ym').value = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+  loadSheet();
+}
+
+async function loadSheet() {
+  show($('err'), ''); show($('ok'), '');
+  if ($('emp').value === '' || $('ym').value.trim() === '') return;
+  const q = new URLSearchParams();
+  q.set('employeeId', $('emp').value);
+  q.set('periodYearMonth', $('ym').value.trim());
+  const res = await fetch('/api/skill-sheets/detail?' + q.toString());
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.status === 403) { show($('err'), 'この画面を使う権限がありません'); return; }
+  if (!res.ok) { show($('err'), '読み込めませんでした'); return; }
+  const d = await res.json();
+  const g = d.suggested;
+  $('sugg').textContent = 'シフトの実績：出勤 ' + g.workDays + '日／遅刻 ' + g.lateCount +
+    '／早退 ' + g.earlyLeaveCount + '／当欠 ' + g.absenceCount + '／残業のあった日 ' + g.overtimeCount;
+  if (d.sheet === null) {
+    // 未登録ならシフトの実績を初期値にする（保存はされていない提示値）
+    $('late').value = g.lateCount;
+    $('early').value = g.earlyLeaveCount;
+    $('absence').value = g.absenceCount;
+    $('overtime').value = g.overtimeCount;
+    $('comment').value = '';
+    $('visible').checked = false;
+  } else {
+    $('late').value = d.sheet.lateCount;
+    $('early').value = d.sheet.earlyLeaveCount;
+    $('absence').value = d.sheet.absenceCount;
+    $('overtime').value = d.sheet.overtimeCount;
+    $('comment').value = d.sheet.comment === null ? '' : d.sheet.comment;
+    $('visible').checked = d.sheet.commentVisibleToEmployee;
+  }
+}
+
+$('fetch').addEventListener('click', loadSheet);
+$('emp').addEventListener('change', loadSheet);
+$('ym').addEventListener('change', loadSheet);
+
+$('save').addEventListener('click', async () => {
+  show($('err'), ''); show($('ok'), '');
+  const res = await fetch('/api/skill-sheets', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify({
+      employeeId: $('emp').value,
+      periodYearMonth: $('ym').value.trim(),
+      lateCount: Number($('late').value || 0),
+      earlyLeaveCount: Number($('early').value || 0),
+      absenceCount: Number($('absence').value || 0),
+      overtimeCount: Number($('overtime').value || 0),
+      comment: $('comment').value,
+      commentVisibleToEmployee: $('visible').checked
+    })
+  });
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.status === 403) { show($('err'), 'この操作を行う権限がありません'); return; }
+  if (res.ok) { show($('ok'), '保存しました'); return; }
+  const d = await res.json().catch(() => ({}));
+  show($('err'), d.issues ? '入力を確認してください' : '保存できませんでした');
+});
+init();
 </script>
 </body>
 </html>`;
