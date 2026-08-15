@@ -10,9 +10,9 @@
  *   認証を通っていないリクエストがハンドラ本体に到達しない構造にする。
  *   ハンドラ側で認証を書き忘れても、ここを通らなければ実行されない。
  */
-import { AuthzError, nowUtc, sha256Hex, canAccessAttendance } from "./core.ts";
-import { loginPage, homePage, shiftSheetPage } from "./pages.ts";
-import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet } from "./services.ts";
+import { AuthzError, nowUtc, toJstCalendarDate, sha256Hex, canAccessAttendance } from "./core.ts";
+import { loginPage, homePage, shiftSheetPage, employeeListPage, employeeFormPage } from "./pages.ts";
+import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet, listEmployees, getEmployee, updateEmployee, listShiftTypes } from "./services.ts";
 import type { Principal } from "./core.ts";
 
 export interface Env {
@@ -63,6 +63,8 @@ export const routes: RouteDef[] = [
   { method: "GET", path: "/login", public: true, handler: async () => html(loginPage()) },
   { method: "GET", path: "/home", public: true, handler: async () => html(homePage()) },
   { method: "GET", path: "/shifts", public: true, handler: async () => html(shiftSheetPage()) },
+  { method: "GET", path: "/employees", public: true, handler: async () => html(employeeListPage()) },
+  { method: "GET", path: "/employees/new", public: true, handler: async () => html(employeeFormPage()) },
   {
     // 設定の反映状況を確認できるようにする。⚠ 値そのものは絶対に返さない
     method: "GET",
@@ -161,21 +163,104 @@ export const routes: RouteDef[] = [
           ctx.principal.tenantId,
           {
             name: String(b.name ?? ""),
+            nameKana: (b.nameKana as string | null) ?? null,
+            employeeCode: (b.employeeCode as string | null) ?? null,
             email: (b.email as string | null) ?? null,
             loginId: String(b.loginId ?? ""),
             password: String(b.password ?? ""),
-            lineId: (b.lineId as string | null) ?? null,
-            shiftGroupCode: (b.shiftGroupCode as string | null) ?? null,
+            shiftTypeId: (b.shiftTypeId as string | null) ?? null,
             employmentType: String(b.employmentType ?? ""),
             birthOn: (b.birthOn as string | null) ?? null,
+            hiredOn: (b.hiredOn as string | null) ?? null,
             gender: (b.gender as string | null) ?? null,
             worksiteId: (b.worksiteId as string | null) ?? null,
           },
-          nowUtc().slice(0, 10)
+          toJstCalendarDate(nowUtc())
         );
         return json({ ok: true, employeeId: r.employeeId }, 201);
       } catch (e) {
         if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    // ⚠ パス変数（/api/employees/:id）は使わない。
+    //    ディスパッチャのルート探索は完全一致であり、変数対応を入れると
+    //    認証・CSRF を一元化している中核部分に手が入る。
+    //    既存の /api/shifts/sheet と同じくクエリ文字列で受ける。
+    method: "GET",
+    path: "/api/employees",
+    handler: async (req, ctx) => {
+      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const u = new URL(req.url);
+      try {
+        const rows = await listEmployees(ctx.env.DB, ctx.principal.tenantId, {
+          status: u.searchParams.get("status"),
+          keyword: u.searchParams.get("keyword"),
+        });
+        return json({ ok: true, employees: rows, count: rows.length });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/employees/detail",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const employeeId = new URL(req.url).searchParams.get("employeeId");
+      if (employeeId === null) return json({ error: "invalid_input" }, 422);
+      const emp = await getEmployee(ctx.env.DB, ctx.principal.tenantId, employeeId);
+      if (emp === null) return json({ error: "not_found" }, 404);
+      // 人事権系統でなければ自分自身の情報だけ見られる
+      if (!canAccessAttendance(ctx.principal)) {
+        const owner = await ctx.env.DB.prepare(`SELECT account_id FROM employees WHERE id = ?1`)
+          .bind(employeeId)
+          .first<{ account_id: string | null }>();
+        if (owner?.account_id !== ctx.principal.accountId) return json({ error: "forbidden" }, 403);
+      }
+      return json({ ok: true, employee: emp });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/shift-types",
+    handler: async (_req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const rows = await listShiftTypes(ctx.env.DB, ctx.principal.tenantId);
+      return json({ ok: true, shiftTypes: rows });
+    },
+  },
+  {
+    // PATCH ではなく POST。既存ルートが GET/POST のみで統一されているため
+    method: "POST",
+    path: "/api/employees/update",
+    handler: async (req, ctx) => {
+      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const b = (await req.json()) as Record<string, unknown>;
+      const employeeId = typeof b.employeeId === "string" ? b.employeeId : null;
+      if (employeeId === null) return json({ error: "invalid_input" }, 422);
+      // 送られてきたキーだけを変更対象にする（部分更新）
+      const patch: Record<string, unknown> = {};
+      for (const k of [
+        "name", "nameKana", "employeeCode", "employmentType", "status",
+        "birthOn", "hiredOn", "gender", "shiftTypeId", "worksiteId",
+      ]) {
+        if (k in b) patch[k] = b[k];
+      }
+      try {
+        await updateEmployee(ctx.env.DB, ctx.principal.tenantId, employeeId, patch, toJstCalendarDate(nowUtc()));
+        return json({ ok: true });
+      } catch (e) {
+        if (e instanceof RegistrationError) {
+          const notFound = e.issues.some((i) => i.field === "employeeId" && i.code === "not_found");
+          return json({ error: notFound ? "not_found" : "validation_failed", issues: e.issues }, notFound ? 404 : 422);
+        }
         throw e;
       }
     },
