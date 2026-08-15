@@ -8,7 +8,7 @@ import {
   parseClock, normalizeClockOut, addDays, nowUtc, toJstCalendarDate,
   hashPassword, verifyPassword, needsRehash, equalizeTiming, ALGO_LABEL, sha256Hex, tenureYearsMonths,
 } from "./core.ts";
-import type { CalendarDate, ClockTime, Minutes } from "./core.ts";
+import type { CalendarDate, ClockTime, Minutes, UtcInstant } from "./core.ts";
 
 export { sha256Hex };
 
@@ -839,7 +839,18 @@ export const DELETION_EXEMPT: Record<string, string> = {
  * 従業員1名の退会で削除する対象。
  * 子から親の順に並べる（外部キーの参照順）。
  */
-export const EMPLOYEE_DELETION_ORDER: Array<{ table: string; by: "employee_id" | "account_id" | "login_id" }> = [
+/**
+ * ⚠ `cols` は「その従業員を指す列」を列挙する。既定は employee_id。
+ *   thanks のように従業員を2方向から参照するテーブルがあるため、複数列を許す。
+ */
+export const EMPLOYEE_DELETION_ORDER: Array<{
+  table: string;
+  by: "employee_id" | "account_id" | "login_id";
+  cols?: string[];
+}> = [
+  { table: "thanks", by: "employee_id", cols: ["from_employee_id", "to_employee_id"] },
+  { table: "photo_posts", by: "employee_id" },
+  { table: "daily_reports", by: "employee_id" },
   { table: "attendance_summaries", by: "employee_id" },
   { table: "shift_period_flags", by: "employee_id" },
   { table: "shifts", by: "employee_id" },
@@ -861,8 +872,15 @@ export const TENANT_DELETION_ORDER: string[] = [
   "shift_period_flags",
   "shifts",
   "attendance_summaries",
+  // thanks / photo_posts / daily_reports は employees を参照する
+  "thanks",
+  "photo_posts",
+  "daily_reports",
+  "daily_report_categories",
   "employees",
   "shift_types",
+  // worksites を参照するため、worksites より先に消すこと
+  "worksite_monthly_reports",
   "worksites",
   "contracts",
   "accounts",
@@ -901,22 +919,24 @@ export async function deleteEmployee(
   const deleted: Record<string, number> = {};
   for (const step of EMPLOYEE_DELETION_ORDER) {
     let key: string | null;
-    let col: string;
+    let cols: string[];
     if (step.by === "employee_id") {
       key = employeeId;
-      col = step.table === "employees" ? "id" : "employee_id";
+      cols = step.cols ?? [step.table === "employees" ? "id" : "employee_id"];
     } else if (step.by === "account_id") {
       key = emp.account_id;
-      col = step.table === "accounts" ? "id" : "account_id";
+      cols = step.cols ?? [step.table === "accounts" ? "id" : "account_id"];
     } else {
       key = loginId;
-      col = "login_id";
+      cols = step.cols ?? ["login_id"];
     }
     if (key === null) {
       deleted[step.table] = 0;
       continue;
     }
-    const res = await db.prepare(`DELETE FROM ${step.table} WHERE ${col} = ?1`).bind(key).run();
+    // 複数列のいずれかに一致する行を消す（例: thanks の from / to）
+    const where = cols.map((c) => `${c} = ?1`).join(" OR ");
+    const res = await db.prepare(`DELETE FROM ${step.table} WHERE ${where}`).bind(key).run();
     deleted[step.table] = res.meta?.changes ?? 0;
   }
 
@@ -1592,4 +1612,1264 @@ export async function getShiftSheet(
     shiftTypes: types.results ?? [],
     rows,
   };
+}
+
+// ===============================================================
+// プロフィール（機能権限表 区分5 / T-11〜T-17）
+// ===============================================================
+/**
+ * 🔴 現行から意図的に変えた点（profile1/2/3updateAction.php・profile3Template.php で実証）:
+ *
+ *   ① 写真を公開ディレクトリに置かない。
+ *      現行は `../upload/{su1_id}/{su2_id}/{file}` で、URL を知れば誰でも顔写真を取得できた。
+ *      新システムは R2 に保存し、認証必須のエンドポイント経由でのみ配信する。
+ *
+ *   ② オブジェクトキーをユーザー入力から作らない。
+ *      現行は `unlink($directory_path . $this->getRequest("su2_pic1"))` で、
+ *      検査のない入力値を連結して削除していた（任意ファイル削除の可能性）。
+ *      新システムは DB に保存済みのキーだけを削除対象にする。
+ *
+ *   ③ サイズ上限と内容検査を入れる（現行は exif_imagetype のみ）。
+ *
+ *   ④ パスワード列を表示分岐に使わない。
+ *      現行 profile01sTemplate.php は `{if $userp->SU1_PASS ==""}` で表示を切り替えていた。
+ *
+ *   ⑤ 自分のプロフィールだけ編集できる。閲覧は同一テナント内に限る。
+ */
+
+/** 顔写真の上限。Workers のリクエスト上限内で余裕を見た値【会話合意 2026-08-16】 */
+export const PHOTO_MAX_BYTES = 5 * 1024 * 1024;
+
+/** 本文の上限。現行は無制限だったが、D1 の行サイズと表示崩れを防ぐため設ける */
+export const PROFILE_TEXT_MAX = 2000;
+
+/** 受け入れる画像形式。マジックナンバーで判定する（拡張子や Content-Type を信用しない） */
+const PHOTO_TYPES = [
+  { mime: "image/jpeg", ext: "jpg", magic: [0xff, 0xd8, 0xff] },
+  { mime: "image/png", ext: "png", magic: [0x89, 0x50, 0x4e, 0x47] },
+  { mime: "image/gif", ext: "gif", magic: [0x47, 0x49, 0x46, 0x38] },
+] as const;
+
+/** 先頭バイト列から画像形式を判定する。判定できなければ null */
+export function sniffImageType(bytes: Uint8Array): { mime: string; ext: string } | null {
+  for (const t of PHOTO_TYPES) {
+    if (bytes.length < t.magic.length) continue;
+    let ok = true;
+    for (let i = 0; i < t.magic.length; i++) {
+      if (bytes[i] !== t.magic[i]) { ok = false; break; }
+    }
+    if (ok) return { mime: t.mime, ext: t.ext };
+  }
+  return null;
+}
+
+export interface Profile {
+  employeeId: string;
+  name: string;
+  /** 画面ラベル「Profile」（現行 su2_remarks3）*/
+  profileText: string | null;
+  /** 画面ラベル「Note」（現行 su2_remarks4）*/
+  profileNote: string | null;
+  hasPhoto: boolean;
+}
+
+interface ProfileDbRow {
+  id: string;
+  name: string;
+  profile_text: string | null;
+  profile_note: string | null;
+  photo_object_key: string | null;
+}
+
+/** 同一テナント内のプロフィールを取得する。他テナントは null（存在を漏らさない） */
+export async function getProfile(
+  db: D1Database,
+  tenantId: string,
+  employeeId: string
+): Promise<Profile | null> {
+  const r = await db
+    .prepare(
+      `SELECT id, name, profile_text, profile_note, photo_object_key
+         FROM employees WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`
+    )
+    .bind(employeeId, tenantId)
+    .first<ProfileDbRow>();
+  if (r === null) return null;
+  return {
+    employeeId: r.id,
+    name: r.name,
+    profileText: r.profile_text,
+    profileNote: r.profile_note,
+    hasPhoto: r.photo_object_key !== null,
+  };
+}
+
+/** ログイン中のアカウントに紐づく従業員。プロフィールの編集可否の判定に使う */
+export async function getOwnEmployeeId(
+  db: D1Database,
+  tenantId: string,
+  accountId: string
+): Promise<string | null> {
+  const r = await db
+    .prepare(`SELECT id FROM employees WHERE account_id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+    .bind(accountId, tenantId)
+    .first<{ id: string }>();
+  return r?.id ?? null;
+}
+
+/** 本文の更新。🔴 呼び出す前に「自分のものか」を確認すること */
+export async function updateProfile(
+  db: D1Database,
+  tenantId: string,
+  employeeId: string,
+  input: { profileText?: string | null; profileNote?: string | null }
+): Promise<void> {
+  const current = await getProfile(db, tenantId, employeeId);
+  if (current === null) throw new RegistrationError([{ field: "employeeId", code: "not_found" }]);
+
+  const issues: ValidationIssue[] = [];
+  const text = input.profileText === undefined ? current.profileText : input.profileText;
+  const note = input.profileNote === undefined ? current.profileNote : input.profileNote;
+  if (text !== null && text.length > PROFILE_TEXT_MAX) issues.push({ field: "profileText", code: "too_long" });
+  if (note !== null && note.length > PROFILE_TEXT_MAX) issues.push({ field: "profileNote", code: "too_long" });
+  if (issues.length > 0) throw new RegistrationError(issues);
+
+  await db
+    .prepare(
+      `UPDATE employees SET profile_text = ?1, profile_note = ?2, updated_at = ?3
+        WHERE id = ?4 AND tenant_id = ?5`
+    )
+    .bind(emptyToNull(text), emptyToNull(note), nowUtc(), employeeId, tenantId)
+    .run();
+}
+
+/**
+ * 顔写真の差し替え。古いオブジェクトは DB に記録されたキーだけを消す。
+ * 🔴 キーはこちらで生成する。ユーザー入力を連結しない（現行の任意ファイル削除対策）。
+ */
+export async function putProfilePhoto(
+  db: D1Database,
+  photos: R2Bucket,
+  tenantId: string,
+  employeeId: string,
+  bytes: Uint8Array
+): Promise<{ objectKey: string; mime: string }> {
+  if (bytes.length === 0) throw new RegistrationError([{ field: "photo", code: "required" }]);
+  if (bytes.length > PHOTO_MAX_BYTES) throw new RegistrationError([{ field: "photo", code: "too_large" }]);
+
+  const kind = sniffImageType(bytes);
+  if (kind === null) throw new RegistrationError([{ field: "photo", code: "unsupported_type" }]);
+
+  const cur = await db
+    .prepare(`SELECT photo_object_key FROM employees WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+    .bind(employeeId, tenantId)
+    .first<{ photo_object_key: string | null }>();
+  if (cur === null) throw new RegistrationError([{ field: "employeeId", code: "not_found" }]);
+
+  // キーにテナントIDを含める。R2 側から見ても所属が追える
+  const objectKey = `tenants/${tenantId}/employees/${employeeId}/${crypto.randomUUID()}.${kind.ext}`;
+  await photos.put(objectKey, bytes, { httpMetadata: { contentType: kind.mime } });
+
+  await db
+    .prepare(`UPDATE employees SET photo_object_key = ?1, updated_at = ?2 WHERE id = ?3 AND tenant_id = ?4`)
+    .bind(objectKey, nowUtc(), employeeId, tenantId)
+    .run();
+
+  if (cur.photo_object_key !== null && cur.photo_object_key !== objectKey) {
+    await photos.delete(cur.photo_object_key);
+  }
+  return { objectKey, mime: kind.mime };
+}
+
+/** 顔写真の削除 */
+export async function deleteProfilePhoto(
+  db: D1Database,
+  photos: R2Bucket,
+  tenantId: string,
+  employeeId: string
+): Promise<boolean> {
+  const cur = await db
+    .prepare(`SELECT photo_object_key FROM employees WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+    .bind(employeeId, tenantId)
+    .first<{ photo_object_key: string | null }>();
+  if (cur === null) throw new RegistrationError([{ field: "employeeId", code: "not_found" }]);
+  if (cur.photo_object_key === null) return false;
+
+  await photos.delete(cur.photo_object_key);
+  await db
+    .prepare(`UPDATE employees SET photo_object_key = NULL, updated_at = ?1 WHERE id = ?2 AND tenant_id = ?3`)
+    .bind(nowUtc(), employeeId, tenantId)
+    .run();
+  return true;
+}
+
+/** 配信用のキー取得。🔴 tenant_id で必ず絞る */
+export async function getProfilePhotoKey(
+  db: D1Database,
+  tenantId: string,
+  employeeId: string
+): Promise<string | null> {
+  const r = await db
+    .prepare(`SELECT photo_object_key FROM employees WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+    .bind(employeeId, tenantId)
+    .first<{ photo_object_key: string | null }>();
+  return r?.photo_object_key ?? null;
+}
+
+// ===============================================================
+// 店舗情報＝月次の人事指標レポート（機能権限表 区分4 / T-18〜T-22）
+// ===============================================================
+/**
+ * ⚠ 「店舗情報」という名称に反して、店舗マスタではない。
+ *    募集・採用・離職を月ごとに記録する機能である（company1Template.php で実証）。
+ *    店舗の名称・住所は worksites が持つ。
+ *
+ * 🔴 現行から意図的に変えた点:
+ *   ① 平均勤続・平均年齢を保存しない。
+ *      現行は保存時に getuser1avgcomovage() で算出して COMPANY1_SERVICE / _AGE に
+ *      書き込んでいたが、従業員データが変われば過去月の値も変わるべきものである。
+ *      新実装は参照時に都度算出する。
+ *   ② 年間集計テーブルを作らない（article_counter1_com3 廃止）【会話合意⑥】。
+ *      年間の値は一覧取得時に合算する。
+ *   ③ overtime 列を作らない（画面に入力欄が無く、常に空だった）。
+ *   ④ 締め日の扱いを階層で分けない。
+ *      現行は company1Template にのみ締め日の分岐があり、company2Template には無かった。
+ */
+
+export interface MonthlyReport {
+  id: string;
+  worksiteId: string | null;
+  worksiteName: string | null;
+  periodYearMonth: string;
+  recruitCount: number;
+  hireCount: number;
+  turnoverCount: number;
+  note: string | null;
+}
+
+interface MonthlyReportDbRow {
+  id: string;
+  worksite_id: string | null;
+  worksite_name: string | null;
+  period_year_month: string;
+  recruit_count: number;
+  hire_count: number;
+  turnover_count: number;
+  note: string | null;
+}
+
+const REPORT_SELECT = `
+  SELECT r.id, r.worksite_id, w.name AS worksite_name, r.period_year_month,
+         r.recruit_count, r.hire_count, r.turnover_count, r.note
+    FROM worksite_monthly_reports r
+    LEFT JOIN worksites w ON w.id = r.worksite_id`;
+
+function toReport(r: MonthlyReportDbRow): MonthlyReport {
+  return {
+    id: r.id,
+    worksiteId: r.worksite_id,
+    worksiteName: r.worksite_name,
+    periodYearMonth: r.period_year_month,
+    recruitCount: r.recruit_count,
+    hireCount: r.hire_count,
+    turnoverCount: r.turnover_count,
+    note: r.note,
+  };
+}
+
+/** 'YYYY-MM' として妥当か。月は 01〜12 */
+export function isYearMonth(v: string): boolean {
+  if (!/^\d{4}-\d{2}$/.test(v)) return false;
+  const m = Number(v.slice(5, 7));
+  return m >= 1 && m <= 12;
+}
+
+export interface MonthlyReportInput {
+  worksiteId: string | null;
+  periodYearMonth: string;
+  recruitCount: number;
+  hireCount: number;
+  turnoverCount: number;
+  note: string | null;
+}
+
+export function validateMonthlyReport(input: MonthlyReportInput): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!isYearMonth(input.periodYearMonth)) issues.push({ field: "periodYearMonth", code: "invalid_format" });
+  for (const [field, v] of [
+    ["recruitCount", input.recruitCount],
+    ["hireCount", input.hireCount],
+    ["turnoverCount", input.turnoverCount],
+  ] as const) {
+    if (!Number.isInteger(v)) issues.push({ field, code: "not_an_integer" });
+    else if (v < 0) issues.push({ field, code: "out_of_range" });
+    else if (v > 100000) issues.push({ field, code: "out_of_range" });
+  }
+  if (input.note !== null && input.note.length > PROFILE_TEXT_MAX) issues.push({ field: "note", code: "too_long" });
+  return issues;
+}
+
+/**
+ * 登録・更新。同一店舗・同一年月は1件に保つ。
+ * 現行は getcompany1c() で件数を数えて弾いていたが、新実装は UNIQUE 制約でも二重に守る。
+ */
+export async function upsertMonthlyReport(
+  db: D1Database,
+  tenantId: string,
+  input: MonthlyReportInput
+): Promise<{ id: string; created: boolean }> {
+  const issues = validateMonthlyReport(input);
+  if (issues.length > 0) throw new RegistrationError(issues);
+
+  const worksiteId = emptyToNull(input.worksiteId);
+  if (worksiteId !== null) {
+    const ws = await db
+      .prepare(`SELECT id FROM worksites WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+      .bind(worksiteId, tenantId)
+      .first<{ id: string }>();
+    if (ws === null) throw new RegistrationError([{ field: "worksiteId", code: "not_found" }]);
+  }
+
+  const t = nowUtc();
+  // 🔴 tenant_id を必ず条件に入れる（B-6）
+  const existing = await db
+    .prepare(
+      `SELECT id FROM worksite_monthly_reports
+        WHERE tenant_id = ?1 AND period_year_month = ?2
+          AND (worksite_id IS ?3) AND deleted_at IS NULL`
+    )
+    .bind(tenantId, input.periodYearMonth, worksiteId)
+    .first<{ id: string }>();
+
+  if (existing !== null) {
+    await db
+      .prepare(
+        `UPDATE worksite_monthly_reports
+            SET recruit_count = ?1, hire_count = ?2, turnover_count = ?3, note = ?4, updated_at = ?5
+          WHERE id = ?6 AND tenant_id = ?7`
+      )
+      .bind(input.recruitCount, input.hireCount, input.turnoverCount, emptyToNull(input.note), t, existing.id, tenantId)
+      .run();
+    return { id: existing.id, created: false };
+  }
+
+  const id = crypto.randomUUID();
+  await db
+    .prepare(
+      `INSERT INTO worksite_monthly_reports
+         (id,tenant_id,worksite_id,period_year_month,recruit_count,hire_count,turnover_count,note,created_at,updated_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)`
+    )
+    .bind(id, tenantId, worksiteId, input.periodYearMonth, input.recruitCount, input.hireCount,
+          input.turnoverCount, emptyToNull(input.note), t)
+    .run();
+  return { id, created: true };
+}
+
+/** 単票。他テナントは null */
+export async function getMonthlyReport(
+  db: D1Database,
+  tenantId: string,
+  reportId: string
+): Promise<MonthlyReport | null> {
+  const r = await db
+    .prepare(`${REPORT_SELECT} WHERE r.id = ?1 AND r.tenant_id = ?2 AND r.deleted_at IS NULL`)
+    .bind(reportId, tenantId)
+    .first<MonthlyReportDbRow>();
+  return r === null ? null : toReport(r);
+}
+
+export interface MonthlyReportListResult {
+  reports: MonthlyReport[];
+  /** 年間の合算。現行の article_counter1_com3 に相当するが、保存せず都度算出する */
+  totals: { recruitCount: number; hireCount: number; turnoverCount: number };
+  /** 離職率 = 離職数 / (期首在籍 + 採用数)。算出できなければ null */
+  turnoverRate: number | null;
+}
+
+/**
+ * 一覧。year を指定すると 'YYYY-01'〜'YYYY-12' に絞る。
+ * ⚠ 年間始月（テナントごとの年度の区切り）は 0003 時点で未実装。
+ *   実装後は開始月からの12ヶ月に変更すること【未確認・機能権限表 1.2 ③】。
+ */
+export async function listMonthlyReports(
+  db: D1Database,
+  tenantId: string,
+  opts: { year?: string | null; worksiteId?: string | null } = {}
+): Promise<MonthlyReportListResult> {
+  const clauses = ["r.tenant_id = ?1", "r.deleted_at IS NULL"];
+  const binds: string[] = [tenantId];
+
+  const year = emptyToNull(opts.year ?? null);
+  if (year !== null) {
+    if (!/^\d{4}$/.test(year)) throw new RegistrationError([{ field: "year", code: "invalid_format" }]);
+    binds.push(`${year}-%`);
+    clauses.push(`r.period_year_month LIKE ?${binds.length}`);
+  }
+  const worksiteId = emptyToNull(opts.worksiteId ?? null);
+  if (worksiteId !== null) {
+    binds.push(worksiteId);
+    clauses.push(`r.worksite_id = ?${binds.length}`);
+  }
+
+  const res = await db
+    .prepare(`${REPORT_SELECT} WHERE ${clauses.join(" AND ")} ORDER BY r.period_year_month DESC LIMIT 500`)
+    .bind(...binds)
+    .all<MonthlyReportDbRow>();
+  const reports = (res.results ?? []).map(toReport);
+
+  const totals = { recruitCount: 0, hireCount: 0, turnoverCount: 0 };
+  for (const r of reports) {
+    totals.recruitCount += r.recruitCount;
+    totals.hireCount += r.hireCount;
+    totals.turnoverCount += r.turnoverCount;
+  }
+  const denom = totals.hireCount + totals.turnoverCount;
+  const turnoverRate = denom === 0 ? null : Math.round((totals.turnoverCount / denom) * 1000) / 10;
+  return { reports, totals, turnoverRate };
+}
+
+/**
+ * その月の平均勤続・平均年齢。🔴 保存しない。参照のたびに算出する。
+ * 現行 getuser1avgcomovage() 相当。月末日を基準日にする。
+ */
+export async function monthlyWorkforceStats(
+  db: D1Database,
+  tenantId: string,
+  periodYearMonth: string,
+  worksiteId: string | null = null
+): Promise<{ headcount: number; avgTenureMonths: number | null; avgAge: number | null }> {
+  if (!isYearMonth(periodYearMonth)) throw new RegistrationError([{ field: "periodYearMonth", code: "invalid_format" }]);
+  const [y, m] = periodYearMonth.split("-").map(Number);
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const asOf = `${periodYearMonth}-${String(lastDay).padStart(2, "0")}`;
+
+  const binds: string[] = [tenantId];
+  let extra = "";
+  if (worksiteId !== null) { binds.push(worksiteId); extra = ` AND worksite_id = ?${binds.length}`; }
+
+  const res = await db
+    .prepare(
+      `SELECT hired_on, birth_on FROM employees
+        WHERE tenant_id = ?1 AND deleted_at IS NULL AND status = 'active'${extra}`
+    )
+    .bind(...binds)
+    .all<{ hired_on: string | null; birth_on: string | null }>();
+  const rows = res.results ?? [];
+
+  let tenureSum = 0, tenureN = 0, ageSum = 0, ageN = 0;
+  for (const r of rows) {
+    if (r.hired_on !== null && r.hired_on <= asOf) {
+      const t = tenureYearsMonths(r.hired_on, asOf);
+      tenureSum += t.years * 12 + t.months;
+      tenureN++;
+    }
+    if (r.birth_on !== null) { ageSum += ageOn(r.birth_on, asOf); ageN++; }
+  }
+  return {
+    headcount: rows.length,
+    avgTenureMonths: tenureN === 0 ? null : Math.round((tenureSum / tenureN) * 10) / 10,
+    avgAge: ageN === 0 ? null : Math.round((ageSum / ageN) * 10) / 10,
+  };
+}
+
+// ===============================================================
+// 業務日報（機能権限表 区分10 / T-23〜T-29）
+// ===============================================================
+/**
+ * 🔴 現行から意図的に変えた点（dreport2Template.php / dreport2updateAction.php で実証）:
+ *
+ *   ① 経過時間を分（INTEGER）で1つだけ持つ。
+ *      現行は REPORT_TIME3（時間単位の小数・小数点以下10桁）と REPORT_TIME4（'HH:MM:SS'）を
+ *      二重に保存していた。不変条件③に反するうえ、二重持ちは食い違いを生む。
+ *
+ *   ② 日跨ぎの判定を normalizeClockOut() に集約する。
+ *      現行は Action ごとに if($timestamp1 > $timestamp2) を書いていた（設計書 4.13.1 と同型）。
+ *
+ *   ③ REPORT_DATE_TIME1/2（検索用の日時列）を持たない。
+ *      reported_on と start_time / end_time から導けるため。
+ *
+ *   ④ 画像を R2 に置き、配信を認証必須にする（現行は ../images/ の公開ディレクトリ）。
+ *
+ *   ⑤ $diff->h で差を作ると days が無視され 24時間以上で壊れる。分の引き算にする。
+ */
+
+export interface ReportCategory {
+  id: string;
+  name: string;
+  sortOrder: number;
+  isActive: boolean;
+}
+
+/** カテゴリ一覧。現行 tb_m_dr（マスタ①の「マスターデータ」画面が管理する） */
+export async function listReportCategories(
+  db: D1Database,
+  tenantId: string,
+  includeInactive = false
+): Promise<ReportCategory[]> {
+  const where = includeInactive ? "" : " AND is_active = 1";
+  const res = await db
+    .prepare(
+      `SELECT id, name, sort_order, is_active FROM daily_report_categories
+        WHERE tenant_id = ?1${where} ORDER BY sort_order ASC, name ASC`
+    )
+    .bind(tenantId)
+    .all<{ id: string; name: string; sort_order: number; is_active: number }>();
+  return (res.results ?? []).map((r) => ({
+    id: r.id, name: r.name, sortOrder: r.sort_order, isActive: r.is_active === 1,
+  }));
+}
+
+export async function upsertReportCategory(
+  db: D1Database,
+  tenantId: string,
+  input: { id?: string | null; name: string; sortOrder?: number; isActive?: boolean }
+): Promise<{ id: string; created: boolean }> {
+  const name = (input.name ?? "").trim();
+  if (name === "") throw new RegistrationError([{ field: "name", code: "required" }]);
+  if (name.length > 100) throw new RegistrationError([{ field: "name", code: "too_long" }]);
+  const sortOrder = input.sortOrder ?? 0;
+  if (!Number.isInteger(sortOrder)) throw new RegistrationError([{ field: "sortOrder", code: "not_an_integer" }]);
+  const isActive = input.isActive === false ? 0 : 1;
+  const t = nowUtc();
+
+  const id = emptyToNull(input.id ?? null);
+  if (id !== null) {
+    const cur = await db
+      .prepare(`SELECT id FROM daily_report_categories WHERE id = ?1 AND tenant_id = ?2`)
+      .bind(id, tenantId)
+      .first<{ id: string }>();
+    if (cur === null) throw new RegistrationError([{ field: "id", code: "not_found" }]);
+    await db
+      .prepare(
+        `UPDATE daily_report_categories SET name = ?1, sort_order = ?2, is_active = ?3, updated_at = ?4
+          WHERE id = ?5 AND tenant_id = ?6`
+      )
+      .bind(name, sortOrder, isActive, t, id, tenantId)
+      .run();
+    return { id, created: false };
+  }
+
+  const dup = await db
+    .prepare(`SELECT id FROM daily_report_categories WHERE tenant_id = ?1 AND name = ?2`)
+    .bind(tenantId, name)
+    .first<{ id: string }>();
+  if (dup !== null) throw new RegistrationError([{ field: "name", code: "already_taken" }]);
+
+  const newId = crypto.randomUUID();
+  await db
+    .prepare(
+      `INSERT INTO daily_report_categories (id,tenant_id,name,sort_order,is_active,created_at,updated_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?6)`
+    )
+    .bind(newId, tenantId, name, sortOrder, isActive, t)
+    .run();
+  return { id: newId, created: true };
+}
+
+export interface DailyReport {
+  id: string;
+  employeeId: string;
+  employeeName: string | null;
+  categoryId: string | null;
+  categoryName: string | null;
+  reportedOn: CalendarDate;
+  startTime: ClockTime;
+  /** 日跨ぎは 24時超え表記（例 26:30）。表示は formatClockOut() を通す */
+  endTime: ClockTime;
+  durationMinutes: Minutes;
+  body: string | null;
+  hasPhoto: boolean;
+}
+
+interface DailyReportDbRow {
+  id: string;
+  employee_id: string;
+  employee_name: string | null;
+  category_id: string | null;
+  category_name: string | null;
+  reported_on: string;
+  start_time: string;
+  end_time: string;
+  duration_minutes: number;
+  body: string | null;
+  photo_object_key: string | null;
+}
+
+const DAILY_REPORT_SELECT = `
+  SELECT r.id, r.employee_id, e.name AS employee_name, r.category_id,
+         c.name AS category_name, r.reported_on, r.start_time, r.end_time,
+         r.duration_minutes, r.body, r.photo_object_key
+    FROM daily_reports r
+    LEFT JOIN employees e ON e.id = r.employee_id
+    LEFT JOIN daily_report_categories c ON c.id = r.category_id`;
+
+function toDailyReport(r: DailyReportDbRow): DailyReport {
+  return {
+    id: r.id,
+    employeeId: r.employee_id,
+    employeeName: r.employee_name,
+    categoryId: r.category_id,
+    categoryName: r.category_name,
+    reportedOn: r.reported_on,
+    startTime: r.start_time,
+    endTime: r.end_time,
+    durationMinutes: r.duration_minutes,
+    body: r.body,
+    hasPhoto: r.photo_object_key !== null,
+  };
+}
+
+export interface DailyReportInput {
+  employeeId: string;
+  categoryId: string | null;
+  reportedOn: CalendarDate;
+  startTime: ClockTime;
+  endTime: ClockTime;
+  body: string | null;
+}
+
+/**
+ * 所要時間を算出する。日跨ぎは終了を翌日として扱う（normalizeClockOut に集約）。
+ * 🔴 現行の $diff->h は days を無視するため 24時間以上で壊れる。分の引き算にする。
+ */
+export function calcReportMinutes(startTime: ClockTime, endTime: ClockTime): Minutes {
+  return parseClock(normalizeClockOut(startTime, endTime)) - parseClock(startTime);
+}
+
+export function validateDailyReport(input: DailyReportInput): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!isRealDate(input.reportedOn)) issues.push({ field: "reportedOn", code: "not_a_real_date" });
+  for (const [field, v] of [["startTime", input.startTime], ["endTime", input.endTime]] as const) {
+    if (!/^\d{1,3}:[0-5]\d$/.test(v)) issues.push({ field, code: "invalid_format" });
+  }
+  if (issues.length === 0 && input.startTime === input.endTime) {
+    // 現行の JS も同値を弾いていた（「時間を確認してください」）
+    issues.push({ field: "endTime", code: "same_as_start" });
+  }
+  if (input.body !== null && input.body.length > PROFILE_TEXT_MAX) {
+    issues.push({ field: "body", code: "too_long" });
+  }
+  return issues;
+}
+
+/**
+ * 同じ従業員・同じ日で時間帯が重なる日報を探す。
+ * ⚠ 現行と同じく「警告するが登録は許可する」【会話合意 2026-08-16】。
+ *   現行は Ajax の dreport2check が文言を返すだけで、保存側に検査が無かった。
+ */
+export async function findOverlappingReports(
+  db: D1Database,
+  tenantId: string,
+  employeeId: string,
+  reportedOn: CalendarDate,
+  startTime: ClockTime,
+  endTime: ClockTime,
+  excludeId: string | null = null
+): Promise<DailyReport[]> {
+  const s = parseClock(startTime);
+  const e = parseClock(normalizeClockOut(startTime, endTime));
+  const res = await db
+    .prepare(
+      `${DAILY_REPORT_SELECT}
+        WHERE r.tenant_id = ?1 AND r.employee_id = ?2 AND r.reported_on = ?3 AND r.deleted_at IS NULL`
+    )
+    .bind(tenantId, employeeId, reportedOn)
+    .all<DailyReportDbRow>();
+  return (res.results ?? [])
+    .filter((r) => r.id !== excludeId)
+    .filter((r) => {
+      const rs = parseClock(r.start_time);
+      const re = parseClock(r.end_time);
+      // 端が接するだけ（前の終了 == 次の開始）は重複としない
+      return rs < e && s < re;
+    })
+    .map(toDailyReport);
+}
+
+export async function upsertDailyReport(
+  db: D1Database,
+  tenantId: string,
+  reportId: string | null,
+  input: DailyReportInput
+): Promise<{ id: string; created: boolean; overlaps: DailyReport[] }> {
+  const issues = validateDailyReport(input);
+  if (issues.length > 0) throw new RegistrationError(issues);
+
+  const emp = await db
+    .prepare(`SELECT id FROM employees WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+    .bind(input.employeeId, tenantId)
+    .first<{ id: string }>();
+  if (emp === null) throw new RegistrationError([{ field: "employeeId", code: "not_found" }]);
+
+  const categoryId = emptyToNull(input.categoryId);
+  if (categoryId !== null) {
+    const c = await db
+      .prepare(`SELECT id FROM daily_report_categories WHERE id = ?1 AND tenant_id = ?2 AND is_active = 1`)
+      .bind(categoryId, tenantId)
+      .first<{ id: string }>();
+    if (c === null) throw new RegistrationError([{ field: "categoryId", code: "not_found" }]);
+  }
+
+  const endTime = normalizeClockOut(input.startTime, input.endTime);
+  const durationMinutes = calcReportMinutes(input.startTime, input.endTime);
+  const overlaps = await findOverlappingReports(
+    db, tenantId, input.employeeId, input.reportedOn, input.startTime, input.endTime, reportId
+  );
+  const t = nowUtc();
+
+  if (reportId !== null) {
+    const cur = await db
+      .prepare(`SELECT id FROM daily_reports WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+      .bind(reportId, tenantId)
+      .first<{ id: string }>();
+    if (cur === null) throw new RegistrationError([{ field: "reportId", code: "not_found" }]);
+    await db
+      .prepare(
+        `UPDATE daily_reports
+            SET employee_id = ?1, category_id = ?2, reported_on = ?3, start_time = ?4,
+                end_time = ?5, duration_minutes = ?6, body = ?7, updated_at = ?8
+          WHERE id = ?9 AND tenant_id = ?10`
+      )
+      .bind(input.employeeId, categoryId, input.reportedOn, input.startTime, endTime,
+            durationMinutes, emptyToNull(input.body), t, reportId, tenantId)
+      .run();
+    return { id: reportId, created: false, overlaps };
+  }
+
+  const id = crypto.randomUUID();
+  await db
+    .prepare(
+      `INSERT INTO daily_reports
+         (id,tenant_id,employee_id,category_id,reported_on,start_time,end_time,duration_minutes,body,created_at,updated_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)`
+    )
+    .bind(id, tenantId, input.employeeId, categoryId, input.reportedOn, input.startTime,
+          endTime, durationMinutes, emptyToNull(input.body), t)
+    .run();
+  return { id, created: true, overlaps };
+}
+
+export async function getDailyReport(
+  db: D1Database,
+  tenantId: string,
+  reportId: string
+): Promise<DailyReport | null> {
+  const r = await db
+    .prepare(`${DAILY_REPORT_SELECT} WHERE r.id = ?1 AND r.tenant_id = ?2 AND r.deleted_at IS NULL`)
+    .bind(reportId, tenantId)
+    .first<DailyReportDbRow>();
+  return r === null ? null : toDailyReport(r);
+}
+
+export async function listDailyReports(
+  db: D1Database,
+  tenantId: string,
+  opts: { employeeId?: string | null; reportedOn?: string | null; month?: string | null } = {}
+): Promise<DailyReport[]> {
+  const clauses = ["r.tenant_id = ?1", "r.deleted_at IS NULL"];
+  const binds: string[] = [tenantId];
+  if (opts.employeeId !== undefined && opts.employeeId !== null && opts.employeeId !== "") {
+    binds.push(opts.employeeId);
+    clauses.push(`r.employee_id = ?${binds.length}`);
+  }
+  const on = emptyToNull(opts.reportedOn ?? null);
+  if (on !== null) {
+    if (!isRealDate(on)) throw new RegistrationError([{ field: "reportedOn", code: "not_a_real_date" }]);
+    binds.push(on);
+    clauses.push(`r.reported_on = ?${binds.length}`);
+  }
+  const month = emptyToNull(opts.month ?? null);
+  if (month !== null) {
+    if (!isYearMonth(month)) throw new RegistrationError([{ field: "month", code: "invalid_format" }]);
+    binds.push(`${month}-%`);
+    clauses.push(`r.reported_on LIKE ?${binds.length}`);
+  }
+  const res = await db
+    .prepare(
+      `${DAILY_REPORT_SELECT} WHERE ${clauses.join(" AND ")}
+        ORDER BY r.reported_on DESC, r.start_time ASC LIMIT 500`
+    )
+    .bind(...binds)
+    .all<DailyReportDbRow>();
+  return (res.results ?? []).map(toDailyReport);
+}
+
+/** 論理削除。写真は R2 から実際に消す（孤児を作らない） */
+export async function deleteDailyReport(
+  db: D1Database,
+  photos: R2Bucket,
+  tenantId: string,
+  reportId: string
+): Promise<boolean> {
+  const cur = await db
+    .prepare(`SELECT photo_object_key FROM daily_reports WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+    .bind(reportId, tenantId)
+    .first<{ photo_object_key: string | null }>();
+  if (cur === null) return false;
+  if (cur.photo_object_key !== null) await photos.delete(cur.photo_object_key);
+  const t = nowUtc();
+  await db
+    .prepare(`UPDATE daily_reports SET deleted_at = ?1, photo_object_key = NULL, updated_at = ?1 WHERE id = ?2 AND tenant_id = ?3`)
+    .bind(t, reportId, tenantId)
+    .run();
+  return true;
+}
+
+/** 日報の写真。プロフィールと同じ作法（キーは自前生成・中身で判定） */
+export async function putDailyReportPhoto(
+  db: D1Database,
+  photos: R2Bucket,
+  tenantId: string,
+  reportId: string,
+  bytes: Uint8Array
+): Promise<{ objectKey: string; mime: string }> {
+  if (bytes.length === 0) throw new RegistrationError([{ field: "photo", code: "required" }]);
+  if (bytes.length > PHOTO_MAX_BYTES) throw new RegistrationError([{ field: "photo", code: "too_large" }]);
+  const kind = sniffImageType(bytes);
+  if (kind === null) throw new RegistrationError([{ field: "photo", code: "unsupported_type" }]);
+
+  const cur = await db
+    .prepare(`SELECT photo_object_key FROM daily_reports WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+    .bind(reportId, tenantId)
+    .first<{ photo_object_key: string | null }>();
+  if (cur === null) throw new RegistrationError([{ field: "reportId", code: "not_found" }]);
+
+  const objectKey = `tenants/${tenantId}/daily-reports/${reportId}/${crypto.randomUUID()}.${kind.ext}`;
+  await photos.put(objectKey, bytes, { httpMetadata: { contentType: kind.mime } });
+  await db
+    .prepare(`UPDATE daily_reports SET photo_object_key = ?1, updated_at = ?2 WHERE id = ?3 AND tenant_id = ?4`)
+    .bind(objectKey, nowUtc(), reportId, tenantId)
+    .run();
+  if (cur.photo_object_key !== null && cur.photo_object_key !== objectKey) {
+    await photos.delete(cur.photo_object_key);
+  }
+  return { objectKey, mime: kind.mime };
+}
+
+export async function getDailyReportPhotoKey(
+  db: D1Database,
+  tenantId: string,
+  reportId: string
+): Promise<string | null> {
+  const r = await db
+    .prepare(`SELECT photo_object_key FROM daily_reports WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+    .bind(reportId, tenantId)
+    .first<{ photo_object_key: string | null }>();
+  return r?.photo_object_key ?? null;
+}
+
+// ===============================================================
+// 社内フォト共有（機能権限表 区分8 / T-30〜T-34）
+// ===============================================================
+/**
+ * ⚠ 現行のテーブル名は tb_m_chat1 だがチャットではない。社内フォト共有である。
+ *
+ * 🔴 現行から意図的に変えた点:
+ *   ① 画像1枚＋ひと言1つに絞る。現行は画面の8項目（pic2〜5 / comment2〜5）が
+ *      すべてコメントアウトされており、Action にだけ処理が残っていた。
+ *   ② 画像を R2 に置き、配信を認証必須にする（現行は ../image/ の公開ディレクトリ）。
+ *   ③ 投稿と画像を1回で受け取る。画像が無い投稿は作らせない。
+ *   ④ 削除できるのは投稿者本人と人事権系統のみ【会話合意 2026-08-16】。
+ */
+
+export interface PhotoPost {
+  id: string;
+  employeeId: string;
+  employeeName: string | null;
+  caption: string | null;
+  postedOn: CalendarDate;
+  createdAt: UtcInstant;
+}
+
+interface PhotoPostDbRow {
+  id: string;
+  employee_id: string;
+  employee_name: string | null;
+  caption: string | null;
+  posted_on: string;
+  created_at: string;
+}
+
+const PHOTO_POST_SELECT = `
+  SELECT p.id, p.employee_id, e.name AS employee_name, p.caption, p.posted_on, p.created_at
+    FROM photo_posts p
+    LEFT JOIN employees e ON e.id = p.employee_id`;
+
+function toPhotoPost(r: PhotoPostDbRow): PhotoPost {
+  return {
+    id: r.id,
+    employeeId: r.employee_id,
+    employeeName: r.employee_name,
+    caption: r.caption,
+    postedOn: r.posted_on,
+    createdAt: r.created_at,
+  };
+}
+
+/** ひと言の上限。現行は無制限だった */
+export const CAPTION_MAX = 200;
+
+/**
+ * 投稿。画像は必須で、キーはこちらで生成する。
+ * 🔴 R2 への書き込みに成功してから DB に入れる。DB が失敗したら R2 を巻き戻す。
+ */
+export async function createPhotoPost(
+  db: D1Database,
+  photos: R2Bucket,
+  tenantId: string,
+  employeeId: string,
+  input: { caption: string | null; postedOn: CalendarDate; bytes: Uint8Array }
+): Promise<{ id: string; objectKey: string }> {
+  const issues: ValidationIssue[] = [];
+  if (!isRealDate(input.postedOn)) issues.push({ field: "postedOn", code: "not_a_real_date" });
+  if (input.caption !== null && input.caption.length > CAPTION_MAX) {
+    issues.push({ field: "caption", code: "too_long" });
+  }
+  if (input.bytes.length === 0) issues.push({ field: "photo", code: "required" });
+  else if (input.bytes.length > PHOTO_MAX_BYTES) issues.push({ field: "photo", code: "too_large" });
+  if (issues.length > 0) throw new RegistrationError(issues);
+
+  const kind = sniffImageType(input.bytes);
+  if (kind === null) throw new RegistrationError([{ field: "photo", code: "unsupported_type" }]);
+
+  const emp = await db
+    .prepare(`SELECT id FROM employees WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+    .bind(employeeId, tenantId)
+    .first<{ id: string }>();
+  if (emp === null) throw new RegistrationError([{ field: "employeeId", code: "not_found" }]);
+
+  const id = crypto.randomUUID();
+  const objectKey = `tenants/${tenantId}/photo-posts/${id}/${crypto.randomUUID()}.${kind.ext}`;
+  await photos.put(objectKey, input.bytes, { httpMetadata: { contentType: kind.mime } });
+
+  try {
+    const t = nowUtc();
+    await db
+      .prepare(
+        `INSERT INTO photo_posts (id,tenant_id,employee_id,caption,photo_object_key,posted_on,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?7)`
+      )
+      .bind(id, tenantId, employeeId, emptyToNull(input.caption), objectKey, input.postedOn, t)
+      .run();
+  } catch (e) {
+    // DB に入らなかったオブジェクトを R2 に残さない
+    await photos.delete(objectKey);
+    throw e;
+  }
+  return { id, objectKey };
+}
+
+export async function listPhotoPosts(
+  db: D1Database,
+  tenantId: string,
+  opts: { employeeId?: string | null; limit?: number } = {}
+): Promise<PhotoPost[]> {
+  const clauses = ["p.tenant_id = ?1", "p.deleted_at IS NULL"];
+  const binds: string[] = [tenantId];
+  const employeeId = emptyToNull(opts.employeeId ?? null);
+  if (employeeId !== null) {
+    binds.push(employeeId);
+    clauses.push(`p.employee_id = ?${binds.length}`);
+  }
+  const limit = opts.limit ?? 100;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+    throw new RegistrationError([{ field: "limit", code: "out_of_range" }]);
+  }
+  const res = await db
+    .prepare(
+      `${PHOTO_POST_SELECT} WHERE ${clauses.join(" AND ")}
+        ORDER BY p.posted_on DESC, p.created_at DESC LIMIT ${limit}`
+    )
+    .bind(...binds)
+    .all<PhotoPostDbRow>();
+  return (res.results ?? []).map(toPhotoPost);
+}
+
+export async function getPhotoPost(
+  db: D1Database,
+  tenantId: string,
+  postId: string
+): Promise<PhotoPost | null> {
+  const r = await db
+    .prepare(`${PHOTO_POST_SELECT} WHERE p.id = ?1 AND p.tenant_id = ?2 AND p.deleted_at IS NULL`)
+    .bind(postId, tenantId)
+    .first<PhotoPostDbRow>();
+  return r === null ? null : toPhotoPost(r);
+}
+
+export async function getPhotoPostKey(
+  db: D1Database,
+  tenantId: string,
+  postId: string
+): Promise<string | null> {
+  const r = await db
+    .prepare(`SELECT photo_object_key FROM photo_posts WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+    .bind(postId, tenantId)
+    .first<{ photo_object_key: string }>();
+  return r?.photo_object_key ?? null;
+}
+
+/** 削除。🔴 呼び出す前に「投稿者本人か人事権系統か」を確認すること */
+export async function deletePhotoPost(
+  db: D1Database,
+  photos: R2Bucket,
+  tenantId: string,
+  postId: string
+): Promise<boolean> {
+  const cur = await db
+    .prepare(`SELECT photo_object_key FROM photo_posts WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+    .bind(postId, tenantId)
+    .first<{ photo_object_key: string }>();
+  if (cur === null) return false;
+  await photos.delete(cur.photo_object_key);
+  const t = nowUtc();
+  await db
+    .prepare(`UPDATE photo_posts SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND tenant_id = ?3`)
+    .bind(t, postId, tenantId)
+    .run();
+  return true;
+}
+
+// ===============================================================
+// ありがとう情報（機能権限表 区分7 / T-35〜T-40）
+// ===============================================================
+/**
+ * 🔴 現行から意図的に変えた点（thanks2Template.php / thanks2updateAction.php で実証）:
+ *
+ *   ① 集計テーブル5本を作らない【会話合意⑥】。
+ *      現行は1回の送信で本体1件＋集計5件の計6回書き込んでいた。
+ *      獲得順位も含め、すべて thanks の実データから都度算出する。
+ *
+ *   ② 🔴 月次の上限を実際に検査する。
+ *      現行は画面に「ありがとう数(月30まで)」と表示するだけで、
+ *      Action 側に検査が0件だった。31回目以降も登録できていた【コード実証】。
+ *
+ *   ③ 自分自身には送れない（ランキングの自作自演を防ぐ）。
+ *      現行は宛先リストから自分を除外していない【未確認だが除外の記述なし】。
+ *
+ *   ④ 集計対象月は締め日基準。getCutoffRange() と同じ考え方を使う。
+ */
+
+/** 1人あたりの月次上限。画面表示と実装を一致させる【会話合意 2026-08-16】 */
+export const THANKS_MONTHLY_LIMIT = 30;
+
+/** メッセージの上限。現行は無制限だった */
+export const THANKS_MESSAGE_MAX = 500;
+
+/**
+ * 送信日から集計対象月を決める。締め日を過ぎていなければ前月に属する。
+ * 例: 締め日20日・2026-08-25 に送信 → 2026-09 の期間（8/21〜9/20）
+ */
+export function thanksPeriodOf(thankedOn: CalendarDate, cutoffDay: number): string {
+  if (!isRealDate(thankedOn)) throw new RegistrationError([{ field: "thankedOn", code: "not_a_real_date" }]);
+  if (!Number.isInteger(cutoffDay) || cutoffDay < 1 || cutoffDay > 31) {
+    throw new RegistrationError([{ field: "cutoffDay", code: "out_of_range" }]);
+  }
+  const [y, m, d] = thankedOn.split("-").map(Number);
+  // 月末締め（cutoffDay が当月の末日以上）なら、その月がそのまま対象
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  if (cutoffDay >= lastDay) return `${thankedOn.slice(0, 7)}`;
+  // 締め日を過ぎていれば翌月の期間に入る
+  if (d > cutoffDay) {
+    const nm = m === 12 ? 1 : m + 1;
+    const ny = m === 12 ? y + 1 : y;
+    return `${ny}-${String(nm).padStart(2, "0")}`;
+  }
+  return thankedOn.slice(0, 7);
+}
+
+export interface Thanks {
+  id: string;
+  fromEmployeeId: string;
+  fromName: string | null;
+  toEmployeeId: string;
+  toName: string | null;
+  message: string | null;
+  thankedOn: CalendarDate;
+  periodYearMonth: string;
+}
+
+interface ThanksDbRow {
+  id: string;
+  from_employee_id: string;
+  from_name: string | null;
+  to_employee_id: string;
+  to_name: string | null;
+  message: string | null;
+  thanked_on: string;
+  period_year_month: string;
+}
+
+const THANKS_SELECT = `
+  SELECT t.id, t.from_employee_id, f.name AS from_name,
+         t.to_employee_id, p.name AS to_name,
+         t.message, t.thanked_on, t.period_year_month
+    FROM thanks t
+    LEFT JOIN employees f ON f.id = t.from_employee_id
+    LEFT JOIN employees p ON p.id = t.to_employee_id`;
+
+function toThanks(r: ThanksDbRow): Thanks {
+  return {
+    id: r.id,
+    fromEmployeeId: r.from_employee_id,
+    fromName: r.from_name,
+    toEmployeeId: r.to_employee_id,
+    toName: r.to_name,
+    message: r.message,
+    thankedOn: r.thanked_on,
+    periodYearMonth: r.period_year_month,
+  };
+}
+
+/** その期間に送った件数。上限の判定と画面表示に使う */
+export async function countThanksSent(
+  db: D1Database,
+  tenantId: string,
+  fromEmployeeId: string,
+  periodYearMonth: string
+): Promise<number> {
+  const r = await db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM thanks
+        WHERE tenant_id = ?1 AND from_employee_id = ?2 AND period_year_month = ?3 AND deleted_at IS NULL`
+    )
+    .bind(tenantId, fromEmployeeId, periodYearMonth)
+    .first<{ n: number }>();
+  return r?.n ?? 0;
+}
+
+export async function sendThanks(
+  db: D1Database,
+  tenantId: string,
+  fromEmployeeId: string,
+  input: { toEmployeeId: string; message: string | null; thankedOn: CalendarDate }
+): Promise<{ id: string; periodYearMonth: string; sentInPeriod: number }> {
+  const issues: ValidationIssue[] = [];
+  if (!isRealDate(input.thankedOn)) issues.push({ field: "thankedOn", code: "not_a_real_date" });
+  if (input.message !== null && input.message.length > THANKS_MESSAGE_MAX) {
+    issues.push({ field: "message", code: "too_long" });
+  }
+  // 🔴 自分自身には送れない
+  if (input.toEmployeeId === fromEmployeeId) issues.push({ field: "toEmployeeId", code: "same_as_sender" });
+  if (issues.length > 0) throw new RegistrationError(issues);
+
+  // 送り主・宛先とも自テナントに実在すること（B-6）
+  for (const [field, id] of [["fromEmployeeId", fromEmployeeId], ["toEmployeeId", input.toEmployeeId]] as const) {
+    const e = await db
+      .prepare(`SELECT id FROM employees WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL`)
+      .bind(id, tenantId)
+      .first<{ id: string }>();
+    if (e === null) throw new RegistrationError([{ field, code: "not_found" }]);
+  }
+
+  const tenant = await db
+    .prepare(`SELECT cutoff_day FROM tenants WHERE id = ?1`)
+    .bind(tenantId)
+    .first<{ cutoff_day: number }>();
+  const cutoffDay = tenant?.cutoff_day ?? 31;
+  const periodYearMonth = thanksPeriodOf(input.thankedOn, cutoffDay);
+
+  // 🔴 現行は画面に書いてあるだけで検査していなかった
+  const sent = await countThanksSent(db, tenantId, fromEmployeeId, periodYearMonth);
+  if (sent >= THANKS_MONTHLY_LIMIT) {
+    throw new RegistrationError([{ field: "thanks", code: "monthly_limit_reached" }]);
+  }
+
+  const id = crypto.randomUUID();
+  const t = nowUtc();
+  await db
+    .prepare(
+      `INSERT INTO thanks (id,tenant_id,from_employee_id,to_employee_id,message,thanked_on,period_year_month,created_at,updated_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)`
+    )
+    .bind(id, tenantId, fromEmployeeId, input.toEmployeeId, emptyToNull(input.message),
+          input.thankedOn, periodYearMonth, t)
+    .run();
+  return { id, periodYearMonth, sentInPeriod: sent + 1 };
+}
+
+export async function listThanks(
+  db: D1Database,
+  tenantId: string,
+  opts: { toEmployeeId?: string | null; fromEmployeeId?: string | null; period?: string | null; limit?: number } = {}
+): Promise<Thanks[]> {
+  const clauses = ["t.tenant_id = ?1", "t.deleted_at IS NULL"];
+  const binds: string[] = [tenantId];
+  const to = emptyToNull(opts.toEmployeeId ?? null);
+  if (to !== null) { binds.push(to); clauses.push(`t.to_employee_id = ?${binds.length}`); }
+  const from = emptyToNull(opts.fromEmployeeId ?? null);
+  if (from !== null) { binds.push(from); clauses.push(`t.from_employee_id = ?${binds.length}`); }
+  const period = emptyToNull(opts.period ?? null);
+  if (period !== null) {
+    if (!isYearMonth(period)) throw new RegistrationError([{ field: "period", code: "invalid_format" }]);
+    binds.push(period);
+    clauses.push(`t.period_year_month = ?${binds.length}`);
+  }
+  const limit = opts.limit ?? 200;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+    throw new RegistrationError([{ field: "limit", code: "out_of_range" }]);
+  }
+  const res = await db
+    .prepare(
+      `${THANKS_SELECT} WHERE ${clauses.join(" AND ")}
+        ORDER BY t.thanked_on DESC, t.created_at DESC LIMIT ${limit}`
+    )
+    .bind(...binds)
+    .all<ThanksDbRow>();
+  return (res.results ?? []).map(toThanks);
+}
+
+export interface RankingRow {
+  rank: number;
+  employeeId: string;
+  employeeName: string | null;
+  receivedCount: number;
+}
+
+/**
+ * 獲得順位。🔴 保存せず都度算出する（現行 article_counter1_rank を廃止）。
+ * 同数は同順位とし、次の順位はその分だけ飛ばす（1,1,3 方式）。
+ * period が null なら全期間。
+ */
+export async function thanksRanking(
+  db: D1Database,
+  tenantId: string,
+  period: string | null = null,
+  limit = 50
+): Promise<RankingRow[]> {
+  if (period !== null && !isYearMonth(period)) {
+    throw new RegistrationError([{ field: "period", code: "invalid_format" }]);
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+    throw new RegistrationError([{ field: "limit", code: "out_of_range" }]);
+  }
+  const binds: string[] = [tenantId];
+  let extra = "";
+  if (period !== null) { binds.push(period); extra = ` AND t.period_year_month = ?${binds.length}`; }
+
+  const res = await db
+    .prepare(
+      `SELECT t.to_employee_id AS employee_id, e.name AS employee_name, COUNT(*) AS n
+         FROM thanks t
+         LEFT JOIN employees e ON e.id = t.to_employee_id
+        WHERE t.tenant_id = ?1 AND t.deleted_at IS NULL${extra}
+        GROUP BY t.to_employee_id, e.name
+        ORDER BY n DESC, e.name ASC
+        LIMIT ${limit}`
+    )
+    .bind(...binds)
+    .all<{ employee_id: string; employee_name: string | null; n: number }>();
+
+  const rows = res.results ?? [];
+  const out: RankingRow[] = [];
+  let lastCount: number | null = null;
+  let lastRank = 0;
+  rows.forEach((r, i) => {
+    const rank = lastCount !== null && r.n === lastCount ? lastRank : i + 1;
+    lastCount = r.n;
+    lastRank = rank;
+    out.push({ rank, employeeId: r.employee_id, employeeName: r.employee_name, receivedCount: r.n });
+  });
+  return out;
 }
