@@ -33,7 +33,7 @@ import {
   EMPLOYMENT_TYPE_BY_LEGACY, GENDER_BY_LEGACY, SHIFT_GROUP_BY_LEGACY,
 } from "../src/services.ts";
 import { worker, routes } from "../src/index.ts";
-import { loginPage, shiftSheetPage } from "../src/pages.ts";
+import { loginPage, shiftSheetPage, formatClockOut, parseClockOut } from "../src/pages.ts";
 import { bootstrapSetup, evaluateAttendance, ageOn, persistAttendanceSummary, getShiftSheet } from "../src/services.ts";
 import { upsertShift, summarizePeriod, ShiftServiceError, setUrgentCheck, hasUrgentCheck, periodForDate } from "../src/services.ts";
 import type { Principal } from "../src/core.ts";
@@ -1576,5 +1576,50 @@ describe("シフト入力画面（現行 shift1Template.php の列構成を踏�
     for (const col of ["確定", "時間帯", "フリー入力", "当日確認", "出勤", "退勤", "休憩", "残業", "実働", "当日フリー"]) {
       assert.ok(body.includes(col), `列「${col}」がある`);
     }
+  });
+});
+
+describe("退勤の表示と入力（保存は24時超え表記のまま）", () => {
+  test("24時以降は「翌 HH:MM」で表示する", () => {
+    assert.equal(formatClockOut("30:00"), "翌 06:00");
+    assert.equal(formatClockOut("24:00"), "翌 00:00");
+    assert.equal(formatClockOut("47:59"), "翌 23:59");
+  });
+
+  test("当日中はそのまま表示する", () => {
+    assert.equal(formatClockOut("18:00"), "18:00");
+    assert.equal(formatClockOut("23:59"), "23:59");
+    assert.equal(formatClockOut(null), "");
+  });
+
+  test("🔴 保存形式は変えない（06:00 に戻すと当日か翌日か判別できなくなる）", () => {
+    // 表示だけの変換であり、往復しても元の意味が失われないこと
+    assert.equal(parseClockOut(formatClockOut("30:00")), "06:00");
+    // サーバ側は clockIn=22:00 との比較で再び 30:00 に正規化する（normalizeClockOut）
+  });
+
+  test("「翌」付きの入力を受け付ける", () => {
+    assert.equal(parseClockOut("翌 06:00"), "06:00");
+    assert.equal(parseClockOut("翌06:00"), "06:00");
+    assert.equal(parseClockOut("翌日 06:00"), "06:00");
+  });
+
+  test("🔴 全角・1桁の入力を受け付ける（現行は変換していなかった）", () => {
+    assert.equal(parseClockOut("２２：００"), "22:00");
+    assert.equal(parseClockOut("06：00"), "06:00");
+    assert.equal(parseClockOut("6:00"), "06:00");
+    assert.equal(parseClockOut(" 9:5 "), "09:05");
+  });
+
+  test("空文字はそのまま空", () => {
+    assert.equal(parseClockOut(""), "");
+    assert.equal(parseClockOut("　"), "");
+  });
+
+  test("画面に変換関数が組み込まれている", () => {
+    const body = shiftSheetPage();
+    assert.ok(body.includes("fmtOut"), "表示変換がある");
+    assert.ok(body.includes("normTime"), "入力正規化がある");
+    assert.ok(body.includes("翌"), "翌日表記を使う");
   });
 });
