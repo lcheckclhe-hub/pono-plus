@@ -183,6 +183,11 @@ export function homePage(): string {
       <a href="/employees">従業員一覧</a>
       <a href="/shifts">シフト登録/修正</a>
       <a href="/attendance">勤怠評価</a>
+      <a href="/profile">プロフィール</a>
+      <a href="/reports">店舗情報（月次）</a>
+      <a href="/daily-reports">業務日報</a>
+      <a href="/photos">社内フォト共有</a>
+      <a href="/thanks">ありがとう情報</a>
     </nav>
     <div class="logout"><button id="out">ログアウト</button></div>
   </div>
@@ -607,6 +612,12 @@ async function load() {
     a2.textContent = '勤怠';
     a2.style.color = '#2f6fbf';
     tdA.appendChild(a2);
+    tdA.appendChild(document.createTextNode(' '));
+    const a3 = document.createElement('a');
+    a3.href = '/profile/view?employeeId=' + encodeURIComponent(e.id);
+    a3.textContent = 'プロフィール';
+    a3.style.color = '#2f6fbf';
+    tdA.appendChild(a3);
     tr.appendChild(tdA);
     tbody.appendChild(tr);
   }
@@ -810,10 +821,14 @@ init();
 // 勤怠評価の表示（Session 04 / T-10）
 // ===============================================================
 /**
- * ⚠ 「点数化」は実装していない【未確認】。
- *   現行の評価系 Action / Template が未受領のため、点数の材料となる
- *   実績値のみを表示する（仕様書 v1 5.3・引継ぎシート §4.4 優先2）。
- *   受領後に点数欄を追加する。推測で点数式を作らない。
+ * ⚠ 「点数化」は要件に含めない【会話合意 2026-08-15】。
+ *
+ *   Session 04 で改修設計書 v6 全文（1,459行）を検索した結果:
+ *     - 勤怠の点数化の計算式・配点・重み付けの記述は 0件
+ *     - 5.1 優先5 の定義は「遅刻・早退・欠勤・残業・勤続・年齢」= 実績値のみ
+ *     - 6.3 の「点数」は Session 02 で **ストレスチェックの結果** と訂正済み
+ *   ➡ 勤怠の点数化は現行システムに存在せず、v1 の誤読に由来していた。
+ *      本画面の項目で設計書 5.1 の定義を満たしている。
  *
  * ⚠ 期間は締め日基準。yearMonth=2026-08・締め日20日 なら 2026-07-21〜2026-08-20
  *   （仕様書 v1 5.2）。画面にも期間を明示し、誤読を防ぐ。
@@ -859,7 +874,7 @@ export function attendancePage(): string {
     <p class="period" id="period"></p>
     <div class="kpi" id="kpi"></div>
     <table id="detail"><tbody></tbody></table>
-    <p class="pending">⚠ 点数化のルールは未確認のため、実績値のみを表示しています。</p>
+    <p class="pending">この画面は実績値を表示します。勤怠の点数化は行いません。</p>
   </div>
   <p class="links"><a href="/home">ホームへ戻る</a> ／ <a href="/employees">従業員一覧</a></p>
 </div>
@@ -950,6 +965,1387 @@ async function load() {
 $('go').addEventListener('click', load);
 $('ym').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') load(); });
 init();
+</script>
+</body>
+</html>`;
+}
+
+// ===============================================================
+// プロフィール（機能権限表 区分5 / T-16）
+// ===============================================================
+/**
+ * 現行 profile3Template.php の項目をそのまま踏襲する:
+ *   画像（1枚）／ Profile（自由入力）／ Note（自由入力）
+ *
+ * 🔴 現行から変えた点:
+ *   ・写真は認証必須の /api/profile/photo から読む（公開ディレクトリに置かない）
+ *   ・パスワード列を表示分岐に使わない（現行は {if $userp->SU1_PASS ==""}）
+ *   ・編集できるのは自分のプロフィールだけ
+ */
+const PROFILE_STYLE = `
+  .photo { width: 160px; height: 160px; border-radius: 8px; object-fit: cover;
+           border: 1px solid #c8d0d8; background: #f7f9fb; display: block; }
+  .nophoto { width: 160px; height: 160px; border-radius: 8px; border: 1px dashed #c8d0d8;
+             background: #f7f9fb; color: #6b7885; font-size: 13px;
+             display: flex; align-items: center; justify-content: center; }
+  .photorow { display: flex; gap: 16px; align-items: flex-start; margin-bottom: 20px; flex-wrap: wrap; }
+  .photorow .ctl { flex: 1 1 220px; }
+  .photorow .ctl button { width: auto; padding: 9px 14px; margin-right: 8px; }
+  .danger { background: #a32020; }
+  textarea { width: 100%; padding: 11px 12px; font-size: 16px; box-sizing: border-box;
+             border: 1px solid #c8d0d8; border-radius: 6px; min-height: 120px; font-family: inherit; }
+  .body { white-space: pre-wrap; font-size: 15px; line-height: 1.7; }
+`;
+
+export function profilePage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>プロフィール | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}${PROFILE_STYLE}
+  .login { max-width: 620px; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1>プロフィール</h1>
+  <div class="box">
+    <p class="error" id="err" style="display:none"></p>
+    <p class="ok" id="ok" style="display:none"></p>
+    <p id="who" class="hint"></p>
+
+    <div class="photorow">
+      <div id="photobox"></div>
+      <div class="ctl">
+        <label for="file">顔写真</label>
+        <input type="file" id="file" accept="image/jpeg,image/png,image/gif">
+        <p class="hint">JPEG / PNG / GIF・5MB まで</p>
+        <button id="up">この画像に変更</button>
+        <button id="del" class="danger">写真を削除</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="text">Profile</label>
+      <textarea id="text" maxlength="2000"></textarea>
+    </div>
+    <div class="row">
+      <label for="note">Note</label>
+      <textarea id="note" maxlength="2000"></textarea>
+    </div>
+    <button id="save">保存</button>
+  </div>
+  <p class="links"><a href="/home">ホームへ戻る</a> ／ <a href="/employees">従業員一覧</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let employeeId = null;
+function show(el, t) { el.textContent = t; el.style.display = t === '' ? 'none' : 'block'; }
+
+function drawPhoto(has) {
+  const box = $('photobox');
+  box.replaceChildren();
+  if (has) {
+    const img = document.createElement('img');
+    img.className = 'photo';
+    img.alt = '顔写真';
+    // キャッシュを避けるため時刻を付ける
+    img.src = '/api/profile/photo?employeeId=' + encodeURIComponent(employeeId) + '&t=' + Date.now();
+    box.appendChild(img);
+  } else {
+    const d = document.createElement('div');
+    d.className = 'nophoto';
+    d.textContent = '写真なし';
+    box.appendChild(d);
+  }
+}
+
+async function load() {
+  const res = await fetch('/api/profile');
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (!res.ok) { show($('err'), 'プロフィールを読み込めませんでした'); return; }
+  const p = (await res.json()).profile;
+  employeeId = p.employeeId;
+  $('who').textContent = p.name + ' さんのプロフィール';
+  $('text').value = p.profileText === null ? '' : p.profileText;
+  $('note').value = p.profileNote === null ? '' : p.profileNote;
+  drawPhoto(p.hasPhoto);
+}
+
+$('save').addEventListener('click', async () => {
+  show($('err'), ''); show($('ok'), '');
+  const res = await fetch('/api/profile/update', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify({ profileText: $('text').value, profileNote: $('note').value })
+  });
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.ok) { show($('ok'), '保存しました'); return; }
+  const d = await res.json().catch(() => ({}));
+  show($('err'), d.issues ? '入力が長すぎます（2000文字まで）' : '保存できませんでした');
+});
+
+$('up').addEventListener('click', async () => {
+  show($('err'), ''); show($('ok'), '');
+  const f = $('file').files[0];
+  if (!f) { show($('err'), '画像を選んでください'); return; }
+  if (f.size > 5 * 1024 * 1024) { show($('err'), '画像が大きすぎます（5MBまで）'); return; }
+  $('up').disabled = true;
+  const res = await fetch('/api/profile/photo', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream', 'Origin': location.origin },
+    body: f
+  });
+  $('up').disabled = false;
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.ok) { show($('ok'), '写真を変更しました'); $('file').value = ''; drawPhoto(true); return; }
+  if (res.status === 413) { show($('err'), '画像が大きすぎます（5MBまで）'); return; }
+  show($('err'), 'JPEG / PNG / GIF の画像を選んでください');
+});
+
+$('del').addEventListener('click', async () => {
+  show($('err'), ''); show($('ok'), '');
+  const res = await fetch('/api/profile/photo/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: '{}'
+  });
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.ok) { show($('ok'), '写真を削除しました'); drawPhoto(false); return; }
+  show($('err'), '削除できませんでした');
+});
+load();
+</script>
+</body>
+</html>`;
+}
+
+/** 他人のプロフィールの閲覧。編集の手段を一切置かない */
+export function profileViewPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>プロフィール詳細 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}${PROFILE_STYLE}
+  .login { max-width: 620px; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1 id="title">プロフィール詳細</h1>
+  <div class="box">
+    <p class="error" id="err" style="display:none"></p>
+    <div class="photorow"><div id="photobox"></div></div>
+    <div class="row"><label>Profile</label><p class="body" id="text">-</p></div>
+    <div class="row"><label>Note</label><p class="body" id="note">-</p></div>
+    <p id="mine" class="hint" style="display:none"><a href="/profile">自分のプロフィールを編集する</a></p>
+  </div>
+  <p class="links"><a href="/employees">従業員一覧へ戻る</a> ／ <a href="/home">ホーム</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const employeeId = new URLSearchParams(location.search).get('employeeId');
+
+async function load() {
+  if (employeeId === null) { $('err').textContent = '従業員が指定されていません'; $('err').style.display = 'block'; return; }
+  const res = await fetch('/api/profile/detail?employeeId=' + encodeURIComponent(employeeId));
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (!res.ok) {
+    $('err').textContent = res.status === 404 ? '見つかりませんでした' : '読み込めませんでした';
+    $('err').style.display = 'block';
+    return;
+  }
+  const d = await res.json();
+  const p = d.profile;
+  $('title').textContent = p.name + ' さんのプロフィール';
+  $('text').textContent = p.profileText === null || p.profileText === '' ? '-' : p.profileText;
+  $('note').textContent = p.profileNote === null || p.profileNote === '' ? '-' : p.profileNote;
+  const box = $('photobox');
+  box.replaceChildren();
+  if (p.hasPhoto) {
+    const img = document.createElement('img');
+    img.className = 'photo';
+    img.alt = '顔写真';
+    img.src = '/api/profile/photo?employeeId=' + encodeURIComponent(employeeId);
+    box.appendChild(img);
+  } else {
+    const e = document.createElement('div');
+    e.className = 'nophoto';
+    e.textContent = '写真なし';
+    box.appendChild(e);
+  }
+  if (d.editable) $('mine').style.display = 'block';
+}
+load();
+</script>
+</body>
+</html>`;
+}
+
+// ===============================================================
+// 店舗情報＝月次の人事指標レポート（機能権限表 区分4 / T-21）
+// ===============================================================
+/**
+ * 現行 company1Template.php の項目を踏襲する:
+ *   対象月 ／ 募集数 ／ 採用数 ／ 離職数 ／ 予備管理（→「備考」に改称）
+ *
+ * 🔴 現行から変えた点:
+ *   ・平均勤続と平均年齢は保存値ではなく、都度算出した値を参考表示する
+ *   ・年間集計テーブルを持たず、一覧で合算する
+ *   ・締め日の扱いを階層で分けない（現行はマスタ②に分岐が無かった）
+ */
+export function reportListPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>店舗情報（月次） | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}
+  .kpi { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+  @media (max-width: 640px) { .kpi { grid-template-columns: repeat(2, 1fr); } }
+  .kpi > div { background: #f7f9fb; border: 1px solid #e4e9ee; border-radius: 8px; padding: 12px 14px; }
+  .kpi .k { font-size: 12px; color: #6b7885; }
+  .kpi .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .kpi .u { font-size: 12px; font-weight: 400; color: #6b7885; margin-left: 2px; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1>店舗情報（月次）</h1>
+  <div class="box">
+    <div class="bar">
+      <div class="row" style="flex:0 0 140px">
+        <label for="year">年</label>
+        <input type="text" id="year" placeholder="2026">
+      </div>
+      <div class="row"><button id="go">表示</button></div>
+      <div class="row"><a class="btn" href="/reports/edit">月次を登録</a></div>
+    </div>
+    <p class="error" id="err" style="display:none"></p>
+    <div class="kpi" id="kpi"></div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>対象月</th><th>店舗</th><th>募集</th><th>採用</th><th>離職</th><th>備考</th><th></th></tr></thead>
+        <tbody id="rows"><tr><td colspan="7">読み込み中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <p class="links"><a href="/home">ホームへ戻る</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+function cell(t, cls) {
+  const td = document.createElement('td');
+  if (cls) td.className = cls;
+  td.textContent = t === null || t === undefined || t === '' ? '-' : String(t);
+  return td;
+}
+function card(k, v, u) {
+  const d = document.createElement('div');
+  const a = document.createElement('div'); a.className = 'k'; a.textContent = k;
+  const b = document.createElement('div'); b.className = 'v'; b.textContent = v;
+  if (u) { const s = document.createElement('span'); s.className = 'u'; s.textContent = u; b.appendChild(s); }
+  d.appendChild(a); d.appendChild(b);
+  return d;
+}
+
+async function load() {
+  $('err').style.display = 'none';
+  const q = new URLSearchParams();
+  const y = $('year').value.trim();
+  if (y !== '') q.set('year', y);
+  const res = await fetch('/api/reports?' + q.toString());
+  if (res.status === 401) { location.href = '/login'; return; }
+  const tbody = $('rows');
+  tbody.replaceChildren();
+  $('kpi').replaceChildren();
+  if (res.status === 403) {
+    const tr = document.createElement('tr');
+    const td = cell('この画面を見る権限がありません'); td.colSpan = 7;
+    tr.appendChild(td); tbody.appendChild(tr);
+    return;
+  }
+  if (!res.ok) { $('err').textContent = '取得できませんでした'; $('err').style.display = 'block'; return; }
+  const d = await res.json();
+  const k = $('kpi');
+  k.appendChild(card('募集', String(d.totals.recruitCount), '人'));
+  k.appendChild(card('採用', String(d.totals.hireCount), '人'));
+  k.appendChild(card('離職', String(d.totals.turnoverCount), '人'));
+  k.appendChild(card('離職率', d.turnoverRate === null ? '－' : d.turnoverRate + ' %'));
+  if (d.reports.length === 0) {
+    const tr = document.createElement('tr');
+    const td = cell('登録がありません'); td.colSpan = 7;
+    tr.appendChild(td); tbody.appendChild(tr);
+    return;
+  }
+  for (const r of d.reports) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell(r.periodYearMonth));
+    tr.appendChild(cell(r.worksiteName));
+    tr.appendChild(cell(r.recruitCount, 'num'));
+    tr.appendChild(cell(r.hireCount, 'num'));
+    tr.appendChild(cell(r.turnoverCount, 'num'));
+    tr.appendChild(cell(r.note));
+    const td = document.createElement('td');
+    const a = document.createElement('a');
+    a.href = '/reports/edit?reportId=' + encodeURIComponent(r.id);
+    a.textContent = '修正';
+    a.style.color = '#2f6fbf';
+    td.appendChild(a);
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
+}
+$('go').addEventListener('click', load);
+$('year').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
+$('year').value = String(new Date().getFullYear());
+load();
+</script>
+</body>
+</html>`;
+}
+
+export function reportFormPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>月次の登録 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}
+  .login { max-width: 560px; }
+  input[type=number] { width: 100%; padding: 11px 12px; font-size: 16px; box-sizing: border-box;
+                       border: 1px solid #c8d0d8; border-radius: 6px; }
+  .ref { background: #f7f9fb; border: 1px solid #e4e9ee; border-radius: 8px;
+         padding: 12px 14px; font-size: 13px; color: #46535f; margin-top: 18px; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1 id="title">月次の登録</h1>
+  <div class="box">
+    <p class="error" id="err" style="display:none"></p>
+    <p class="ok" id="ok" style="display:none"></p>
+    <div class="row">
+      <label for="ym">対象月 <span class="req">*</span></label>
+      <input type="text" id="ym" placeholder="2026-08">
+      <p class="hint">同じ店舗・同じ月は上書きされます</p>
+    </div>
+    <div class="row">
+      <label for="ws">店舗</label>
+      <select id="ws"><option value="">未指定</option></select>
+    </div>
+    <div class="grid">
+      <div class="row"><label for="recruit">募集数</label><input type="number" id="recruit" min="0" value="0"></div>
+      <div class="row"><label for="hire">採用数</label><input type="number" id="hire" min="0" value="0"></div>
+      <div class="row"><label for="turnover">離職数</label><input type="number" id="turnover" min="0" value="0"></div>
+    </div>
+    <div class="row">
+      <label for="note">備考</label>
+      <input type="text" id="note">
+      <p class="hint">現行の「予備管理」にあたります</p>
+    </div>
+    <button id="save">登録／修正</button>
+    <div class="ref" id="ref">在籍・平均勤続・平均年齢は、対象月を入れると表示されます。</div>
+  </div>
+  <p class="links"><a href="/reports">一覧へ戻る</a> ／ <a href="/home">ホーム</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const reportId = new URLSearchParams(location.search).get('reportId');
+function show(el, t) { el.textContent = t; el.style.display = t === '' ? 'none' : 'block'; }
+
+async function loadWorksites() {
+  const res = await fetch('/api/employees?status=active');
+  if (res.status === 401) { location.href = '/login'; return; }
+}
+
+async function loadRef() {
+  const ym = $('ym').value.trim();
+  if (!/^\\d{4}-\\d{2}$/.test(ym)) { $('ref').textContent = '在籍・平均勤続・平均年齢は、対象月を入れると表示されます。'; return; }
+  const res = await fetch('/api/reports/workforce?periodYearMonth=' + encodeURIComponent(ym));
+  if (!res.ok) { $('ref').textContent = '参考値を取得できませんでした'; return; }
+  const d = await res.json();
+  const tenure = d.avgTenureMonths === null ? '－'
+    : Math.floor(d.avgTenureMonths / 12) + '年' + Math.round(d.avgTenureMonths % 12) + 'か月';
+  $('ref').textContent = '参考（' + ym + '末時点・保存しません）　在籍 ' + d.headcount +
+    '人／平均勤続 ' + tenure + '／平均年齢 ' + (d.avgAge === null ? '－' : d.avgAge + '歳');
+}
+
+async function init() {
+  const now = new Date();
+  $('ym').value = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+  if (reportId !== null) {
+    $('title').textContent = '月次の修正';
+    const res = await fetch('/api/reports/detail?reportId=' + encodeURIComponent(reportId));
+    if (res.status === 401) { location.href = '/login'; return; }
+    if (res.ok) {
+      const r = (await res.json()).report;
+      $('ym').value = r.periodYearMonth;
+      $('recruit').value = r.recruitCount;
+      $('hire').value = r.hireCount;
+      $('turnover').value = r.turnoverCount;
+      $('note').value = r.note === null ? '' : r.note;
+      if (r.worksiteId !== null) {
+        const o = document.createElement('option');
+        o.value = r.worksiteId;
+        o.textContent = r.worksiteName === null ? r.worksiteId : r.worksiteName;
+        o.selected = true;
+        $('ws').appendChild(o);
+      }
+    }
+  }
+  loadRef();
+}
+
+$('ym').addEventListener('change', loadRef);
+$('save').addEventListener('click', async () => {
+  show($('err'), ''); show($('ok'), '');
+  const res = await fetch('/api/reports', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify({
+      worksiteId: $('ws').value === '' ? null : $('ws').value,
+      periodYearMonth: $('ym').value.trim(),
+      recruitCount: Number($('recruit').value || 0),
+      hireCount: Number($('hire').value || 0),
+      turnoverCount: Number($('turnover').value || 0),
+      note: $('note').value
+    })
+  });
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.ok) { show($('ok'), '保存しました'); loadRef(); return; }
+  if (res.status === 403) { show($('err'), 'この操作を行う権限がありません'); return; }
+  const d = await res.json().catch(() => ({}));
+  if (d.issues) {
+    const L = { periodYearMonth: '対象月', recruitCount: '募集数', hireCount: '採用数',
+                turnoverCount: '離職数', note: '備考', worksiteId: '店舗' };
+    show($('err'), d.issues.map((i) => (L[i.field] || i.field) + 'を確認してください').join(' / '));
+  } else { show($('err'), '保存できませんでした'); }
+});
+init();
+</script>
+</body>
+</html>`;
+}
+
+// ===============================================================
+// 業務日報（機能権限表 区分10 / T-28）
+// ===============================================================
+/**
+ * 現行 dreport2Template.php の項目を踏襲する:
+ *   日付 ／ カテゴリ ／ 時間（開始〜終了）／ 内容 ／ 画像
+ *
+ * 🔴 現行から変えた点:
+ *   ・外部CDN（cdn.rawgit.com）に依存しない。rawgit は2019年に終了しており、
+ *     timepicker が読み込めていなかった可能性が高い。標準の input[type=time] を使う
+ *   ・画像は認証必須の API から読む（現行は ../images/ の公開ディレクトリ）
+ *   ・削除は URL クエリではなく POST で、所有者を突き合わせてから実行する
+ */
+export function dailyReportListPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>業務日報 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}</style>
+</head>
+<body>
+<div class="login">
+  <h1>業務日報</h1>
+  <div class="box">
+    <div class="bar">
+      <div class="row" style="flex:0 0 150px">
+        <label for="month">対象月</label>
+        <input type="text" id="month" placeholder="2026-08">
+      </div>
+      <div class="row"><button id="go">表示</button></div>
+      <div class="row"><a class="btn" href="/daily-reports/edit">新規登録</a></div>
+    </div>
+    <p id="msg"></p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>日付</th><th>時間</th><th>所要</th><th>カテゴリ</th><th>担当</th><th>内容</th><th></th></tr></thead>
+        <tbody id="rows"><tr><td colspan="7">読み込み中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <p class="links"><a href="/home">ホームへ戻る</a> ／ <a href="/daily-reports/categories">カテゴリの管理</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+function cell(t) {
+  const td = document.createElement('td');
+  td.textContent = t === null || t === undefined || t === '' ? '-' : String(t);
+  return td;
+}
+function hm(min) { return Math.floor(min / 60) + ':' + String(min % 60).padStart(2, '0'); }
+// 24時超え表記を「翌 HH:MM」に直す（保存は 26:30 のまま）
+function showEnd(t) {
+  const [h, m] = t.split(':').map(Number);
+  return h >= 24 ? '翌 ' + String(h - 24).padStart(2, '0') + ':' + String(m).padStart(2, '0') : t;
+}
+
+async function load() {
+  const q = new URLSearchParams();
+  const m = $('month').value.trim();
+  if (m !== '') q.set('month', m);
+  const res = await fetch('/api/daily-reports?' + q.toString());
+  if (res.status === 401) { location.href = '/login'; return; }
+  const tbody = $('rows');
+  tbody.replaceChildren();
+  if (!res.ok) {
+    const tr = document.createElement('tr');
+    const td = cell('取得できませんでした'); td.colSpan = 7;
+    tr.appendChild(td); tbody.appendChild(tr);
+    return;
+  }
+  const d = await res.json();
+  $('msg').textContent = d.count + ' 件';
+  if (d.reports.length === 0) {
+    const tr = document.createElement('tr');
+    const td = cell('登録がありません'); td.colSpan = 7;
+    tr.appendChild(td); tbody.appendChild(tr);
+    return;
+  }
+  for (const r of d.reports) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell(r.reportedOn));
+    tr.appendChild(cell(r.startTime + '〜' + showEnd(r.endTime)));
+    tr.appendChild(cell(hm(r.durationMinutes)));
+    tr.appendChild(cell(r.categoryName));
+    tr.appendChild(cell(r.employeeName));
+    tr.appendChild(cell(r.body === null ? '' : r.body.slice(0, 20)));
+    const td = document.createElement('td');
+    const a = document.createElement('a');
+    a.href = '/daily-reports/edit?reportId=' + encodeURIComponent(r.id);
+    a.textContent = '修正';
+    a.style.color = '#2f6fbf';
+    td.appendChild(a);
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
+}
+$('go').addEventListener('click', load);
+$('month').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
+const now = new Date();
+$('month').value = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+load();
+</script>
+</body>
+</html>`;
+}
+
+export function dailyReportFormPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>業務日報 登録 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}
+  .login { max-width: 560px; }
+  input[type=date], input[type=time] { width: 100%; padding: 11px 12px; font-size: 16px;
+    box-sizing: border-box; border: 1px solid #c8d0d8; border-radius: 6px; background: #fff; }
+  textarea { width: 100%; padding: 11px 12px; font-size: 16px; box-sizing: border-box;
+    border: 1px solid #c8d0d8; border-radius: 6px; min-height: 120px; font-family: inherit; }
+  .warn { background: #fdf6e3; border: 1px solid #e6d5a8; color: #6b5510;
+          padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 16px; }
+  .photo { max-width: 100%; border-radius: 8px; border: 1px solid #c8d0d8; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1 id="title">業務日報 登録</h1>
+  <div class="box">
+    <p class="error" id="err" style="display:none"></p>
+    <p class="ok" id="ok" style="display:none"></p>
+    <p class="warn" id="warn" style="display:none"></p>
+
+    <div class="row">
+      <label for="day">日付 <span class="req">*</span></label>
+      <input type="date" id="day">
+    </div>
+    <div class="row">
+      <label for="cate">カテゴリ</label>
+      <select id="cate"><option value="">未設定</option></select>
+    </div>
+    <div class="grid">
+      <div class="row"><label for="t1">開始 <span class="req">*</span></label><input type="time" id="t1"></div>
+      <div class="row"><label for="t2">終了 <span class="req">*</span></label><input type="time" id="t2"></div>
+    </div>
+    <p class="hint" id="dur">終了が開始より前なら翌日として扱います</p>
+    <div class="row">
+      <label for="body">内容</label>
+      <textarea id="body" maxlength="2000"></textarea>
+    </div>
+    <button id="save">保存</button>
+
+    <div id="photobox" style="display:none">
+      <div class="row" style="margin-top:20px">
+        <label for="file">画像</label>
+        <input type="file" id="file" accept="image/jpeg,image/png,image/gif">
+        <p class="hint">JPEG / PNG / GIF・5MB まで</p>
+        <button id="up">この画像を添付</button>
+      </div>
+      <div id="preview"></div>
+    </div>
+    <button id="del" class="danger" style="display:none;background:#a32020;margin-top:12px">この日報を削除</button>
+  </div>
+  <p class="links"><a href="/daily-reports">一覧へ戻る</a> ／ <a href="/home">ホーム</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let reportId = new URLSearchParams(location.search).get('reportId');
+function show(el, t) { el.textContent = t; el.style.display = t === '' ? 'none' : 'block'; }
+
+function updateDur() {
+  const a = $('t1').value, b = $('t2').value;
+  if (a === '' || b === '') { $('dur').textContent = '終了が開始より前なら翌日として扱います'; return; }
+  const [ah, am] = a.split(':').map(Number);
+  const [bh, bm] = b.split(':').map(Number);
+  let d = (bh * 60 + bm) - (ah * 60 + am);
+  if (d < 0) d += 24 * 60;
+  $('dur').textContent = d === 0 ? '開始と終了が同じです' :
+    '所要 ' + Math.floor(d / 60) + '時間' + (d % 60) + '分' + (bh * 60 + bm < ah * 60 + am ? '（翌日にまたがります）' : '');
+}
+
+function drawPhoto(has) {
+  const p = $('preview');
+  p.replaceChildren();
+  if (!has) return;
+  const img = document.createElement('img');
+  img.className = 'photo';
+  img.alt = '添付画像';
+  img.src = '/api/daily-reports/photo?reportId=' + encodeURIComponent(reportId) + '&t=' + Date.now();
+  p.appendChild(img);
+}
+
+async function init() {
+  const res = await fetch('/api/daily-reports/categories');
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.ok) {
+    for (const c of (await res.json()).categories) {
+      const o = document.createElement('option');
+      o.value = c.id; o.textContent = c.name;
+      $('cate').appendChild(o);
+    }
+  }
+  const now = new Date();
+  $('day').value = now.toISOString().slice(0, 10);
+  if (reportId === null) return;
+
+  $('title').textContent = '業務日報 修正';
+  const r2 = await fetch('/api/daily-reports/detail?reportId=' + encodeURIComponent(reportId));
+  if (!r2.ok) { show($('err'), '日報を読み込めませんでした'); return; }
+  const d = await r2.json();
+  const r = d.report;
+  $('day').value = r.reportedOn;
+  $('cate').value = r.categoryId === null ? '' : r.categoryId;
+  $('t1').value = r.startTime;
+  // 24時超え表記は input[type=time] に入らないので戻す
+  const [eh, em] = r.endTime.split(':').map(Number);
+  $('t2').value = String(eh >= 24 ? eh - 24 : eh).padStart(2, '0') + ':' + String(em).padStart(2, '0');
+  $('body').value = r.body === null ? '' : r.body;
+  $('photobox').style.display = 'block';
+  $('del').style.display = 'block';
+  drawPhoto(r.hasPhoto);
+  updateDur();
+}
+
+$('t1').addEventListener('change', updateDur);
+$('t2').addEventListener('change', updateDur);
+
+$('save').addEventListener('click', async () => {
+  show($('err'), ''); show($('ok'), ''); show($('warn'), '');
+  const res = await fetch('/api/daily-reports', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify({
+      reportId: reportId,
+      categoryId: $('cate').value === '' ? null : $('cate').value,
+      reportedOn: $('day').value,
+      startTime: $('t1').value,
+      endTime: $('t2').value,
+      body: $('body').value
+    })
+  });
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.status === 403) { show($('err'), 'この操作を行う権限がありません'); return; }
+  if (res.ok) {
+    const d = await res.json();
+    reportId = d.id;
+    show($('ok'), '保存しました');
+    $('photobox').style.display = 'block';
+    $('del').style.display = 'block';
+    if (d.overlaps && d.overlaps.length > 0) {
+      show($('warn'), '注意：時間帯が重なる日報が ' + d.overlaps.length + ' 件あります（登録は完了しています）');
+    }
+    return;
+  }
+  const d = await res.json().catch(() => ({}));
+  if (d.issues) {
+    const L = { reportedOn: '日付', startTime: '開始時刻', endTime: '終了時刻', body: '内容',
+                categoryId: 'カテゴリ', employeeId: '担当' };
+    show($('err'), d.issues.map((i) => (L[i.field] || i.field) +
+      (i.code === 'same_as_start' ? 'が開始と同じです' : 'を確認してください')).join(' / '));
+  } else { show($('err'), '保存できませんでした'); }
+});
+
+$('up').addEventListener('click', async () => {
+  show($('err'), ''); show($('ok'), '');
+  const f = $('file').files[0];
+  if (!f) { show($('err'), '画像を選んでください'); return; }
+  const res = await fetch('/api/daily-reports/photo?reportId=' + encodeURIComponent(reportId), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream', 'Origin': location.origin },
+    body: f
+  });
+  if (res.ok) { show($('ok'), '画像を添付しました'); $('file').value = ''; drawPhoto(true); return; }
+  if (res.status === 413) { show($('err'), '画像が大きすぎます（5MBまで）'); return; }
+  show($('err'), 'JPEG / PNG / GIF の画像を選んでください');
+});
+
+$('del').addEventListener('click', async () => {
+  if (!confirm('削除します。よろしいですか?')) return;
+  const res = await fetch('/api/daily-reports/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify({ reportId: reportId })
+  });
+  if (res.ok) { location.href = '/daily-reports'; return; }
+  show($('err'), '削除できませんでした');
+});
+init();
+</script>
+</body>
+</html>`;
+}
+
+/** 日報カテゴリの管理。現行マスタ①の「業務日報 > マスターデータ」に相当 */
+export function reportCategoryPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>日報カテゴリ | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}
+  .login { max-width: 620px; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1>日報カテゴリ（マスターデータ）</h1>
+  <div class="box">
+    <p class="error" id="err" style="display:none"></p>
+    <p class="ok" id="ok" style="display:none"></p>
+    <div class="bar">
+      <div class="row" style="flex:1 1 200px">
+        <label for="name">カテゴリ名</label>
+        <input type="text" id="name" maxlength="100">
+      </div>
+      <div class="row" style="flex:0 0 100px">
+        <label for="order">並び順</label>
+        <input type="text" id="order" value="0">
+      </div>
+      <div class="row"><button id="add">追加</button></div>
+    </div>
+    <table>
+      <thead><tr><th>並び</th><th>カテゴリ名</th><th>状態</th><th></th></tr></thead>
+      <tbody id="rows"><tr><td colspan="4">読み込み中…</td></tr></tbody>
+    </table>
+  </div>
+  <p class="links"><a href="/daily-reports">業務日報へ戻る</a> ／ <a href="/home">ホーム</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+function show(el, t) { el.textContent = t; el.style.display = t === '' ? 'none' : 'block'; }
+function cell(t) {
+  const td = document.createElement('td');
+  td.textContent = t === null || t === undefined || t === '' ? '-' : String(t);
+  return td;
+}
+
+async function load() {
+  const res = await fetch('/api/daily-reports/categories?includeInactive=1');
+  if (res.status === 401) { location.href = '/login'; return; }
+  const tbody = $('rows');
+  tbody.replaceChildren();
+  if (res.status === 403) {
+    const tr = document.createElement('tr');
+    const td = cell('この画面を見る権限がありません'); td.colSpan = 4;
+    tr.appendChild(td); tbody.appendChild(tr);
+    return;
+  }
+  const cats = (await res.json()).categories;
+  if (cats.length === 0) {
+    const tr = document.createElement('tr');
+    const td = cell('カテゴリがありません'); td.colSpan = 4;
+    tr.appendChild(td); tbody.appendChild(tr);
+    return;
+  }
+  for (const c of cats) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell(c.sortOrder));
+    tr.appendChild(cell(c.name));
+    tr.appendChild(cell(c.isActive ? '有効' : '停止'));
+    const td = document.createElement('td');
+    const b = document.createElement('button');
+    b.textContent = c.isActive ? '停止する' : '有効に戻す';
+    b.style.width = 'auto';
+    b.style.padding = '6px 12px';
+    b.style.fontSize = '13px';
+    b.addEventListener('click', () => toggle(c));
+    td.appendChild(b);
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
+}
+
+async function post(body) {
+  return fetch('/api/daily-reports/categories', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify(body)
+  });
+}
+
+async function toggle(c) {
+  show($('err'), ''); show($('ok'), '');
+  const res = await post({ id: c.id, name: c.name, sortOrder: c.sortOrder, isActive: !c.isActive });
+  if (res.ok) { show($('ok'), '更新しました'); load(); return; }
+  show($('err'), '更新できませんでした');
+}
+
+$('add').addEventListener('click', async () => {
+  show($('err'), ''); show($('ok'), '');
+  const name = $('name').value.trim();
+  if (name === '') { show($('err'), 'カテゴリ名を入力してください'); return; }
+  const res = await post({ name: name, sortOrder: Number($('order').value || 0) });
+  if (res.ok) { show($('ok'), '追加しました'); $('name').value = ''; load(); return; }
+  if (res.status === 403) { show($('err'), 'この操作を行う権限がありません'); return; }
+  const d = await res.json().catch(() => ({}));
+  show($('err'), d.issues && d.issues.some((i) => i.code === 'already_taken')
+    ? '同じ名前のカテゴリが既にあります' : '追加できませんでした');
+});
+load();
+</script>
+</body>
+</html>`;
+}
+
+// ===============================================================
+// 社内フォト共有（機能権限表 区分8 / T-33）
+// ===============================================================
+/**
+ * 現行 chat2Template.php の有効な項目は「画像1枚」と「ひと言」だけ。
+ * 画像②〜⑤・ひと言②〜⑤（8項目）はすべてコメントアウトされていた【コード実証】。
+ *
+ * 🔴 現行から変えた点:
+ *   ・画像は認証必須の API から読む（現行は ../image/ の公開ディレクトリ）
+ *   ・削除は投稿者本人と人事権系統のみ
+ *   ・未使用の hidden（company_name1/2）を置かない
+ * ✅ 踏襲した点:
+ *   ・投稿前のプレビュー（FileReader）。現行の良い実装
+ */
+const PHOTO_GRID_STYLE = `
+  .grid2 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 640px) { .grid2 { grid-template-columns: repeat(2, 1fr); } }
+  .card { border: 1px solid #e4e9ee; border-radius: 8px; overflow: hidden; background: #fff; }
+  .card img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; display: block; background: #f7f9fb; }
+  .card .meta { padding: 8px 10px; font-size: 13px; }
+  .card .cap { color: #23303a; word-break: break-word; }
+  .card .by { color: #6b7885; font-size: 12px; margin-top: 4px; }
+  .card button { width: auto; padding: 5px 10px; font-size: 12px; background: #a32020; margin-top: 6px; }
+  .preview img { max-width: 100%; border-radius: 8px; border: 1px solid #c8d0d8; margin-top: 10px; }
+`;
+
+export function photoListPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>社内フォト共有 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}${PHOTO_GRID_STYLE}</style>
+</head>
+<body>
+<div class="login">
+  <h1>社内フォト共有</h1>
+  <div class="box">
+    <div class="bar">
+      <div class="row"><a class="btn" href="/photos/new">写真を投稿</a></div>
+      <div class="row" style="flex:1 1 auto"><p id="msg" class="hint"></p></div>
+    </div>
+    <p class="error" id="err" style="display:none"></p>
+    <div class="grid2" id="grid"></div>
+  </div>
+  <p class="links"><a href="/home">ホームへ戻る</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let own = null, canDeleteAny = false;
+
+async function load() {
+  const res = await fetch('/api/photos');
+  if (res.status === 401) { location.href = '/login'; return; }
+  const grid = $('grid');
+  grid.replaceChildren();
+  if (!res.ok) { $('err').textContent = '取得できませんでした'; $('err').style.display = 'block'; return; }
+  const d = await res.json();
+  own = d.ownEmployeeId;
+  canDeleteAny = d.canDeleteAny;
+  $('msg').textContent = d.count + ' 件';
+  if (d.posts.length === 0) {
+    const p = document.createElement('p');
+    p.textContent = 'まだ投稿がありません';
+    grid.appendChild(p);
+    return;
+  }
+  for (const post of d.posts) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    const img = document.createElement('img');
+    img.alt = post.caption === null ? '投稿写真' : post.caption;
+    img.loading = 'lazy';
+    img.src = '/api/photos/photo?postId=' + encodeURIComponent(post.id);
+    card.appendChild(img);
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const cap = document.createElement('div');
+    cap.className = 'cap';
+    cap.textContent = post.caption === null || post.caption === '' ? '－' : post.caption;
+    meta.appendChild(cap);
+    const by = document.createElement('div');
+    by.className = 'by';
+    by.textContent = (post.employeeName === null ? '不明' : post.employeeName) + '／' + post.postedOn;
+    meta.appendChild(by);
+    if (post.employeeId === own || canDeleteAny) {
+      const b = document.createElement('button');
+      b.textContent = '削除';
+      b.addEventListener('click', () => del(post.id));
+      meta.appendChild(b);
+    }
+    card.appendChild(meta);
+    grid.appendChild(card);
+  }
+}
+
+async function del(postId) {
+  if (!confirm('この写真を削除します。よろしいですか?')) return;
+  const res = await fetch('/api/photos/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify({ postId: postId })
+  });
+  if (res.ok) { load(); return; }
+  $('err').textContent = res.status === 403 ? '削除する権限がありません' : '削除できませんでした';
+  $('err').style.display = 'block';
+}
+load();
+</script>
+</body>
+</html>`;
+}
+
+export function photoNewPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>写真を投稿 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}${PHOTO_GRID_STYLE}
+  .login { max-width: 520px; }
+  input[type=date] { width: 100%; padding: 11px 12px; font-size: 16px; box-sizing: border-box;
+    border: 1px solid #c8d0d8; border-radius: 6px; background: #fff; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1>写真を投稿</h1>
+  <div class="box">
+    <p class="error" id="err" style="display:none"></p>
+    <div class="row">
+      <label for="file">画像 <span class="req">*</span></label>
+      <input type="file" id="file" accept="image/jpeg,image/png,image/gif">
+      <p class="hint">JPEG / PNG / GIF・5MB まで</p>
+      <div class="preview" id="preview"></div>
+    </div>
+    <div class="row">
+      <label for="cap">ひと言</label>
+      <input type="text" id="cap" maxlength="200">
+    </div>
+    <div class="row">
+      <label for="day">日付</label>
+      <input type="date" id="day">
+    </div>
+    <button id="post">投稿する</button>
+  </div>
+  <p class="links"><a href="/photos">一覧へ戻る</a> ／ <a href="/home">ホーム</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+function show(t) { $('err').textContent = t; $('err').style.display = t === '' ? 'none' : 'block'; }
+
+// 現行 chat2Template の良い実装を踏襲：投稿前にプレビューする
+$('file').addEventListener('change', function() {
+  const p = $('preview');
+  p.replaceChildren();
+  const f = this.files[0];
+  if (!f) return;
+  if (f.size > 5 * 1024 * 1024) { show('画像が大きすぎます（5MBまで）'); this.value = ''; return; }
+  show('');
+  const img = document.createElement('img');
+  img.alt = 'プレビュー';
+  const fr = new FileReader();
+  fr.onload = () => { img.src = fr.result; };
+  fr.readAsDataURL(f);
+  p.appendChild(img);
+});
+
+$('post').addEventListener('click', async () => {
+  show('');
+  const f = $('file').files[0];
+  if (!f) { show('画像を選んでください'); return; }
+  const q = new URLSearchParams();
+  q.set('caption', $('cap').value);
+  q.set('postedOn', $('day').value);
+  $('post').disabled = true;
+  const res = await fetch('/api/photos?' + q.toString(), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream', 'Origin': location.origin },
+    body: f
+  });
+  $('post').disabled = false;
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.ok) { location.href = '/photos'; return; }
+  if (res.status === 413) { show('画像が大きすぎます（5MBまで）'); return; }
+  show('JPEG / PNG / GIF の画像を選んでください');
+});
+$('day').value = new Date().toISOString().slice(0, 10);
+</script>
+</body>
+</html>`;
+}
+
+// ===============================================================
+// ありがとう情報（機能権限表 区分7 / T-39）
+// ===============================================================
+/**
+ * 現行 thanks2Template.php の項目を踏襲する:
+ *   日付 ／ 誰へ ／ フリー入力
+ *
+ * 🔴 現行から変えた点:
+ *   ・「ありがとう数(月30まで)」を表示だけでなく実際に効かせる
+ *     （現行は Action に検査が0件で、31回目以降も登録できていた）
+ *   ・宛先から自分自身を除く
+ *   ・獲得順位は集計テーブルではなく都度算出した値を表示する
+ */
+const THANKS_STYLE = `
+  .quota { background: #f7f9fb; border: 1px solid #e4e9ee; border-radius: 8px;
+           padding: 12px 14px; font-size: 14px; margin-bottom: 18px; }
+  .quota strong { font-size: 20px; font-variant-numeric: tabular-nums; }
+  .quota.full { background: #fdf0e0; border-color: #e6c99a; color: #8a5a12; }
+  .feed { list-style: none; padding: 0; margin: 0; }
+  .feed li { border-bottom: 1px solid #e4e9ee; padding: 12px 2px; }
+  .feed .to { font-weight: 600; color: #23303a; }
+  .feed .msg { font-size: 14px; color: #46535f; margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
+  .feed .by { font-size: 12px; color: #6b7885; margin-top: 4px; }
+  td.rank { font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
+  tr.me { background: #f2f6fb; }
+`;
+
+export function thanksListPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>ありがとう情報 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}${THANKS_STYLE}
+  .login { max-width: 620px; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1>ありがとう情報</h1>
+  <div class="box">
+    <div class="bar">
+      <div class="row"><a class="btn" href="/thanks/new">ありがとうをする</a></div>
+      <div class="row"><a class="btn" href="/thanks/ranking" style="background:#6b7885">獲得順位</a></div>
+    </div>
+    <div class="row" style="max-width:200px">
+      <label for="period">対象月</label>
+      <input type="text" id="period" placeholder="すべて">
+    </div>
+    <p class="error" id="err" style="display:none"></p>
+    <p id="msg" class="hint"></p>
+    <ul class="feed" id="feed"></ul>
+  </div>
+  <p class="links"><a href="/home">ホームへ戻る</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function load() {
+  const q = new URLSearchParams();
+  const p = $('period').value.trim();
+  if (p !== '') q.set('period', p);
+  const res = await fetch('/api/thanks?' + q.toString());
+  if (res.status === 401) { location.href = '/login'; return; }
+  const feed = $('feed');
+  feed.replaceChildren();
+  if (!res.ok) { $('err').textContent = '取得できませんでした'; $('err').style.display = 'block'; return; }
+  $('err').style.display = 'none';
+  const d = await res.json();
+  $('msg').textContent = d.count + ' 件';
+  if (d.thanks.length === 0) {
+    const li = document.createElement('li');
+    li.textContent = 'まだありません';
+    feed.appendChild(li);
+    return;
+  }
+  for (const t of d.thanks) {
+    const li = document.createElement('li');
+    const to = document.createElement('div');
+    to.className = 'to';
+    to.textContent = (t.toName === null ? '不明' : t.toName) + ' さんへ';
+    li.appendChild(to);
+    if (t.message !== null && t.message !== '') {
+      const m = document.createElement('div');
+      m.className = 'msg';
+      m.textContent = t.message;
+      li.appendChild(m);
+    }
+    const by = document.createElement('div');
+    by.className = 'by';
+    by.textContent = (t.fromName === null ? '不明' : t.fromName) + ' より　' + t.thankedOn + '（' + t.periodYearMonth + ' 分）';
+    li.appendChild(by);
+    feed.appendChild(li);
+  }
+}
+$('period').addEventListener('change', load);
+load();
+</script>
+</body>
+</html>`;
+}
+
+export function thanksNewPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>ありがとうをする | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}${THANKS_STYLE}
+  .login { max-width: 520px; }
+  input[type=date] { width: 100%; padding: 11px 12px; font-size: 16px; box-sizing: border-box;
+    border: 1px solid #c8d0d8; border-radius: 6px; background: #fff; }
+  textarea { width: 100%; padding: 11px 12px; font-size: 16px; box-sizing: border-box;
+    border: 1px solid #c8d0d8; border-radius: 6px; min-height: 100px; font-family: inherit; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1>ありがとうをする</h1>
+  <div class="box">
+    <p class="error" id="err" style="display:none"></p>
+    <p class="ok" id="ok" style="display:none"></p>
+    <div class="quota" id="quota">読み込み中…</div>
+    <div class="row">
+      <label for="day">日付</label>
+      <input type="date" id="day">
+    </div>
+    <div class="row">
+      <label for="to">誰へ <span class="req">*</span></label>
+      <select id="to"><option value="">選んでください</option></select>
+      <p class="hint">自分自身には送れません</p>
+    </div>
+    <div class="row">
+      <label for="msg">フリー入力</label>
+      <textarea id="msg" maxlength="500"></textarea>
+    </div>
+    <button id="send">ありがとう</button>
+  </div>
+  <p class="links"><a href="/thanks">一覧へ戻る</a> ／ <a href="/home">ホーム</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let own = null;
+function show(el, t) { el.textContent = t; el.style.display = t === '' ? 'none' : 'block'; }
+
+async function loadQuota() {
+  const q = new URLSearchParams();
+  if ($('day').value !== '') q.set('thankedOn', $('day').value);
+  const res = await fetch('/api/thanks/quota?' + q.toString());
+  if (res.status === 401) { location.href = '/login'; return; }
+  const box = $('quota');
+  box.replaceChildren();
+  box.className = 'quota';
+  if (!res.ok) { box.textContent = '送信可能数を取得できませんでした'; return; }
+  const d = await res.json();
+  const s = document.createElement('span');
+  s.textContent = d.period + ' 分：';
+  const n = document.createElement('strong');
+  n.textContent = String(d.sent);
+  const rest = document.createElement('span');
+  rest.textContent = ' / ' + d.limit + ' 回（あと ' + d.remaining + ' 回）';
+  box.appendChild(s); box.appendChild(n); box.appendChild(rest);
+  if (d.remaining === 0) {
+    box.className = 'quota full';
+    $('send').disabled = true;
+  } else {
+    $('send').disabled = false;
+  }
+}
+
+async function init() {
+  $('day').value = new Date().toISOString().slice(0, 10);
+  const me = await fetch('/api/profile');
+  if (me.status === 401) { location.href = '/login'; return; }
+  if (me.ok) own = (await me.json()).profile.employeeId;
+  const res = await fetch('/api/employees?status=active');
+  if (res.ok) {
+    for (const e of (await res.json()).employees) {
+      if (e.id === own) continue; // 🔴 自分自身は宛先に出さない
+      const o = document.createElement('option');
+      o.value = e.id;
+      o.textContent = e.name;
+      $('to').appendChild(o);
+    }
+  }
+  loadQuota();
+}
+
+$('day').addEventListener('change', loadQuota);
+
+$('send').addEventListener('click', async () => {
+  show($('err'), ''); show($('ok'), '');
+  if ($('to').value === '') { show($('err'), '送る相手を選んでください'); return; }
+  const res = await fetch('/api/thanks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify({
+      toEmployeeId: $('to').value,
+      message: $('msg').value,
+      thankedOn: $('day').value
+    })
+  });
+  if (res.status === 401) { location.href = '/login'; return; }
+  if (res.ok) {
+    show($('ok'), 'ありがとうを送りました');
+    $('msg').value = '';
+    loadQuota();
+    return;
+  }
+  if (res.status === 429) { show($('err'), '今月の上限（30回）に達しています'); loadQuota(); return; }
+  const d = await res.json().catch(() => ({}));
+  if (d.issues && d.issues.some((i) => i.code === 'same_as_sender')) {
+    show($('err'), '自分自身には送れません');
+  } else if (d.issues) {
+    show($('err'), '入力を確認してください');
+  } else {
+    show($('err'), '送信できませんでした');
+  }
+});
+init();
+</script>
+</body>
+</html>`;
+}
+
+export function thanksRankingPage(): string {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>獲得順位 | PONO-PLUS</title>
+<style>${STYLE}${ADMIN_STYLE}${THANKS_STYLE}
+  .login { max-width: 560px; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1>獲得順位</h1>
+  <div class="box">
+    <div class="bar">
+      <div class="row" style="flex:0 0 150px">
+        <label for="period">対象月</label>
+        <input type="text" id="period" placeholder="すべて">
+      </div>
+      <div class="row"><button id="go">表示</button></div>
+    </div>
+    <p class="error" id="err" style="display:none"></p>
+    <table>
+      <thead><tr><th style="width:60px">順位</th><th>氏名</th><th style="width:90px">獲得数</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="3">読み込み中…</td></tr></tbody>
+    </table>
+    <p class="hint">受け取った「ありがとう」の件数で集計しています。同数は同順位です。</p>
+  </div>
+  <p class="links"><a href="/thanks">ありがとう情報へ戻る</a> ／ <a href="/home">ホーム</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let own = null;
+
+async function load() {
+  const q = new URLSearchParams();
+  const p = $('period').value.trim();
+  if (p !== '') q.set('period', p);
+  const res = await fetch('/api/thanks/ranking?' + q.toString());
+  if (res.status === 401) { location.href = '/login'; return; }
+  const tbody = $('rows');
+  tbody.replaceChildren();
+  if (!res.ok) { $('err').textContent = '取得できませんでした'; $('err').style.display = 'block'; return; }
+  $('err').style.display = 'none';
+  const d = await res.json();
+  if (d.ranking.length === 0) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 3;
+    td.textContent = 'まだ集計できる記録がありません';
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  for (const r of d.ranking) {
+    const tr = document.createElement('tr');
+    if (r.employeeId === own) tr.className = 'me';
+    const a = document.createElement('td'); a.className = 'rank'; a.textContent = String(r.rank);
+    const b = document.createElement('td'); b.textContent = r.employeeName === null ? '不明' : r.employeeName;
+    const c = document.createElement('td'); c.className = 'num'; c.textContent = String(r.receivedCount);
+    tr.appendChild(a); tr.appendChild(b); tr.appendChild(c);
+    tbody.appendChild(tr);
+  }
+}
+$('go').addEventListener('click', load);
+$('period').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
+fetch('/api/profile').then((r) => r.ok ? r.json() : null).then((d) => {
+  if (d) own = d.profile.employeeId;
+  load();
+});
 </script>
 </body>
 </html>`;
