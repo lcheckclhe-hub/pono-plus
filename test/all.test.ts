@@ -3361,3 +3361,75 @@ describe("画面: ありがとう情報（T-39）", () => {
     assert.ok(homePage().includes('href="/thanks"'));
   });
 });
+
+// ===============================================================
+// F-8 / F-9 の回帰（Session 05 実機確認で検出）
+// ===============================================================
+describe("F-8: セットアップが管理者の従業員レコードを作る", () => {
+  const SETUP = {
+    tenantName: "デモ株式会社", cutoffDay: 20,
+    adminLoginId: "admin", adminPassword: "Pono-Plus-2026!", adminEmail: null,
+  };
+
+  test("🔴 管理者にも employees 行ができる", async () => {
+    const db = new ShimD1(SCHEMA) as AnyDb;
+    await db.prepare(`INSERT INTO roles (id,code,name,is_hr_line,created_at) VALUES ('r1','tenant_admin','会社管理者',1,?1)`)
+      .bind(nowUtc()).run();
+    const r = await bootstrapSetup(db, "secret-token", "secret-token", SETUP);
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const emp = await db.prepare(`SELECT * FROM employees WHERE id = ?1`).bind(r.employeeId).first();
+    assert.equal(emp.account_id, r.accountId);
+    assert.equal(emp.tenant_id, r.tenantId);
+    assert.equal(emp.name, "管理者");
+    assert.equal(emp.status, "active");
+  });
+
+  test("🔴 管理者が自分の従業員IDを引ける（これが無いと全機能が使えない）", async () => {
+    const db = new ShimD1(SCHEMA) as AnyDb;
+    await db.prepare(`INSERT INTO roles (id,code,name,is_hr_line,created_at) VALUES ('r1','tenant_admin','会社管理者',1,?1)`)
+      .bind(nowUtc()).run();
+    const r = await bootstrapSetup(db, "secret-token", "secret-token", SETUP);
+    if (!r.ok) throw new Error("setup failed");
+    // プロフィール・日報・社内フォト・ありがとうは、すべてこの関数に依存している
+    assert.equal(await getOwnEmployeeId(db, r.tenantId, r.accountId), r.employeeId);
+    assert.notEqual(await getProfile(db, r.tenantId, r.employeeId), null);
+  });
+
+  test("氏名を指定できる。空なら「管理者」になる", async () => {
+    for (const [given, expected] of [["宮澤", "宮澤"], ["", "管理者"], ["   ", "管理者"]] as const) {
+      const db = new ShimD1(SCHEMA) as AnyDb;
+      await db.prepare(`INSERT INTO roles (id,code,name,is_hr_line,created_at) VALUES ('r1','tenant_admin','会社管理者',1,?1)`)
+        .bind(nowUtc()).run();
+      const r = await bootstrapSetup(db, "secret-token", "secret-token", { ...SETUP, adminName: given });
+      if (!r.ok) throw new Error("setup failed");
+      const emp = await db.prepare(`SELECT name FROM employees WHERE id = ?1`).bind(r.employeeId).first();
+      assert.equal(emp.name, expected);
+    }
+  });
+
+  test("入社日が入る（勤続の算出に必要・F-1 と同じ理由）", async () => {
+    const db = new ShimD1(SCHEMA) as AnyDb;
+    await db.prepare(`INSERT INTO roles (id,code,name,is_hr_line,created_at) VALUES ('r1','tenant_admin','会社管理者',1,?1)`)
+      .bind(nowUtc()).run();
+    const r = await bootstrapSetup(db, "secret-token", "secret-token", SETUP);
+    if (!r.ok) throw new Error("setup failed");
+    const emp = await db.prepare(`SELECT hired_on FROM employees WHERE id = ?1`).bind(r.employeeId).first();
+    assert.notEqual(emp.hired_on, null);
+    assert.match(emp.hired_on, /^\d{4}-\d{2}-\d{2}$/);
+  });
+});
+
+describe("F-9: ファイルを選び直したらエラー表示を消す", () => {
+  test("プロフィールと日報の画像欄に change ハンドラがある", () => {
+    for (const h of [profilePage(), dailyReportFormPage()]) {
+      assert.ok(h.includes("$('file').addEventListener('change'"), "change ハンドラが無い");
+    }
+  });
+
+  test("従業員レコードが無い場合に原因が分かる案内を出す", () => {
+    const h = profilePage();
+    assert.ok(h.includes("res.status === 404"));
+    assert.ok(h.includes("従業員の登録がない"));
+  });
+});
