@@ -1299,10 +1299,12 @@ export interface SetupInput {
   adminLoginId: string;
   adminPassword: string;
   adminEmail: string | null;
+  /** 管理者の従業員としての氏名。既定は「管理者」（F-8） */
+  adminName?: string;
 }
 
 export type SetupResult =
-  | { ok: true; tenantId: string; accountId: string }
+  | { ok: true; tenantId: string; accountId: string; employeeId: string }
   | { ok: false; reason: "disabled" | "invalid_token" | "already_initialized" | "invalid_input" };
 
 export async function bootstrapSetup(
@@ -1324,6 +1326,7 @@ export async function bootstrapSetup(
   if (input.tenantName.trim() === "" || input.adminLoginId.trim() === "" || input.adminPassword.length < 12) {
     return { ok: false, reason: "invalid_input" };
   }
+  const adminName = (input.adminName ?? "").trim() === "" ? "管理者" : (input.adminName as string).trim();
   if (!Number.isInteger(input.cutoffDay) || input.cutoffDay < 1 || input.cutoffDay > 31) {
     return { ok: false, reason: "invalid_input" };
   }
@@ -1362,6 +1365,21 @@ export async function bootstrapSetup(
     .bind(crypto.randomUUID(), accountId, role.id, tenantId, t)
     .run();
 
+  // 🔴 F-8: 管理者にも従業員レコードを作る。
+  //   これが無いと getOwnEmployeeId() が null を返し、
+  //   プロフィール・業務日報・社内フォト・ありがとうがすべて使えない。
+  //   現行のマスタ①（会社アカウント）も一利用者として振る舞う構造であり
+  //   （設計書 4.11.4「マスタ①自身が受検者として記録される経路が存在する」）、
+  //   段階1でアカウントを employees に一本化した以上、ここで作る必要がある。
+  const employeeId = crypto.randomUUID();
+  await db
+    .prepare(
+      `INSERT INTO employees (id,tenant_id,account_id,name,employment_type,status,hired_on,created_at,updated_at)
+       VALUES (?1,?2,?3,?4,'regular','active',?5,?6,?6)`
+    )
+    .bind(employeeId, tenantId, accountId, adminName, toJstCalendarDate(t), t)
+    .run();
+
   // 勤務時間帯の初期値。現行 tb_m_cate1 の CATE1_REMARKS1..21 に相当し、
   // code は 1〜21 の数値。名称は会社ごとに自由に変更できる（shift1Template.php で実証）。
   for (const [i, name] of ["早番", "日勤", "遅番", "夜勤"].entries()) {
@@ -1374,7 +1392,7 @@ export async function bootstrapSetup(
       .run();
   }
 
-  return { ok: true, tenantId, accountId };
+  return { ok: true, tenantId, accountId, employeeId };
 }
 
 // ===============================================================
