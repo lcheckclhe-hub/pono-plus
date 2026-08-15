@@ -31,13 +31,13 @@ src/index.ts               ディスパッチャ（ルート表・認証・CSRF�
 src/core.ts                基盤：日時 / パスワード(Argon2id) / 認可(is_hr_line) / データアクセス
 src/services.ts            業務：シフト計算 / 認証 / 従業員登録 / 勤怠評価 / 退会・解約削除
 src/pages.ts               画面：ログイン / ホーム / シフト入力（現行 Template を踏襲）
-test/all.test.ts           単体 + 統合 + ディスパッチャ + 画面 + スキーマ検査（145件）
+test/all.test.ts           単体 + 統合 + ディスパッチャ + 画面 + スキーマ検査（152件）
 ```
 
 ## コマンド
 
 ```bash
-npm run check      # 型チェック + テスト145件（これだけ通せばよい）
+npm run check      # 型チェック + テスト152件（これだけ通せばよい）
 npm test
 npm run typecheck
 ```
