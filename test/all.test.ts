@@ -44,9 +44,13 @@ import {
   THANKS_MONTHLY_LIMIT, THANKS_MESSAGE_MAX,
   upsertSkillSheet, getSkillSheet, listSkillSheetsByYear, suggestSkillCounts,
   redactForEmployee, validateSkillSheet, SKILL_COMMENT_MAX,
+  parseVideoRef, videoEmbedUrl, getTenantNotice, updateTenantNotice,
+  addNoticeImage, deleteNoticeImage, getNoticeImageKey,
+  listActivities, activityLabelOf, getSupportContent,
+  NOTICE_IMAGE_MAX, NOTICE_LINK_MAX,
 } from "../src/services.ts";
 import { worker, routes } from "../src/index.ts";
-import { loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage } from "../src/pages.ts";
+import { loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage, noticeEditPage, supportPage } from "../src/pages.ts";
 import { bootstrapSetup, evaluateAttendance, ageOn, persistAttendanceSummary, getShiftSheet } from "../src/services.ts";
 import { upsertShift, summarizePeriod, ShiftServiceError, setUrgentCheck, hasUrgentCheck, periodForDate } from "../src/services.ts";
 import type { Principal } from "../src/core.ts";
@@ -585,6 +589,8 @@ const TENANT_EXEMPT = new Set([
   "accounts", "account_roles", "sessions",
   "password_reset_tokens", "login_attempts",
   "retention_policies", "audit_logs",
+  // サポートは全テナント共通の内容（現行 tb_m_contact に相当）。テナントに属さない
+  "support_contents",
 ]);
 
 function schemaDb(): DatabaseSync {
@@ -604,7 +610,7 @@ function columns(db: DatabaseSync, table: string): Array<{ name: string; type: s
 }
 
 describe("スキーマ: 設計原則の検査（CIで守る不変条件）", () => {
-  test("マイグレーションが実行でき、テーブル26本・インデックス27本になる", () => {
+  test("マイグレーションが実行でき、テーブル30本・インデックス29本になる", () => {
     // 🔴 この数を変えるときは、意図した追加か必ず確認すること。
     //    0001: テーブル20 / インデックス16
     //    0004: worksite_monthly_reports を追加（テーブル21 / インデックス17）
@@ -612,13 +618,14 @@ describe("スキーマ: 設計原則の検査（CIで守る不変条件）", () 
     //    0006: photo_posts を追加（テーブル24 / インデックス22）
     //    0007: thanks を追加（テーブル25 / インデックス25）
     //    0008: skill_sheets を追加（テーブル26 / インデックス27）
+    //    0009: tenant_notices + _links + _images + support_contents を追加（テーブル30 / インデックス29）
     //    0002・0003 は列の追加のみ
     const db = schemaDb();
-    assert.equal(tableNames(db).length, 26);
+    assert.equal(tableNames(db).length, 30);
     const idx = db.prepare(
       "select count(*) as n from sqlite_master where type='index' and name not like 'sqlite_%'"
     ).get() as { n: number };
-    assert.equal(idx.n, 27);
+    assert.equal(idx.n, 29);
   });
 
   test("業務テーブルは tenant_id NOT NULL（B-6・スキーマ 2.5）", () => {
@@ -902,10 +909,10 @@ describe("ディスパッチャ: 認証の一元化（B-5/B-29・設計書 4.2/5
       "/", "/api/login", "/api/setup", "/attendance",
       "/daily-reports", "/daily-reports/categories", "/daily-reports/edit",
       "/employees", "/employees/new",
-      "/healthz", "/home", "/login", "/photos", "/photos/new",
-      "/profile", "/profile/view",
+      "/healthz", "/home", "/login", "/notices/edit",
+      "/photos", "/photos/new", "/profile", "/profile/view",
       "/reports", "/reports/edit", "/shifts",
-      "/skill-sheets", "/skill-sheets/edit",
+      "/skill-sheets", "/skill-sheets/edit", "/support",
       "/thanks", "/thanks/new", "/thanks/ranking",
     ]);
   });
@@ -1964,8 +1971,8 @@ describe("スキーマ: マイグレーション 0002", () => {
   });
 
   test("このマイグレーション自体はテーブルを増やさない（列の追加のみ）", () => {
-    // 全マイグレーション適用後の総数。テーブルを増やしたのは 0001・0004〜0008
-    assert.equal(tableNames(schemaDb()).length, 26);
+    // 全マイグレーション適用後の総数。テーブルを増やしたのは 0001・0004〜0009
+    assert.equal(tableNames(schemaDb()).length, 30);
   });
 });
 
@@ -2314,8 +2321,8 @@ describe("スキーマ: マイグレーション 0003", () => {
   });
 
   test("このマイグレーション自体はテーブルを増やさない（列の追加のみ）", () => {
-    // 全マイグレーション適用後の総数。テーブルを増やしたのは 0001・0004〜0008
-    assert.equal(tableNames(schemaDb()).length, 26);
+    // 全マイグレーション適用後の総数。テーブルを増やしたのは 0001・0004〜0009
+    assert.equal(tableNames(schemaDb()).length, 30);
   });
 });
 
@@ -2556,8 +2563,8 @@ describe("画面: 店舗情報（T-21）", () => {
 });
 
 describe("スキーマ: マイグレーション 0004", () => {
-  test("テーブルが26本になる（0005 で2本・0006〜0008 で各1本追加）", () => {
-    assert.equal(tableNames(schemaDb()).length, 26);
+  test("テーブルが30本になる（0009 で4本追加）", () => {
+    assert.equal(tableNames(schemaDb()).length, 30);
   });
 });
 
@@ -3691,5 +3698,331 @@ describe("画面: スキルシート（T-45）", () => {
 
   test("ホームから行ける", () => {
     assert.ok(homePage().includes('href="/skill-sheets"'));
+  });
+});
+
+// ===============================================================
+// トップ表示（区分1）／更新履歴（区分2）／サポート（区分12）／ T-47〜T-53
+// ===============================================================
+describe("トップ表示: 🔴 動画は埋め込みHTMLを保存しない（T-48）", () => {
+  test("YouTube の各種URLから動画IDを取り出す", () => {
+    for (const u of [
+      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "https://youtu.be/dQw4w9WgXcQ",
+      "https://www.youtube.com/embed/dQw4w9WgXcQ",
+      "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+      "https://www.youtube.com/watch?list=PL1&v=dQw4w9WgXcQ",
+    ]) {
+      assert.deepEqual(parseVideoRef(u), { kind: "youtube", id: "dQw4w9WgXcQ" }, u);
+    }
+  });
+
+  test("Vimeo のURLから動画IDを取り出す", () => {
+    assert.deepEqual(parseVideoRef("https://vimeo.com/476531935"), { kind: "vimeo", id: "476531935" });
+    assert.deepEqual(parseVideoRef("https://player.vimeo.com/video/476531935"), { kind: "vimeo", id: "476531935" });
+  });
+
+  test("🔴 iframe を貼られても src からIDだけを取る（HTMLは保存しない）", () => {
+    const iframe = '<iframe width="100%" src="https://www.youtube.com/embed/dQw4w9WgXcQ" frameborder="0"></iframe>';
+    assert.deepEqual(parseVideoRef(iframe), { kind: "youtube", id: "dQw4w9WgXcQ" });
+  });
+
+  test("🔴 スクリプトや未対応のURLは拒否する", () => {
+    for (const bad of [
+      '<script>alert(1)</script>',
+      '<iframe src="javascript:alert(1)"></iframe>',
+      '<iframe src="https://evil.example.com/x"></iframe>',
+      "https://example.com/movie.mp4",
+      "",
+    ]) {
+      assert.equal(parseVideoRef(bad), null, bad.slice(0, 40));
+    }
+  });
+
+  test("埋め込みURLは保存済みIDから組み立てる", () => {
+    assert.equal(videoEmbedUrl({ kind: "youtube", id: "dQw4w9WgXcQ" }),
+      "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ");
+    assert.equal(videoEmbedUrl({ kind: "vimeo", id: "476531935" }),
+      "https://player.vimeo.com/video/476531935");
+  });
+
+  test("解釈できない動画は保存されない", async () => {
+    const { db } = await seed();
+    await assert.rejects(
+      () => updateTenantNotice(db, "t_1", { message: null, videoInput: "<script>x</script>", links: [] }),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.code === "unsupported_video")
+    );
+    assert.equal((await getTenantNotice(db, "t_1")).video, null);
+  });
+});
+
+describe("トップ表示: メッセージとURL（T-48）", () => {
+  test("保存して取得できる。埋め込みURLも返る", async () => {
+    const { db } = await seed();
+    await updateTenantNotice(db, "t_1", {
+      message: "熱中症に気をつけましょう",
+      videoInput: "https://youtu.be/dQw4w9WgXcQ",
+      links: [{ url: "https://example.com/a", label: "説明ページ" }],
+    });
+    const n = await getTenantNotice(db, "t_1");
+    assert.equal(n.message, "熱中症に気をつけましょう");
+    assert.equal(n.video?.id, "dQw4w9WgXcQ");
+    assert.equal(n.embedUrl, "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ");
+    assert.equal(n.links[0].label, "説明ページ");
+  });
+
+  test("🔴 http(s) 以外のURLを拒否する", async () => {
+    const { db } = await seed();
+    for (const bad of ["javascript:alert(1)", "data:text/html,<script>x</script>", "ftp://x/y", "not a url"]) {
+      await assert.rejects(
+        () => updateTenantNotice(db, "t_1", { message: null, videoInput: null, links: [{ url: bad, label: null }] }),
+        RegistrationError, bad
+      );
+    }
+    assert.equal((await getTenantNotice(db, "t_1")).links.length, 0);
+  });
+
+  test("URLは総入れ替えされる（3本固定ではない）", async () => {
+    const { db } = await seed();
+    const mk = (n: number) => Array.from({ length: n }, (_, i) => ({ url: `https://e.example/${i}`, label: null }));
+    await updateTenantNotice(db, "t_1", { message: null, videoInput: null, links: mk(3) });
+    assert.equal((await getTenantNotice(db, "t_1")).links.length, 3);
+    await updateTenantNotice(db, "t_1", { message: null, videoInput: null, links: mk(1) });
+    assert.equal((await getTenantNotice(db, "t_1")).links.length, 1);
+  });
+
+  test("URLの本数の上限を超えたら弾く", async () => {
+    const { db } = await seed();
+    const many = Array.from({ length: NOTICE_LINK_MAX + 1 }, (_, i) => ({ url: `https://e.example/${i}`, label: null }));
+    await assert.rejects(() => updateTenantNotice(db, "t_1", { message: null, videoInput: null, links: many }), RegistrationError);
+  });
+
+  test("🔴 テナントごとに独立している（B-6）", async () => {
+    const { db } = await seed();
+    await updateTenantNotice(db, "t_1", { message: "t1のお知らせ", videoInput: null, links: [] });
+    assert.equal((await getTenantNotice(db, "t_1")).message, "t1のお知らせ");
+    assert.equal((await getTenantNotice(db, "t_2")).message, null);
+  });
+});
+
+describe("トップ表示: 画像（T-49）", () => {
+  test("追加・削除できる。キーは自前生成", async () => {
+    const { db, r2 } = await seed();
+    const r = await addNoticeImage(db, r2 as never, "t_1", JPEG);
+    assert.ok(r.objectKey.startsWith("tenants/t_1/notices/"));
+    assert.equal((await getTenantNotice(db, "t_1")).images.length, 1);
+    assert.equal(await deleteNoticeImage(db, r2 as never, "t_1", r.id), true);
+    assert.equal(r2.objects.has(r.objectKey), false);
+    assert.equal((await getTenantNotice(db, "t_1")).images.length, 0);
+  });
+
+  test("🔴 4枚を超えたら拒否する", async () => {
+    const { db, r2 } = await seed();
+    for (let i = 0; i < NOTICE_IMAGE_MAX; i++) await addNoticeImage(db, r2 as never, "t_1", PNG);
+    await assert.rejects(
+      () => addNoticeImage(db, r2 as never, "t_1", PNG),
+      (e: unknown) => e instanceof RegistrationError && e.issues.some((i) => i.code === "too_many")
+    );
+    assert.equal((await getTenantNotice(db, "t_1")).images.length, NOTICE_IMAGE_MAX);
+    assert.equal(NOTICE_IMAGE_MAX, 4);
+  });
+
+  test("🔴 画像でないものを拒否し、R2 を汚さない", async () => {
+    const { db, r2 } = await seed();
+    const before = r2.objects.size;
+    const php = new TextEncoder().encode("<?php system($_GET['c']); ?>");
+    await assert.rejects(() => addNoticeImage(db, r2 as never, "t_1", php), RegistrationError);
+    assert.equal(r2.objects.size, before);
+  });
+
+  test("🔴 他テナントからはキーを引けない・消せない", async () => {
+    const { db, r2 } = await seed();
+    const r = await addNoticeImage(db, r2 as never, "t_1", GIF);
+    assert.notEqual(await getNoticeImageKey(db, "t_1", r.id), null);
+    assert.equal(await getNoticeImageKey(db, "t_2", r.id), null);
+    assert.equal(await deleteNoticeImage(db, r2 as never, "t_2", r.id), false);
+    assert.equal(r2.objects.has(r.objectKey), true);
+  });
+});
+
+describe("更新履歴（区分2）: audit_logs から組み立てる（T-50）", () => {
+  test("パスを機能名に読み替える", () => {
+    assert.equal(activityLabelOf("/api/notices"), "トップ表示");
+    assert.equal(activityLabelOf("/api/profile/update"), "プロフィール");
+    assert.equal(activityLabelOf("/api/thanks"), "ありがとう");
+    assert.equal(activityLabelOf("/api/photos/delete"), "社内フォト");
+    assert.equal(activityLabelOf("/api/daily-reports/photo"), "業務日報");
+    // ログインなどは履歴に出さない
+    assert.equal(activityLabelOf("/api/login"), null);
+    assert.equal(activityLabelOf("/healthz"), null);
+  });
+
+  test("🔴 閲覧（GET）は履歴に出さない", async () => {
+    const { db } = await seed();
+    const t = nowUtc();
+    for (const [action, path] of [["view", "/api/notices"], ["post", "/api/notices"]] as const) {
+      await db.prepare(
+        `INSERT INTO audit_logs (id,tenant_id,actor_id,actor_role,action,target_type,target_id,occurred_at)
+         VALUES (?1,'t_1','acc_1','tenant_admin',?2,?3,'200',?4)`
+      ).bind(crypto.randomUUID(), action, path, t).run();
+    }
+    const acts = await listActivities(db, "t_1");
+    assert.equal(acts.length, 1);
+    assert.equal(acts[0].label, "トップ表示");
+  });
+
+  test("現行の文言を踏襲する（トップ表示だけ「更新しました」）", async () => {
+    const { db } = await seed();
+    const t = nowUtc();
+    for (const path of ["/api/notices", "/api/photos"]) {
+      await db.prepare(
+        `INSERT INTO audit_logs (id,tenant_id,actor_id,actor_role,action,target_type,target_id,occurred_at)
+         VALUES (?1,'t_1','acc_1','tenant_admin','post',?2,'200',?3)`
+      ).bind(crypto.randomUUID(), path, t).run();
+    }
+    const acts = await listActivities(db, "t_1");
+    const notice = acts.find((a) => a.label === "トップ表示");
+    const photo = acts.find((a) => a.label === "社内フォト");
+    assert.equal(notice?.verb, "更新しました");
+    assert.equal(photo?.verb, "投稿しました");
+  });
+
+  test("投稿者の氏名を引く", async () => {
+    const { db } = await seed();
+    await db.prepare(`UPDATE employees SET account_id = 'acc_1' WHERE id = 'e_1'`).run();
+    await db.prepare(
+      `INSERT INTO audit_logs (id,tenant_id,actor_id,actor_role,action,target_type,target_id,occurred_at)
+       VALUES (?1,'t_1','acc_1','tenant_admin','post','/api/photos','201',?2)`
+    ).bind(crypto.randomUUID(), nowUtc()).run();
+    assert.equal((await listActivities(db, "t_1"))[0].actorName, "山田");
+  });
+
+  test("🔴 他テナントの記録を混ぜない（B-6）", async () => {
+    const { db } = await seed();
+    await db.prepare(
+      `INSERT INTO audit_logs (id,tenant_id,actor_id,actor_role,action,target_type,target_id,occurred_at)
+       VALUES (?1,'t_1','acc_1','tenant_admin','post','/api/photos','201',?2)`
+    ).bind(crypto.randomUUID(), nowUtc()).run();
+    assert.equal((await listActivities(db, "t_1")).length, 1);
+    assert.equal((await listActivities(db, "t_2")).length, 0);
+  });
+
+  test("件数の上限を超える指定は弾く", async () => {
+    const { db } = await seed();
+    await assert.rejects(() => listActivities(db, "t_1", 0), RegistrationError);
+    await assert.rejects(() => listActivities(db, "t_1", 101), RegistrationError);
+  });
+});
+
+describe("サポート（区分12）: 表示のみ（T-51）", () => {
+  test("未登録なら null を返す", async () => {
+    const { db } = await seed();
+    assert.deepEqual(await getSupportContent(db), { videoUrl: null, body: null });
+  });
+
+  test("登録されていれば返る", async () => {
+    const { db } = await seed();
+    const t = nowUtc();
+    await db.prepare(
+      `INSERT INTO support_contents (id,video_url,body,created_at,updated_at)
+       VALUES ('s1','https://player.vimeo.com/video/476531935','LINE登録してください',?1,?1)`
+    ).bind(t).run();
+    const c = await getSupportContent(db);
+    assert.equal(c.videoUrl, "https://player.vimeo.com/video/476531935");
+    assert.equal(c.body, "LINE登録してください");
+  });
+
+  test("⚠ テナントに属さない（全社共通）", () => {
+    const cols = columns(schemaDb(), "support_contents").map((c) => c.name);
+    assert.equal(cols.includes("tenant_id"), false);
+    assert.equal((TENANT_SCOPED_TABLES as readonly string[]).includes("support_contents"), false);
+  });
+});
+
+describe("区分1・2・12: 境界とルート（T-47）", () => {
+  test("トップ表示の3テーブルが tenant_id NOT NULL で登録されている", () => {
+    for (const t of ["tenant_notices", "tenant_notice_links", "tenant_notice_images"]) {
+      assert.ok((TENANT_SCOPED_TABLES as readonly string[]).includes(t), `${t} が未登録`);
+      assert.equal(columns(schemaDb(), t).find((c) => c.name === "tenant_id")?.notnull, 1, t);
+    }
+  });
+
+  test("解約の削除順が外部キーと矛盾しない", () => {
+    const w = TENANT_DELETION_ORDER.indexOf("worksites");
+    for (const t of ["tenant_notices", "tenant_notice_links", "tenant_notice_images"]) {
+      const i = TENANT_DELETION_ORDER.indexOf(t);
+      assert.ok(i >= 0, `${t} が削除計画に無い`);
+      assert.ok(i < TENANT_DELETION_ORDER.indexOf("tenants"), t);
+    }
+    assert.ok(w >= 0);
+  });
+
+  test("ルートが登録され、API はすべて認証必須", () => {
+    const paths = routes.map((r) => `${r.method} ${r.path}`);
+    for (const p of [
+      "GET /notices/edit", "GET /support",
+      "GET /api/notices", "POST /api/notices",
+      "POST /api/notices/image", "POST /api/notices/image/delete", "GET /api/notices/image",
+      "GET /api/activities", "GET /api/support",
+    ]) {
+      assert.ok(paths.includes(p), `${p} が未登録`);
+    }
+    for (const r of routes.filter((x) => x.path.startsWith("/api/notices") || x.path === "/api/activities" || x.path === "/api/support")) {
+      assert.notEqual(r.public, true, r.path);
+    }
+  });
+
+  test("🔴 トップ表示を編集できるのは人事権系統のみ", () => {
+    const src = readFileSync(join(here, "..", "src", "index.ts"), "utf-8");
+    const i = src.indexOf('method: "POST",\n    path: "/api/notices"');
+    const block = src.slice(i, i + 500);
+    assert.ok(block.includes("canAccessAttendance"));
+    assert.ok(block.includes('"forbidden"'));
+  });
+});
+
+describe("画面: トップ表示・更新履歴・サポート（T-52）", () => {
+  test("🔴 ホームが埋め込みHTMLを組み立てない（サーバーの embedUrl を使う）", () => {
+    const h = homePage();
+    assert.ok(h.includes("n.embedUrl"));
+    assert.ok(h.includes("利用者のHTMLは使わない"));
+    assert.equal(h.includes("<iframe"), false); // 文字列としての iframe を書かない
+  });
+
+  test("ホームに更新履歴とサポートへの導線がある", () => {
+    const h = homePage();
+    assert.ok(h.includes("更新履歴"));
+    assert.ok(h.includes("/api/activities"));
+    assert.ok(h.includes('href="/support"'));
+  });
+
+  test("外部リンクに rel=noopener を付ける", () => {
+    for (const h of [homePage(), supportPage()]) {
+      assert.ok(h.includes("noopener"), "noopener が無い");
+    }
+  });
+
+  test("編集画面は埋め込みコードではなくURLを求める", () => {
+    const h = noticeEditPage();
+    assert.ok(h.includes("埋め込みコードは不要です"));
+    assert.ok(h.includes("YouTube か Vimeo の URL"));
+    // 現行の手順書きを再現しない
+    assert.equal(h.includes("右クリック"), false);
+  });
+
+  test("画像は4枚まで・URLは追加できると分かる", () => {
+    const h = noticeEditPage();
+    assert.ok(h.includes("最大4枚"));
+    assert.ok(h.includes("最大5本"));
+  });
+
+  test("innerHTML に値を混ぜない（B-35）／外部から読み込まない（B-38）", () => {
+    for (const h of [noticeEditPage(), supportPage()]) {
+      assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
+      assert.equal(h.includes("cdn"), false);
+      // ⚠ 説明文の中の "http://" は外部読み込みではない。
+      //   src / href / import で外部を指していないことを見る
+      assert.equal(/(?:src|href)\s*=\s*["']https?:\/\//.test(h), false, "外部リソースを直参照している");
+    }
   });
 });
