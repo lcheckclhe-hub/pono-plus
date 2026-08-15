@@ -11,8 +11,8 @@
  *   ハンドラ側で認証を書き忘れても、ここを通らなければ実行されない。
  */
 import { AuthzError, nowUtc, toJstCalendarDate, sha256Hex, canAccessAttendance } from "./core.ts";
-import { loginPage, homePage, shiftSheetPage, employeeListPage, employeeFormPage, attendancePage } from "./pages.ts";
-import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet, listEmployees, getEmployee, updateEmployee, listShiftTypes } from "./services.ts";
+import { loginPage, homePage, shiftSheetPage, employeeListPage, employeeFormPage, attendancePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage } from "./pages.ts";
+import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet, listEmployees, getEmployee, updateEmployee, listShiftTypes, getProfile, getOwnEmployeeId, updateProfile, putProfilePhoto, deleteProfilePhoto, getProfilePhotoKey, PHOTO_MAX_BYTES, upsertMonthlyReport, getMonthlyReport, listMonthlyReports, monthlyWorkforceStats, listReportCategories, upsertReportCategory, upsertDailyReport, getDailyReport, listDailyReports, deleteDailyReport, putDailyReportPhoto, getDailyReportPhotoKey, createPhotoPost, listPhotoPosts, getPhotoPost, getPhotoPostKey, deletePhotoPost, CAPTION_MAX, sendThanks, listThanks, thanksRanking, countThanksSent, thanksPeriodOf, THANKS_MONTHLY_LIMIT } from "./services.ts";
 import type { Principal } from "./core.ts";
 
 export interface Env {
@@ -66,6 +66,18 @@ export const routes: RouteDef[] = [
   { method: "GET", path: "/employees", public: true, handler: async () => html(employeeListPage()) },
   { method: "GET", path: "/employees/new", public: true, handler: async () => html(employeeFormPage()) },
   { method: "GET", path: "/attendance", public: true, handler: async () => html(attendancePage()) },
+  { method: "GET", path: "/profile", public: true, handler: async () => html(profilePage()) },
+  { method: "GET", path: "/profile/view", public: true, handler: async () => html(profileViewPage()) },
+  { method: "GET", path: "/reports", public: true, handler: async () => html(reportListPage()) },
+  { method: "GET", path: "/reports/edit", public: true, handler: async () => html(reportFormPage()) },
+  { method: "GET", path: "/daily-reports", public: true, handler: async () => html(dailyReportListPage()) },
+  { method: "GET", path: "/daily-reports/edit", public: true, handler: async () => html(dailyReportFormPage()) },
+  { method: "GET", path: "/daily-reports/categories", public: true, handler: async () => html(reportCategoryPage()) },
+  { method: "GET", path: "/photos", public: true, handler: async () => html(photoListPage()) },
+  { method: "GET", path: "/photos/new", public: true, handler: async () => html(photoNewPage()) },
+  { method: "GET", path: "/thanks", public: true, handler: async () => html(thanksListPage()) },
+  { method: "GET", path: "/thanks/new", public: true, handler: async () => html(thanksNewPage()) },
+  { method: "GET", path: "/thanks/ranking", public: true, handler: async () => html(thanksRankingPage()) },
   {
     // 設定の反映状況を確認できるようにする。⚠ 値そのものは絶対に返さない
     method: "GET",
@@ -225,6 +237,531 @@ export const routes: RouteDef[] = [
         if (owner?.account_id !== ctx.principal.accountId) return json({ error: "forbidden" }, 403);
       }
       return json({ ok: true, employee: emp });
+    },
+  },
+  {
+    // 自分のプロフィール。編集できるのは常に自分のものだけ
+    method: "GET",
+    path: "/api/profile",
+    handler: async (_req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      if (own === null) return json({ error: "not_found" }, 404);
+      const p = await getProfile(ctx.env.DB, ctx.principal.tenantId, own);
+      return json({ ok: true, profile: p, editable: true });
+    },
+  },
+  {
+    // 同一テナント内の他人のプロフィール。閲覧のみ
+    method: "GET",
+    path: "/api/profile/detail",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const employeeId = new URL(req.url).searchParams.get("employeeId");
+      if (employeeId === null) return json({ error: "invalid_input" }, 422);
+      const p = await getProfile(ctx.env.DB, ctx.principal.tenantId, employeeId);
+      if (p === null) return json({ error: "not_found" }, 404);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      return json({ ok: true, profile: p, editable: own === employeeId });
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/profile/update",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      // 🔴 対象は常にセッションの主体から引く。リクエストの employeeId は受け付けない
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      if (own === null) return json({ error: "not_found" }, 404);
+      const b = (await req.json()) as Record<string, unknown>;
+      const patch: Record<string, unknown> = {};
+      if ("profileText" in b) patch.profileText = b.profileText;
+      if ("profileNote" in b) patch.profileNote = b.profileNote;
+      try {
+        await updateProfile(ctx.env.DB, ctx.principal.tenantId, own, patch);
+        return json({ ok: true });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/profile/photo",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      if (own === null) return json({ error: "not_found" }, 404);
+      // Content-Length で先に弾く。本文を読み切る前に上限超過を止める
+      const declared = Number(req.headers.get("Content-Length") ?? "0");
+      if (declared > PHOTO_MAX_BYTES) return json({ error: "too_large" }, 413);
+      const buf = new Uint8Array(await req.arrayBuffer());
+      try {
+        const r = await putProfilePhoto(ctx.env.DB, ctx.env.PHOTOS, ctx.principal.tenantId, own, buf);
+        return json({ ok: true, mime: r.mime });
+      } catch (e) {
+        if (e instanceof RegistrationError) {
+          const tooLarge = e.issues.some((i) => i.code === "too_large");
+          return json({ error: "validation_failed", issues: e.issues }, tooLarge ? 413 : 422);
+        }
+        throw e;
+      }
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/profile/photo/delete",
+    handler: async (_req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      if (own === null) return json({ error: "not_found" }, 404);
+      const removed = await deleteProfilePhoto(ctx.env.DB, ctx.env.PHOTOS, ctx.principal.tenantId, own);
+      return json({ ok: true, removed });
+    },
+  },
+  {
+    // 🔴 顔写真の配信。認証必須。現行は公開ディレクトリに置いていた（設計書 6.1 と同系統）
+    method: "GET",
+    path: "/api/profile/photo",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const employeeId = new URL(req.url).searchParams.get("employeeId");
+      if (employeeId === null) return json({ error: "invalid_input" }, 422);
+      const key = await getProfilePhotoKey(ctx.env.DB, ctx.principal.tenantId, employeeId);
+      if (key === null) return json({ error: "not_found" }, 404);
+      const obj = await ctx.env.PHOTOS.get(key);
+      if (obj === null) return json({ error: "not_found" }, 404);
+      return new Response(obj.body, {
+        headers: {
+          "Content-Type": obj.httpMetadata?.contentType ?? "application/octet-stream",
+          // 共有キャッシュに載せない（個人の顔写真のため）
+          "Cache-Control": "private, max-age=300",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    },
+  },
+  {
+    // 月次の人事指標レポート（現行「店舗情報」）。人事権系統のみ
+    method: "GET",
+    path: "/api/reports",
+    handler: async (req, ctx) => {
+      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const u = new URL(req.url);
+      try {
+        const r = await listMonthlyReports(ctx.env.DB, ctx.principal.tenantId, {
+          year: u.searchParams.get("year"),
+          worksiteId: u.searchParams.get("worksiteId"),
+        });
+        return json({ ok: true, ...r });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/reports/detail",
+    handler: async (req, ctx) => {
+      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const reportId = new URL(req.url).searchParams.get("reportId");
+      if (reportId === null) return json({ error: "invalid_input" }, 422);
+      const r = await getMonthlyReport(ctx.env.DB, ctx.principal.tenantId, reportId);
+      if (r === null) return json({ error: "not_found" }, 404);
+      return json({ ok: true, report: r });
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/reports",
+    handler: async (req, ctx) => {
+      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const b = (await req.json()) as Record<string, unknown>;
+      try {
+        const r = await upsertMonthlyReport(ctx.env.DB, ctx.principal.tenantId, {
+          worksiteId: (b.worksiteId as string | null) ?? null,
+          periodYearMonth: String(b.periodYearMonth ?? ""),
+          recruitCount: Number(b.recruitCount ?? 0),
+          hireCount: Number(b.hireCount ?? 0),
+          turnoverCount: Number(b.turnoverCount ?? 0),
+          note: (b.note as string | null) ?? null,
+        });
+        return json({ ok: true, id: r.id, created: r.created }, r.created ? 201 : 200);
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    // 🔴 平均勤続・平均年齢は保存せず都度算出する（現行は保存して陳腐化していた）
+    method: "GET",
+    path: "/api/reports/workforce",
+    handler: async (req, ctx) => {
+      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const u = new URL(req.url);
+      const ym = u.searchParams.get("periodYearMonth");
+      if (ym === null) return json({ error: "invalid_input" }, 422);
+      try {
+        const st = await monthlyWorkforceStats(ctx.env.DB, ctx.principal.tenantId, ym, u.searchParams.get("worksiteId"));
+        return json({ ok: true, ...st });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    // 日報のカテゴリ（現行 tb_m_dr・マスタ①の「マスターデータ」）
+    method: "GET",
+    path: "/api/daily-reports/categories",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const all = new URL(req.url).searchParams.get("includeInactive") === "1";
+      // 無効なものまで見られるのは管理側だけ
+      if (all && !canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      const rows = await listReportCategories(ctx.env.DB, ctx.principal.tenantId, all);
+      return json({ ok: true, categories: rows });
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/daily-reports/categories",
+    handler: async (req, ctx) => {
+      // 🔴 カテゴリの定義はマスタ①相当のみ（機能権限表 区分10）
+      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const b = (await req.json()) as Record<string, unknown>;
+      try {
+        const r = await upsertReportCategory(ctx.env.DB, ctx.principal.tenantId, {
+          id: (b.id as string | null) ?? null,
+          name: String(b.name ?? ""),
+          sortOrder: b.sortOrder === undefined ? 0 : Number(b.sortOrder),
+          isActive: b.isActive !== false,
+        });
+        return json({ ok: true, id: r.id, created: r.created }, r.created ? 201 : 200);
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/daily-reports",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const u = new URL(req.url);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      let employeeId = u.searchParams.get("employeeId");
+      // 🔴 人事権系統でなければ自分の分しか見られない
+      if (!canAccessAttendance(ctx.principal)) {
+        if (own === null) return json({ error: "not_found" }, 404);
+        if (employeeId !== null && employeeId !== own) return json({ error: "forbidden" }, 403);
+        employeeId = own;
+      }
+      try {
+        const rows = await listDailyReports(ctx.env.DB, ctx.principal.tenantId, {
+          employeeId,
+          reportedOn: u.searchParams.get("reportedOn"),
+          month: u.searchParams.get("month"),
+        });
+        return json({ ok: true, reports: rows, count: rows.length, ownEmployeeId: own });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/daily-reports/detail",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const reportId = new URL(req.url).searchParams.get("reportId");
+      if (reportId === null) return json({ error: "invalid_input" }, 422);
+      const r = await getDailyReport(ctx.env.DB, ctx.principal.tenantId, reportId);
+      if (r === null) return json({ error: "not_found" }, 404);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      if (!canAccessAttendance(ctx.principal) && r.employeeId !== own) return json({ error: "forbidden" }, 403);
+      return json({ ok: true, report: r, editable: r.employeeId === own || canAccessAttendance(ctx.principal) });
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/daily-reports",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const b = (await req.json()) as Record<string, unknown>;
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      let employeeId = (b.employeeId as string | null) ?? own;
+      // 人事権系統でなければ他人名義では書けない
+      if (!canAccessAttendance(ctx.principal)) {
+        if (own === null) return json({ error: "not_found" }, 404);
+        if (employeeId !== own) return json({ error: "forbidden" }, 403);
+      }
+      if (employeeId === null) return json({ error: "invalid_input" }, 422);
+      const reportId = typeof b.reportId === "string" && b.reportId !== "" ? b.reportId : null;
+      try {
+        const r = await upsertDailyReport(ctx.env.DB, ctx.principal.tenantId, reportId, {
+          employeeId,
+          categoryId: (b.categoryId as string | null) ?? null,
+          reportedOn: String(b.reportedOn ?? ""),
+          startTime: String(b.startTime ?? ""),
+          endTime: String(b.endTime ?? ""),
+          body: (b.body as string | null) ?? null,
+        });
+        // ⚠ 重複は警告として返す。登録は阻止しない（現行の動作・会話合意）
+        return json({ ok: true, id: r.id, created: r.created, overlaps: r.overlaps }, r.created ? 201 : 200);
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/daily-reports/delete",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const b = (await req.json()) as Record<string, unknown>;
+      const reportId = typeof b.reportId === "string" ? b.reportId : null;
+      if (reportId === null) return json({ error: "invalid_input" }, 422);
+      // 🔴 現行は URL クエリの id だけで削除できた。所有者を必ず突き合わせる
+      const r = await getDailyReport(ctx.env.DB, ctx.principal.tenantId, reportId);
+      if (r === null) return json({ error: "not_found" }, 404);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      if (!canAccessAttendance(ctx.principal) && r.employeeId !== own) return json({ error: "forbidden" }, 403);
+      const removed = await deleteDailyReport(ctx.env.DB, ctx.env.PHOTOS, ctx.principal.tenantId, reportId);
+      return json({ ok: true, removed });
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/daily-reports/photo",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const reportId = new URL(req.url).searchParams.get("reportId");
+      if (reportId === null) return json({ error: "invalid_input" }, 422);
+      const r = await getDailyReport(ctx.env.DB, ctx.principal.tenantId, reportId);
+      if (r === null) return json({ error: "not_found" }, 404);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      if (!canAccessAttendance(ctx.principal) && r.employeeId !== own) return json({ error: "forbidden" }, 403);
+      const declared = Number(req.headers.get("Content-Length") ?? "0");
+      if (declared > PHOTO_MAX_BYTES) return json({ error: "too_large" }, 413);
+      const buf = new Uint8Array(await req.arrayBuffer());
+      try {
+        const p = await putDailyReportPhoto(ctx.env.DB, ctx.env.PHOTOS, ctx.principal.tenantId, reportId, buf);
+        return json({ ok: true, mime: p.mime });
+      } catch (e) {
+        if (e instanceof RegistrationError) {
+          const tooLarge = e.issues.some((i) => i.code === "too_large");
+          return json({ error: "validation_failed", issues: e.issues }, tooLarge ? 413 : 422);
+        }
+        throw e;
+      }
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/daily-reports/photo",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const reportId = new URL(req.url).searchParams.get("reportId");
+      if (reportId === null) return json({ error: "invalid_input" }, 422);
+      const r = await getDailyReport(ctx.env.DB, ctx.principal.tenantId, reportId);
+      if (r === null) return json({ error: "not_found" }, 404);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      if (!canAccessAttendance(ctx.principal) && r.employeeId !== own) return json({ error: "forbidden" }, 403);
+      const key = await getDailyReportPhotoKey(ctx.env.DB, ctx.principal.tenantId, reportId);
+      if (key === null) return json({ error: "not_found" }, 404);
+      const obj = await ctx.env.PHOTOS.get(key);
+      if (obj === null) return json({ error: "not_found" }, 404);
+      return new Response(obj.body, {
+        headers: {
+          "Content-Type": obj.httpMetadata?.contentType ?? "application/octet-stream",
+          "Cache-Control": "private, max-age=300",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    },
+  },
+  {
+    // 社内フォト共有。同一テナント内は全員が閲覧できる
+    method: "GET",
+    path: "/api/photos",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      try {
+        const posts = await listPhotoPosts(ctx.env.DB, ctx.principal.tenantId, {
+          employeeId: new URL(req.url).searchParams.get("employeeId"),
+        });
+        return json({
+          ok: true, posts, count: posts.length,
+          ownEmployeeId: own, canDeleteAny: canAccessAttendance(ctx.principal),
+        });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    // 投稿。画像を本文で受け取り、ひと言と日付はクエリで受ける
+    method: "POST",
+    path: "/api/photos",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      if (own === null) return json({ error: "not_found" }, 404);
+      const declared = Number(req.headers.get("Content-Length") ?? "0");
+      if (declared > PHOTO_MAX_BYTES) return json({ error: "too_large" }, 413);
+      const u = new URL(req.url);
+      const caption = u.searchParams.get("caption");
+      if (caption !== null && caption.length > CAPTION_MAX) return json({ error: "validation_failed" }, 422);
+      const buf = new Uint8Array(await req.arrayBuffer());
+      try {
+        const r = await createPhotoPost(ctx.env.DB, ctx.env.PHOTOS, ctx.principal.tenantId, own, {
+          caption,
+          postedOn: u.searchParams.get("postedOn") ?? toJstCalendarDate(nowUtc()),
+          bytes: buf,
+        });
+        return json({ ok: true, id: r.id }, 201);
+      } catch (e) {
+        if (e instanceof RegistrationError) {
+          const tooLarge = e.issues.some((i) => i.code === "too_large");
+          return json({ error: "validation_failed", issues: e.issues }, tooLarge ? 413 : 422);
+        }
+        throw e;
+      }
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/photos/delete",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const b = (await req.json()) as Record<string, unknown>;
+      const postId = typeof b.postId === "string" ? b.postId : null;
+      if (postId === null) return json({ error: "invalid_input" }, 422);
+      const post = await getPhotoPost(ctx.env.DB, ctx.principal.tenantId, postId);
+      if (post === null) return json({ error: "not_found" }, 404);
+      // 🔴 投稿者本人か人事権系統のみ削除できる【会話合意 2026-08-16】
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      if (post.employeeId !== own && !canAccessAttendance(ctx.principal)) {
+        return json({ error: "forbidden" }, 403);
+      }
+      const removed = await deletePhotoPost(ctx.env.DB, ctx.env.PHOTOS, ctx.principal.tenantId, postId);
+      return json({ ok: true, removed });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/photos/photo",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const postId = new URL(req.url).searchParams.get("postId");
+      if (postId === null) return json({ error: "invalid_input" }, 422);
+      const key = await getPhotoPostKey(ctx.env.DB, ctx.principal.tenantId, postId);
+      if (key === null) return json({ error: "not_found" }, 404);
+      const obj = await ctx.env.PHOTOS.get(key);
+      if (obj === null) return json({ error: "not_found" }, 404);
+      return new Response(obj.body, {
+        headers: {
+          "Content-Type": obj.httpMetadata?.contentType ?? "application/octet-stream",
+          "Cache-Control": "private, max-age=300",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    },
+  },
+  {
+    // ありがとう情報。同一テナント内は全員が閲覧できる
+    method: "GET",
+    path: "/api/thanks",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const u = new URL(req.url);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      try {
+        const rows = await listThanks(ctx.env.DB, ctx.principal.tenantId, {
+          toEmployeeId: u.searchParams.get("toEmployeeId"),
+          fromEmployeeId: u.searchParams.get("fromEmployeeId"),
+          period: u.searchParams.get("period"),
+        });
+        return json({ ok: true, thanks: rows, count: rows.length, ownEmployeeId: own });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    // 今期に送った件数と上限。画面の「今月は○回」に使う
+    method: "GET",
+    path: "/api/thanks/quota",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      if (own === null) return json({ error: "not_found" }, 404);
+      const t = await ctx.env.DB.prepare(`SELECT cutoff_day FROM tenants WHERE id = ?1`)
+        .bind(ctx.principal.tenantId).first<{ cutoff_day: number }>();
+      const thankedOn = new URL(req.url).searchParams.get("thankedOn") ?? toJstCalendarDate(nowUtc());
+      try {
+        const period = thanksPeriodOf(thankedOn, t?.cutoff_day ?? 31);
+        const sent = await countThanksSent(ctx.env.DB, ctx.principal.tenantId, own, period);
+        return json({ ok: true, period, sent, limit: THANKS_MONTHLY_LIMIT, remaining: Math.max(0, THANKS_MONTHLY_LIMIT - sent) });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/thanks",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      // 🔴 送り主は常にセッションから引く。リクエストの from は受け付けない
+      const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+      if (own === null) return json({ error: "not_found" }, 404);
+      const b = (await req.json()) as Record<string, unknown>;
+      try {
+        const r = await sendThanks(ctx.env.DB, ctx.principal.tenantId, own, {
+          toEmployeeId: String(b.toEmployeeId ?? ""),
+          message: (b.message as string | null) ?? null,
+          thankedOn: String(b.thankedOn ?? toJstCalendarDate(nowUtc())),
+        });
+        return json({ ok: true, ...r }, 201);
+      } catch (e) {
+        if (e instanceof RegistrationError) {
+          const limit = e.issues.some((i) => i.code === "monthly_limit_reached");
+          return json({ error: limit ? "monthly_limit_reached" : "validation_failed", issues: e.issues }, limit ? 429 : 422);
+        }
+        throw e;
+      }
+    },
+  },
+  {
+    // 🔴 獲得順位は保存せず都度算出する（現行 article_counter1_rank を廃止）
+    method: "GET",
+    path: "/api/thanks/ranking",
+    handler: async (req, ctx) => {
+      if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
+      try {
+        const rows = await thanksRanking(ctx.env.DB, ctx.principal.tenantId, new URL(req.url).searchParams.get("period"));
+        return json({ ok: true, ranking: rows });
+      } catch (e) {
+        if (e instanceof RegistrationError) return json({ error: "validation_failed", issues: e.issues }, 422);
+        throw e;
+      }
     },
   },
   {
