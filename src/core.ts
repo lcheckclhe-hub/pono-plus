@@ -300,7 +300,7 @@ export const TENANT_SCOPED_TABLES = [
   "employees",
   "shift_types",
   "shifts",
-  "shift_confirmations",
+  "shift_period_flags",
   "attendance_summaries",
 ] as const;
 
