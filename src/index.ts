@@ -75,7 +75,7 @@ export const routes: RouteDef[] = [
   //   ⚠ リクエストの Host からURLを組み立てる方法は取らない。Host は詐称できるため。
   { method: "GET", path: "/", public: true, handler: async () => new Response(null, { status: 302, headers: { Location: "/login" } }) },
   { method: "GET", path: "/login", public: true, handler: async () => html(loginPage()) },
-  { method: "GET", path: "/home", handler: async () => html(homePage()) },
+  { method: "GET", path: "/home", handler: async (_req, ctx) => html(homePage(ctx.principal)) },
   { method: "GET", path: "/shifts", section: "shift", need: "view", handler: async () => html(shiftSheetPage()) },
   { method: "GET", path: "/employees", section: "account", need: "edit", handler: async () => html(employeeListPage()) },
   { method: "GET", path: "/employees/new", section: "account", need: "edit", handler: async () => html(employeeFormPage()) },

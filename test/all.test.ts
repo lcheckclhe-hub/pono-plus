@@ -52,7 +52,7 @@ import {
   NOTICE_IMAGE_MAX, NOTICE_LINK_MAX,
 } from "../src/services.ts";
 import { worker, routes } from "../src/index.ts";
-import { loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage, noticeEditPage, supportPage } from "../src/pages.ts";
+import { menuFor, loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage, noticeEditPage, supportPage } from "../src/pages.ts";
 import { bootstrapSetup, evaluateAttendance, ageOn, persistAttendanceSummary, getShiftSheet } from "../src/services.ts";
 import { upsertShift, summarizePeriod, ShiftServiceError, setUrgentCheck, hasUrgentCheck, periodForDate } from "../src/services.ts";
 import type { Principal } from "../src/core.ts";
@@ -2047,7 +2047,7 @@ describe("画面: 勤怠評価（T-10）", () => {
 
 describe("画面: 導線（T-9）", () => {
   test("ホームから3画面へ行ける", () => {
-    const h = homePage();
+    const h = homePage(P1);
     for (const p of ['href="/employees"', 'href="/shifts"', 'href="/attendance"']) {
       assert.ok(h.includes(p), `${p} が無い`);
     }
@@ -2333,7 +2333,7 @@ describe("画面: プロフィール（T-16）", () => {
   });
 
   test("ホームと従業員一覧から行ける", () => {
-    assert.ok(homePage().includes('href="/profile"'));
+    assert.ok(homePage(P1).includes('href="/profile"'));
     assert.ok(employeeListPage().includes("/profile/view?employeeId="));
   });
 });
@@ -2583,7 +2583,7 @@ describe("画面: 店舗情報（T-21）", () => {
   });
 
   test("ホームから行ける", () => {
-    assert.ok(homePage().includes('href="/reports"'));
+    assert.ok(homePage(P1).includes('href="/reports"'));
   });
 });
 
@@ -2928,7 +2928,7 @@ describe("画面: 業務日報（T-28）", () => {
   });
 
   test("ホームから行ける", () => {
-    assert.ok(homePage().includes('href="/daily-reports"'));
+    assert.ok(homePage(P1).includes('href="/daily-reports"'));
   });
 });
 
@@ -3125,7 +3125,7 @@ describe("画面: 社内フォト共有（T-33）", () => {
   });
 
   test("ホームから行ける", () => {
-    assert.ok(homePage().includes('href="/photos"'));
+    assert.ok(homePage(P1).includes('href="/photos"'));
   });
 });
 
@@ -3394,7 +3394,7 @@ describe("画面: ありがとう情報（T-39）", () => {
   });
 
   test("ホームから行ける", () => {
-    assert.ok(homePage().includes('href="/thanks"'));
+    assert.ok(homePage(P1).includes('href="/thanks"'));
   });
 });
 
@@ -3716,7 +3716,7 @@ describe("画面: スキルシート（T-45）", () => {
   });
 
   test("ホームから行ける", () => {
-    assert.ok(homePage().includes('href="/skill-sheets"'));
+    assert.ok(homePage(P1).includes('href="/skill-sheets"'));
   });
 });
 
@@ -4002,21 +4002,21 @@ describe("区分1・2・12: 境界とルート（T-47）", () => {
 
 describe("画面: トップ表示・更新履歴・サポート（T-52）", () => {
   test("🔴 ホームが埋め込みHTMLを組み立てない（サーバーの embedUrl を使う）", () => {
-    const h = homePage();
+    const h = homePage(P1);
     assert.ok(h.includes("n.embedUrl"));
     assert.ok(h.includes("利用者のHTMLは使わない"));
     assert.equal(h.includes("<iframe"), false); // 文字列としての iframe を書かない
   });
 
   test("ホームに更新履歴とサポートへの導線がある", () => {
-    const h = homePage();
+    const h = homePage(P1);
     assert.ok(h.includes("更新履歴"));
     assert.ok(h.includes("/api/activities"));
     assert.ok(h.includes('href="/support"'));
   });
 
   test("外部リンクに rel=noopener を付ける", () => {
-    for (const h of [homePage(), supportPage()]) {
+    for (const h of [homePage(P1), supportPage()]) {
       assert.ok(h.includes("noopener"), "noopener が無い");
     }
   });
@@ -4379,5 +4379,56 @@ describe("権限: 実リクエストで機能権限表どおりに弾かれる",
     for (const p of ["/api/support", "/api/activities", "/api/thanks/ranking"]) {
       assert.equal((await call(db, r2, "GET", p, staff)).status, 200, `${p} が③で使えない`);
     }
+  });
+});
+
+// ===============================================================
+// メニューの出し分け（機能権限表 §2 の「—＝メニューに存在しない」）
+//
+// 🔴 Session 06 で、ルートを塞いだだけではこれを満たせないことが判明した。
+//    ③のホームに「従業員一覧」「店舗情報」のリンクが出たままだった。
+// ===============================================================
+
+describe("メニュー: 権限に無い区分はリンク自体を出さない", () => {
+  const P = (roles: string[]): Principal => ({ accountId: "a", tenantId: "t_1", roleCodes: roles });
+  const labels = (roles: string[]) => menuFor(P(roles)).map((m) => m.label);
+
+  test("🔴 ③には従業員一覧・店舗情報・勤怠評価が出ない", () => {
+    const m = labels(["employee"]);
+    assert.equal(m.includes("従業員一覧"), false, "区分3 は③に存在しない（機能権限表 §2）");
+    assert.equal(m.includes("店舗情報（月次）"), false, "区分4 は③に存在しない");
+    assert.equal(m.includes("勤怠評価"), false, "勤怠評価は人事権系統のみ");
+  });
+
+  test("③に出るのは、機能権限表で③が持つ区分だけ", () => {
+    assert.deepEqual(labels(["employee"]), [
+      "シフト", "プロフィール", "業務日報", "社内フォト共有",
+      "ありがとう情報", "スキルシート", "サポート",
+    ]);
+  });
+
+  test("🔴 ②には従業員一覧が出ない（区分3 は①のみ・H-1）", () => {
+    const m = labels(["worksite_manager"]);
+    assert.equal(m.includes("従業員一覧"), false);
+    assert.equal(m.includes("店舗情報（月次）"), true, "②は店舗情報を持つ");
+    assert.equal(m.includes("業務日報"), true);
+  });
+
+  test("①には全区分が出る", () => {
+    assert.deepEqual(labels(["tenant_admin"]), [
+      "従業員一覧", "シフト", "勤怠評価", "プロフィール", "店舗情報（月次）",
+      "業務日報", "社内フォト共有", "ありがとう情報", "スキルシート", "サポート",
+    ]);
+  });
+
+  test("🔴 super管理者に業務メニューは出ない（機能権限表 1.1）", () => {
+    assert.deepEqual(labels(["system_admin"]), []);
+  });
+
+  test("ホームのHTMLに、権限の無いリンクが埋まっていない", () => {
+    const staff = homePage(P(["employee"]));
+    assert.equal(staff.includes('href="/employees"'), false, "③のHTMLに従業員一覧のリンクがある");
+    assert.equal(staff.includes('href="/reports"'), false, "③のHTMLに店舗情報のリンクがある");
+    assert.ok(staff.includes('href="/daily-reports"'));
   });
 });

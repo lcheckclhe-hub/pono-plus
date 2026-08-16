@@ -11,6 +11,9 @@
  *   会社の入力欄は現行どおり設けない。ログインIDから特定する
  */
 
+import { canView, canEdit } from "./core.ts";
+import type { Principal, Section } from "./core.ts";
+
 function esc(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -150,7 +153,34 @@ f.addEventListener('submit', async (e) => {
 </html>`;
 }
 
-export function homePage(): string {
+/**
+ * 🔴 メニューは権限で組み立てる（Session 06・機能権限表 §2）。
+ *    「—＝メニューに存在しない」を満たすため、リンクごとに必要な区分を持たせる。
+ *    ルートを塞ぐだけでは不十分で、③に従業員一覧や店舗情報のリンクが見えていた。
+ *
+ * ⚠ need が "edit" のものは、閲覧できてもリンクを出さない。
+ *   勤怠評価は①②のみ（③に自分の評価を見せるかは【未確認】。現行に該当画面が無い）。
+ */
+const MENU: Array<{ href: string; label: string; section: Section; need: "view" | "edit" }> = [
+  { href: "/employees", label: "従業員一覧", section: "account", need: "edit" },
+  { href: "/shifts", label: "シフト", section: "shift", need: "view" },
+  { href: "/attendance", label: "勤怠評価", section: "shift", need: "edit" },
+  { href: "/profile", label: "プロフィール", section: "profile", need: "view" },
+  { href: "/reports", label: "店舗情報（月次）", section: "worksite", need: "view" },
+  { href: "/daily-reports", label: "業務日報", section: "daily_report", need: "view" },
+  { href: "/photos", label: "社内フォト共有", section: "photo", need: "view" },
+  { href: "/thanks", label: "ありがとう情報", section: "thanks", need: "view" },
+  { href: "/skill-sheets", label: "スキルシート", section: "skill", need: "view" },
+  { href: "/support", label: "サポート", section: "support", need: "view" },
+];
+
+export function menuFor(p: Principal): Array<{ href: string; label: string }> {
+  return MENU
+    .filter((m) => (m.need === "edit" ? canEdit(p, m.section) : canView(p, m.section)))
+    .map((m) => ({ href: m.href, label: m.label }));
+}
+
+export function homePage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -198,16 +228,7 @@ export function homePage(): string {
     </div>
     <table id="me"><tbody><tr><td colspan="2">読み込み中…</td></tr></tbody></table>
     <nav class="nav">
-      <a href="/employees">従業員一覧</a>
-      <a href="/shifts">シフト登録/修正</a>
-      <a href="/attendance">勤怠評価</a>
-      <a href="/profile">プロフィール</a>
-      <a href="/reports">店舗情報（月次）</a>
-      <a href="/daily-reports">業務日報</a>
-      <a href="/photos">社内フォト共有</a>
-      <a href="/thanks">ありがとう情報</a>
-      <a href="/skill-sheets">スキルシート</a>
-      <a href="/support">サポート</a>
+      ${menuFor(p).map((m) => `<a href="${m.href}">${m.label}</a>`).join("\n      ")}
     </nav>
     <div class="notice" style="margin-top:20px">
       <h2>更新履歴</h2>
