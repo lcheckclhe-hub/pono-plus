@@ -79,14 +79,14 @@ export const routes: RouteDef[] = [
   { method: "GET", path: "/shifts", section: "shift", need: "view", handler: async () => html(shiftSheetPage()) },
   { method: "GET", path: "/employees", section: "account", need: "edit", handler: async () => html(employeeListPage()) },
   { method: "GET", path: "/employees/new", section: "account", need: "edit", handler: async () => html(employeeFormPage()) },
-  { method: "GET", path: "/attendance", section: "shift", need: "view", handler: async () => html(attendancePage()) },
-  { method: "GET", path: "/profile", section: "profile", need: "edit", handler: async () => html(profilePage()) },
-  { method: "GET", path: "/profile/view", section: "profile", need: "view", handler: async () => html(profileViewPage()) },
+  { method: "GET", path: "/attendance", section: "shift", need: "edit", handler: async (_req, ctx) => html(attendancePage(ctx.principal)) },
+  { method: "GET", path: "/profile", section: "profile", need: "edit", handler: async (_req, ctx) => html(profilePage(ctx.principal)) },
+  { method: "GET", path: "/profile/view", section: "profile", need: "view", handler: async (_req, ctx) => html(profileViewPage(ctx.principal)) },
   { method: "GET", path: "/reports", section: "worksite", need: "view", handler: async () => html(reportListPage()) },
   { method: "GET", path: "/reports/edit", section: "worksite", need: "edit", handler: async () => html(reportFormPage()) },
-  { method: "GET", path: "/daily-reports", section: "daily_report", need: "view", handler: async () => html(dailyReportListPage()) },
+  { method: "GET", path: "/daily-reports", section: "daily_report", need: "view", handler: async (_req, ctx) => html(dailyReportListPage(ctx.principal)) },
   { method: "GET", path: "/daily-reports/edit", section: "daily_report", need: "edit", handler: async () => html(dailyReportFormPage()) },
-  { method: "GET", path: "/daily-reports/categories", handler: async () => html(reportCategoryPage()) },
+  { method: "GET", path: "/daily-reports/categories", handler: async (_req, ctx) => canEditReportCategory(ctx.principal) ? html(reportCategoryPage()) : new Response(null, { status: 302, headers: { Location: "/home" } }) },
   { method: "GET", path: "/photos", section: "photo", need: "view", handler: async () => html(photoListPage()) },
   { method: "GET", path: "/photos/new", section: "photo", need: "edit", handler: async () => html(photoNewPage()) },
   { method: "GET", path: "/thanks", section: "thanks", need: "view", handler: async () => html(thanksListPage()) },
@@ -925,7 +925,7 @@ export const routes: RouteDef[] = [
     handler: async (_req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const n = await getTenantNotice(ctx.env.DB, ctx.principal.tenantId);
-      return json({ ok: true, notice: n, canEdit: canAccessAttendance(ctx.principal) });
+      return json({ ok: true, notice: n, canEdit: canEdit(ctx.principal, "notice") });
     },
   },
   {

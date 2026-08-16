@@ -11,7 +11,7 @@
  *   会社の入力欄は現行どおり設けない。ログインIDから特定する
  */
 
-import { canView, canEdit } from "./core.ts";
+import { canView, canEdit, canEditReportCategory } from "./core.ts";
 import type { Principal, Section } from "./core.ts";
 
 function esc(s: string): string {
@@ -224,7 +224,7 @@ export function homePage(p: Principal): string {
     <div class="notice" id="notice" style="display:none">
       <h2>お知らせ</h2>
       <div id="noticebody"></div>
-      <p class="editlink" id="noticeedit" style="display:none"><a href="/notices/edit">トップ表示を編集する</a></p>
+      ${canEdit(p, "notice") ? '<p class="editlink" id="noticeedit" style="display:none"><a href="/notices/edit">トップ表示を編集する</a></p>' : ""}
     </div>
     <table id="me"><tbody><tr><td colspan="2">読み込み中…</td></tr></tbody></table>
     <nav class="nav">
@@ -959,7 +959,7 @@ init();
  * ⚠ 期間は締め日基準。yearMonth=2026-08・締め日20日 なら 2026-07-21〜2026-08-20
  *   （仕様書 v1 5.2）。画面にも期間を明示し、誤読を防ぐ。
  */
-export function attendancePage(): string {
+export function attendancePage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1002,7 +1002,7 @@ export function attendancePage(): string {
     <table id="detail"><tbody></tbody></table>
     <p class="pending">この画面は実績値を表示します。勤怠の点数化は行いません。</p>
   </div>
-  <p class="links"><a href="/home">ホームへ戻る</a> ／ <a href="/employees">従業員一覧</a></p>
+  <p class="links"><a href="/home">ホームへ戻る</a>${canEdit(p, "account") ? ' ／ <a href="/employees">従業員一覧</a>' : ""}</p>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -1123,7 +1123,7 @@ const PROFILE_STYLE = `
   .body { white-space: pre-wrap; font-size: 15px; line-height: 1.7; }
 `;
 
-export function profilePage(): string {
+export function profilePage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1164,7 +1164,7 @@ export function profilePage(): string {
     </div>
     <button id="save">保存</button>
   </div>
-  <p class="links"><a href="/home">ホームへ戻る</a> ／ <a href="/employees">従業員一覧</a></p>
+  <p class="links"><a href="/home">ホームへ戻る</a>${canEdit(p, "account") ? ' ／ <a href="/employees">従業員一覧</a>' : ""}</p>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -1258,7 +1258,7 @@ load();
 }
 
 /** 他人のプロフィールの閲覧。編集の手段を一切置かない */
-export function profileViewPage(): string {
+export function profileViewPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1280,7 +1280,7 @@ export function profileViewPage(): string {
     <div class="row"><label>Note</label><p class="body" id="note">-</p></div>
     <p id="mine" class="hint" style="display:none"><a href="/profile">自分のプロフィールを編集する</a></p>
   </div>
-  <p class="links"><a href="/employees">従業員一覧へ戻る</a> ／ <a href="/home">ホーム</a></p>
+  <p class="links">${canEdit(p, "account") ? '<a href="/employees">従業員一覧へ戻る</a> ／ ' : ""}<a href="/home">ホーム</a></p>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -1585,7 +1585,7 @@ init();
  *   ・画像は認証必須の API から読む（現行は ../images/ の公開ディレクトリ）
  *   ・削除は URL クエリではなく POST で、所有者を突き合わせてから実行する
  */
-export function dailyReportListPage(): string {
+export function dailyReportListPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1605,7 +1605,7 @@ export function dailyReportListPage(): string {
         <input type="text" id="month" placeholder="2026-08">
       </div>
       <div class="row"><button id="go">表示</button></div>
-      <div class="row"><a class="btn" href="/daily-reports/edit">新規登録</a></div>
+      ${canEdit(p, "daily_report") ? '<div class="row"><a class="btn" href="/daily-reports/edit">新規登録</a></div>' : ""}
     </div>
     <p id="msg"></p>
     <div class="scroll">
@@ -1615,7 +1615,7 @@ export function dailyReportListPage(): string {
       </table>
     </div>
   </div>
-  <p class="links"><a href="/home">ホームへ戻る</a> ／ <a href="/daily-reports/categories">カテゴリの管理</a></p>
+  <p class="links"><a href="/home">ホームへ戻る</a>${canEditReportCategory(p) ? ' ／ <a href="/daily-reports/categories">カテゴリの管理</a>' : ""}</p>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);

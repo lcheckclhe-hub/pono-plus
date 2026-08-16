@@ -2007,13 +2007,13 @@ describe("スキーマ: マイグレーション 0002", () => {
 describe("画面: 勤怠評価（T-10）", () => {
   test("ルートが登録され、既定で認証必須の API から取る", () => {
     assert.ok(routes.some((r) => r.method === "GET" && r.path === "/attendance"));
-    const h = attendancePage();
+    const h = attendancePage(P1);
     assert.ok(h.includes("/api/attendance/evaluation"));
     assert.ok(h.includes("/api/employees?status=active"));
   });
 
   test("実績値の項目が並ぶ", () => {
-    const h = attendancePage();
+    const h = attendancePage(P1);
     for (const s of ["出勤日数", "実働", "残業", "遅刻", "早退", "欠勤", "出勤率", "勤続", "年齢"]) {
       assert.ok(h.includes(s), `${s} が無い`);
     }
@@ -2023,22 +2023,22 @@ describe("画面: 勤怠評価（T-10）", () => {
     // 設計書 v6 全文に勤怠の点数化の計算式は 0件。5.1 優先5 の定義は実績値のみ。
     // 6.3 の「点数」は Session 02 で「ストレスチェックの結果」と訂正済み。
     // 将来ここに点数を足すなら、移植ではなく新規要件として設計すること。
-    assert.ok(attendancePage().includes("点数化は行いません"));
+    assert.ok(attendancePage(P1).includes("点数化は行いません"));
   });
 
   test("🔴 締め日基準の期間を画面に明示する（yearMonth との食い違いを防ぐ）", () => {
-    assert.ok(attendancePage().includes("締め日基準"));
+    assert.ok(attendancePage(P1).includes("締め日基準"));
   });
 
   test("勤続・年齢・出勤率が null のとき理由を出す", () => {
-    const h = attendancePage();
+    const h = attendancePage(P1);
     assert.ok(h.includes("入社日が未登録"));
     assert.ok(h.includes("生年月日が未登録"));
     assert.ok(h.includes("登録なし"));
   });
 
   test("innerHTML に値を混ぜない（B-35）／外部CDNに依存しない（B-38）", () => {
-    const h = attendancePage();
+    const h = attendancePage(P1);
     assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
     assert.equal(h.includes("http://"), false);
     assert.equal(h.includes("cdn"), false);
@@ -2058,7 +2058,7 @@ describe("画面: 導線（T-9）", () => {
   });
 
   test("各画面からホームへ戻れる", () => {
-    for (const h of [employeeListPage(), employeeFormPage(), attendancePage()]) {
+    for (const h of [employeeListPage(), employeeFormPage(), attendancePage(P1)]) {
       assert.ok(h.includes('href="/home"'));
     }
   });
@@ -2077,13 +2077,13 @@ describe("画面: 勤怠評価の表示欠陥（F-6 / F-7 の回帰）", () => {
     });
     assert.equal(r.attendanceRate, 50); // 1 / (1+1)。0.5 ではない
 
-    const h = attendancePage();
+    const h = attendancePage(P1);
     assert.equal(h.includes("attendanceRate * 1000"), false);
     assert.ok(h.includes("r.attendanceRate + ' %'"));
   });
 
   test("🔴 F-7: カードの枠を子セレクタで当てる（入れ子の div に二重に付かない）", () => {
-    const h = attendancePage();
+    const h = attendancePage(P1);
     assert.ok(h.includes(".kpi > div"));
     assert.equal(/[^>]\s\.kpi div \{/.test(h), false);
   });
@@ -2292,7 +2292,7 @@ describe("ディスパッチャ: プロフィールのルート（T-12〜T-15）
 
 describe("画面: プロフィール（T-16）", () => {
   test("現行 profile3Template の3項目を踏襲する", () => {
-    const h = profilePage();
+    const h = profilePage(P1);
     for (const s of ["顔写真", "Profile", "Note"]) assert.ok(h.includes(s), `${s} が無い`);
     assert.ok(h.includes('id="text"'));
     assert.ok(h.includes('id="note"'));
@@ -2300,7 +2300,7 @@ describe("画面: プロフィール（T-16）", () => {
   });
 
   test("🔴 写真を公開パスではなく認証必須APIから読む", () => {
-    for (const h of [profilePage(), profileViewPage()]) {
+    for (const h of [profilePage(P1), profileViewPage(P1)]) {
       assert.ok(h.includes("/api/profile/photo?employeeId="));
       assert.equal(h.includes("../upload/"), false);
     }
@@ -2309,7 +2309,7 @@ describe("画面: プロフィール（T-16）", () => {
   test("🔴 パスワード列を表示分岐に使わない（現行 SU1_PASS の再発防止）", () => {
     // 現行 profile01sTemplate.php は {if $userp->SU1_PASS ==""} で表示を切り替えていた。
     // 新実装は写真の有無を hasPhoto で判定する
-    for (const h of [profilePage(), profileViewPage()]) {
+    for (const h of [profilePage(P1), profileViewPage(P1)]) {
       assert.ok(h.includes("hasPhoto"));
       assert.equal(/SU1_PASS|\bPASS\b/.test(h), false);
       // パスワードの入力欄そのものを置かない
@@ -2318,14 +2318,14 @@ describe("画面: プロフィール（T-16）", () => {
   });
 
   test("閲覧画面には編集の手段が無い", () => {
-    const h = profileViewPage();
+    const h = profileViewPage(P1);
     assert.equal(h.includes("<textarea"), false);
     assert.equal(h.includes('type="file"'), false);
     assert.equal(h.includes("/api/profile/update"), false);
   });
 
   test("innerHTML に値を混ぜない（B-35）／外部CDNに依存しない（B-38）", () => {
-    for (const h of [profilePage(), profileViewPage()]) {
+    for (const h of [profilePage(P1), profileViewPage(P1)]) {
       assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
       assert.equal(h.includes("http://"), false);
       assert.equal(h.includes("cdn"), false);
@@ -2885,7 +2885,7 @@ describe("画面: 業務日報（T-28）", () => {
   });
 
   test("🔴 外部CDNに依存しない（現行は終了済みの cdn.rawgit.com を参照していた）", () => {
-    for (const h of [dailyReportListPage(), dailyReportFormPage(), reportCategoryPage()]) {
+    for (const h of [dailyReportListPage(P1), dailyReportFormPage(), reportCategoryPage()]) {
       assert.equal(h.includes("rawgit"), false);
       assert.equal(h.includes("cdn"), false);
       assert.equal(h.includes("http://"), false);
@@ -2914,7 +2914,7 @@ describe("画面: 業務日報（T-28）", () => {
   });
 
   test("24時超え表記を「翌 HH:MM」で表示する", () => {
-    assert.ok(dailyReportListPage().includes("翌 "));
+    assert.ok(dailyReportListPage(P1).includes("翌 "));
   });
 
   test("カテゴリ管理画面がマスターデータであると分かる", () => {
@@ -2922,7 +2922,7 @@ describe("画面: 業務日報（T-28）", () => {
   });
 
   test("innerHTML に値を混ぜない（B-35）", () => {
-    for (const h of [dailyReportListPage(), dailyReportFormPage(), reportCategoryPage()]) {
+    for (const h of [dailyReportListPage(P1), dailyReportFormPage(), reportCategoryPage()]) {
       assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
     }
   });
@@ -3450,13 +3450,13 @@ describe("F-8: セットアップが管理者の従業員レコードを作る",
 
 describe("F-9: ファイルを選び直したらエラー表示を消す", () => {
   test("プロフィールと日報の画像欄に change ハンドラがある", () => {
-    for (const h of [profilePage(), dailyReportFormPage()]) {
+    for (const h of [profilePage(P1), dailyReportFormPage()]) {
       assert.ok(h.includes("$('file').addEventListener('change'"), "change ハンドラが無い");
     }
   });
 
   test("従業員レコードが無い場合に原因が分かる案内を出す", () => {
-    const h = profilePage();
+    const h = profilePage(P1);
     assert.ok(h.includes("res.status === 404"));
     assert.ok(h.includes("従業員の登録がない"));
   });
@@ -4430,5 +4430,89 @@ describe("メニュー: 権限に無い区分はリンク自体を出さない",
     assert.equal(staff.includes('href="/employees"'), false, "③のHTMLに従業員一覧のリンクがある");
     assert.equal(staff.includes('href="/reports"'), false, "③のHTMLに店舗情報のリンクがある");
     assert.ok(staff.includes('href="/daily-reports"'));
+  });
+});
+
+// ===============================================================
+// 画面内リンクの網羅検査（H-8・Session 06）
+//
+// 🔴 メニューだけ直しても足りなかった。実機で③から
+//    「日報 → カテゴリ管理」「プロフィール → 従業員一覧」に行けていた。
+//    画面が出力する HTML の中に、その階層が使えない遷移先が
+//    1つも埋まっていないことを機械的に確かめる。
+// ===============================================================
+
+describe("画面: 権限の無い遷移先を HTML に埋めない", () => {
+  const P = (roles: string[]): Principal => ({ accountId: "a", tenantId: "t_1", roleCodes: roles });
+
+  /** 遷移先パス -> それを使える条件 */
+  const GUARD: Record<string, (p: Principal) => boolean> = {
+    "/employees": (p) => canEdit(p, "account"),
+    "/employees/new": (p) => canEdit(p, "account"),
+    "/attendance": (p) => canEdit(p, "shift"),
+    "/reports": (p) => canView(p, "worksite"),
+    "/reports/edit": (p) => canEdit(p, "worksite"),
+    "/daily-reports": (p) => canView(p, "daily_report"),
+    "/daily-reports/edit": (p) => canEdit(p, "daily_report"),
+    "/daily-reports/categories": (p) => canEditReportCategory(p),
+    "/photos": (p) => canView(p, "photo"),
+    "/photos/new": (p) => canEdit(p, "photo"),
+    "/thanks": (p) => canView(p, "thanks"),
+    "/thanks/new": (p) => canEdit(p, "thanks"),
+    "/thanks/ranking": (p) => canView(p, "thanks"),
+    "/skill-sheets": (p) => canView(p, "skill"),
+    "/skill-sheets/edit": (p) => canEdit(p, "skill"),
+    "/notices/edit": (p) => canEdit(p, "notice"),
+    "/shifts": (p) => canView(p, "shift"),
+    "/profile": (p) => canView(p, "profile"),
+    "/profile/view": (p) => canView(p, "profile"),
+    // /home /login は権限に依らない
+  };
+
+  /** その階層が実際に開ける画面だけを対象にする */
+  function pagesFor(p: Principal): Array<[string, string]> {
+    const out: Array<[string, string]> = [["home", homePage(p)]];
+    if (canView(p, "profile")) { out.push(["profile", profilePage(p)], ["profileView", profileViewPage(p)]); }
+    if (canView(p, "daily_report")) out.push(["dailyReportList", dailyReportListPage(p)]);
+    if (canEdit(p, "shift")) out.push(["attendance", attendancePage(p)]);
+    if (canEdit(p, "account")) out.push(["employeeList", employeeListPage()]);
+    return out;
+  }
+
+  for (const [label, roles] of [["③ staff", ["employee"]], ["② 店舗管理者", ["worksite_manager"]], ["① 会社管理者", ["tenant_admin"]]] as const) {
+    test(`${label} の画面に、使えない遷移先が埋まっていない`, () => {
+      const p = P([...roles]);
+      const ng: string[] = [];
+      for (const [name, htmlOut] of pagesFor(p)) {
+        for (const [path, allowed] of Object.entries(GUARD)) {
+          if (allowed(p)) continue;
+          if (htmlOut.includes(`href="${path}"`)) ng.push(`${name} -> ${path}`);
+        }
+      }
+      assert.deepEqual(ng, [], `権限の無いリンクが出ている: ${ng.join(" / ")}`);
+    });
+  }
+
+  test("🔴 ③の日報一覧にカテゴリ管理と新規登録の扱いが正しい", () => {
+    const staff = dailyReportListPage(P(["employee"]));
+    assert.equal(staff.includes("カテゴリの管理"), false, "③はマスターデータを触れない");
+    assert.ok(staff.includes('href="/daily-reports/edit"'), "③は日報を登録する");
+  });
+
+  test("🔴 ①の日報一覧には新規登録が出ない（①は読む側・機能権限表 §3②）", () => {
+    const admin = dailyReportListPage(P(["tenant_admin"]));
+    assert.equal(admin.includes('href="/daily-reports/edit"'), false, "①が日報を書けてはならない");
+    assert.ok(admin.includes("カテゴリの管理"), "①はマスターデータを定義する");
+  });
+
+  test("🔴 ③のプロフィールに従業員一覧のリンクが無い", () => {
+    for (const h of [profilePage(P(["employee"])), profileViewPage(P(["employee"]))]) {
+      assert.equal(h.includes('href="/employees"'), false);
+      assert.ok(h.includes('href="/home"'), "ホームへは戻れる");
+    }
+  });
+
+  test("②のプロフィールにも従業員一覧は出ない（区分3 は①のみ・H-1）", () => {
+    assert.equal(profilePage(P(["worksite_manager"])).includes('href="/employees"'), false);
   });
 });
