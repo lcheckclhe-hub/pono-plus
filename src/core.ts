@@ -273,6 +273,104 @@ export function canAccessAttendance(p: Principal): boolean {
   return isSystemAdmin(p) || hasHrLineRole(p);
 }
 
+// ===============================================================
+// 機能権限表 v4 §2 の実装（Session 06 で追加）
+//
+// 🔴 これまで判定は isSystemAdmin / hasHrLineRole / canAccessAttendance の
+//    3つしか無く、tenant_admin（マスタ①）と worksite_manager（マスタ②）が
+//    is_hr_line=true で同一に扱われていた。機能権限表は①②に差を付けているため、
+//    区分3（アカウント）と区分10（業務日報）で仕様と実装がずれていた（H-1・H-2）。
+// ===============================================================
+
+/** マスタ①（会社アカウント・人事権者） */
+export function isTenantAdmin(p: Principal): boolean {
+  return p.roleCodes.includes("tenant_admin");
+}
+
+/** マスタ②（店舗管理者クラス） */
+export function isWorksiteManager(p: Principal): boolean {
+  return p.roleCodes.includes("worksite_manager");
+}
+
+/** マスタ③（一般スタッフ）。①②のいずれでもなく、system_admin でもない */
+export function isStaff(p: Principal): boolean {
+  return !isSystemAdmin(p) && !isTenantAdmin(p) && !isWorksiteManager(p);
+}
+
+/** 権限の段階。◎=作成・編集 ／ ○=閲覧のみ ／ none=メニューに存在しない */
+export type Access = "edit" | "view" | "none";
+
+/** 機能権限表 v4 §2 の区分 */
+export type Section =
+  | "notice" // 1 トップ表示
+  | "activity" // 2 更新履歴
+  | "account" // 3 アカウント
+  | "worksite" // 4 店舗情報
+  | "profile" // 5 プロフィール
+  | "shift" // 6 シフト
+  | "thanks" // 7 ありがとう情報
+  | "photo" // 8 社内フォト共有
+  | "skill" // 9 スキルシート
+  | "daily_report" // 10 業務日報
+  | "stress_check" // 11 セルフストレスチェック（段階2）
+  | "support"; // 12 サポート
+
+/**
+ * 🔴 機能権限表 v4 §2 の表をそのまま写したもの。**この表が正本である。**
+ *    実装を変えるときは、先にこの表と機能権限表を合わせること。
+ *
+ * ⚠ 区分10 業務日報の①が "view" なのは誤記ではない。機能権限表 §3② の
+ *   「①は日報を書かず、定型項目を定義して読む側。管理者と記入者が分離されている」
+ *   という設計意図による。日報の「マスターデータ」定義は別枠（canEditReportCategory）。
+ * ⚠ 区分6 シフトの③が "view" なのも同様。「スタッフは自分のシフトを見るだけで登録しない」（§3④）。
+ */
+export const SECTION_ACCESS: Record<Section, { tenantAdmin: Access; worksiteManager: Access; staff: Access }> = {
+  notice: { tenantAdmin: "edit", worksiteManager: "edit", staff: "view" },
+  activity: { tenantAdmin: "view", worksiteManager: "view", staff: "view" },
+  account: { tenantAdmin: "edit", worksiteManager: "none", staff: "none" },
+  worksite: { tenantAdmin: "edit", worksiteManager: "edit", staff: "none" },
+  profile: { tenantAdmin: "edit", worksiteManager: "edit", staff: "edit" },
+  shift: { tenantAdmin: "edit", worksiteManager: "edit", staff: "view" },
+  thanks: { tenantAdmin: "edit", worksiteManager: "edit", staff: "edit" },
+  photo: { tenantAdmin: "edit", worksiteManager: "edit", staff: "edit" },
+  skill: { tenantAdmin: "edit", worksiteManager: "edit", staff: "edit" },
+  daily_report: { tenantAdmin: "view", worksiteManager: "edit", staff: "edit" },
+  stress_check: { tenantAdmin: "edit", worksiteManager: "edit", staff: "edit" },
+  support: { tenantAdmin: "view", worksiteManager: "view", staff: "view" },
+};
+
+/**
+ * その主体が区分に対して持つ権限を返す。
+ * ⚠ system_admin は業務機能を一切持たない（機能権限表 1.1）。
+ *   テナント管理だけを行うため、ここでは常に "none" を返す。
+ */
+export function accessFor(p: Principal, section: Section): Access {
+  if (isSystemAdmin(p)) return "none";
+  const a = SECTION_ACCESS[section];
+  if (isTenantAdmin(p)) return a.tenantAdmin;
+  if (isWorksiteManager(p)) return a.worksiteManager;
+  return a.staff;
+}
+
+/** 区分を閲覧できるか（◎ または ○） */
+export function canView(p: Principal, section: Section): boolean {
+  return accessFor(p, section) !== "none";
+}
+
+/** 区分を作成・編集できるか（◎ のみ） */
+export function canEdit(p: Principal, section: Section): boolean {
+  return accessFor(p, section) === "edit";
+}
+
+/**
+ * 業務日報の「マスターデータ」（定型項目の定義）を編集できるか。
+ * 機能権限表 §2 区分10 では①がマスターデータを持ち、②は登録側。
+ * 表の access（①=view）とは別軸のため専用の判定を置く。
+ */
+export function canEditReportCategory(p: Principal): boolean {
+  return isTenantAdmin(p) || isWorksiteManager(p);
+}
+
 /** 従業員が自分自身のデータを見る場合 */
 export function canAccessOwnEmployee(p: Principal, employeeAccountId: string): boolean {
   return p.accountId === employeeAccountId;

@@ -10,7 +10,8 @@
  *   認証を通っていないリクエストがハンドラ本体に到達しない構造にする。
  *   ハンドラ側で認証を書き忘れても、ここを通らなければ実行されない。
  */
-import { AuthzError, nowUtc, toJstCalendarDate, sha256Hex, canAccessAttendance } from "./core.ts";
+import { AuthzError, nowUtc, toJstCalendarDate, sha256Hex, canAccessAttendance, canView, canEdit, canEditReportCategory } from "./core.ts";
+import type { Section } from "./core.ts";
 import { loginPage, homePage, shiftSheetPage, employeeListPage, employeeFormPage, attendancePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage, noticeEditPage, supportPage } from "./pages.ts";
 import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet, listEmployees, getEmployee, updateEmployee, listShiftTypes, getProfile, getOwnEmployeeId, updateProfile, putProfilePhoto, deleteProfilePhoto, getProfilePhotoKey, PHOTO_MAX_BYTES, upsertMonthlyReport, getMonthlyReport, listMonthlyReports, monthlyWorkforceStats, listReportCategories, upsertReportCategory, upsertDailyReport, getDailyReport, listDailyReports, deleteDailyReport, putDailyReportPhoto, getDailyReportPhotoKey, createPhotoPost, listPhotoPosts, getPhotoPost, getPhotoPostKey, deletePhotoPost, CAPTION_MAX, sendThanks, listThanks, thanksRanking, countThanksSent, thanksPeriodOf, THANKS_MONTHLY_LIMIT, upsertSkillSheet, getSkillSheet, listSkillSheetsByYear, suggestSkillCounts, redactForEmployee, getTenantNotice, updateTenantNotice, addNoticeImage, deleteNoticeImage, getNoticeImageKey, listActivities, getSupportContent } from "./services.ts";
 import type { Principal } from "./core.ts";
@@ -38,6 +39,14 @@ interface RouteDef {
   path: string;
   /** 認証不要のルートは明示的に public: true を書かせる（既定は要認証） */
   public?: boolean;
+  /**
+   * 🔴 機能権限表 v4 §2 の区分。ディスパッチャがここで権限を判定する（Session 06）。
+   *    従来は画面が全て public: true で、権限の無い階層にもフォームが開いていた（H-6）。
+   *    ハンドラごとの実装に任せると必ず漏れるため、ルート定義に宣言させる。
+   */
+  section?: Section;
+  /** "view" = 閲覧できれば通す ／ "edit" = 作成・編集できる場合のみ通す */
+  need?: "view" | "edit";
   handler: Handler;
 }
 
@@ -66,27 +75,27 @@ export const routes: RouteDef[] = [
   //   ⚠ リクエストの Host からURLを組み立てる方法は取らない。Host は詐称できるため。
   { method: "GET", path: "/", public: true, handler: async () => new Response(null, { status: 302, headers: { Location: "/login" } }) },
   { method: "GET", path: "/login", public: true, handler: async () => html(loginPage()) },
-  { method: "GET", path: "/home", public: true, handler: async () => html(homePage()) },
-  { method: "GET", path: "/shifts", public: true, handler: async () => html(shiftSheetPage()) },
-  { method: "GET", path: "/employees", public: true, handler: async () => html(employeeListPage()) },
-  { method: "GET", path: "/employees/new", public: true, handler: async () => html(employeeFormPage()) },
-  { method: "GET", path: "/attendance", public: true, handler: async () => html(attendancePage()) },
-  { method: "GET", path: "/profile", public: true, handler: async () => html(profilePage()) },
-  { method: "GET", path: "/profile/view", public: true, handler: async () => html(profileViewPage()) },
-  { method: "GET", path: "/reports", public: true, handler: async () => html(reportListPage()) },
-  { method: "GET", path: "/reports/edit", public: true, handler: async () => html(reportFormPage()) },
-  { method: "GET", path: "/daily-reports", public: true, handler: async () => html(dailyReportListPage()) },
-  { method: "GET", path: "/daily-reports/edit", public: true, handler: async () => html(dailyReportFormPage()) },
-  { method: "GET", path: "/daily-reports/categories", public: true, handler: async () => html(reportCategoryPage()) },
-  { method: "GET", path: "/photos", public: true, handler: async () => html(photoListPage()) },
-  { method: "GET", path: "/photos/new", public: true, handler: async () => html(photoNewPage()) },
-  { method: "GET", path: "/thanks", public: true, handler: async () => html(thanksListPage()) },
-  { method: "GET", path: "/thanks/new", public: true, handler: async () => html(thanksNewPage()) },
-  { method: "GET", path: "/thanks/ranking", public: true, handler: async () => html(thanksRankingPage()) },
-  { method: "GET", path: "/skill-sheets", public: true, handler: async () => html(skillSheetPage()) },
-  { method: "GET", path: "/skill-sheets/edit", public: true, handler: async () => html(skillSheetFormPage()) },
-  { method: "GET", path: "/notices/edit", public: true, handler: async () => html(noticeEditPage()) },
-  { method: "GET", path: "/support", public: true, handler: async () => html(supportPage()) },
+  { method: "GET", path: "/home", handler: async () => html(homePage()) },
+  { method: "GET", path: "/shifts", section: "shift", need: "view", handler: async () => html(shiftSheetPage()) },
+  { method: "GET", path: "/employees", section: "account", need: "edit", handler: async () => html(employeeListPage()) },
+  { method: "GET", path: "/employees/new", section: "account", need: "edit", handler: async () => html(employeeFormPage()) },
+  { method: "GET", path: "/attendance", section: "shift", need: "view", handler: async () => html(attendancePage()) },
+  { method: "GET", path: "/profile", section: "profile", need: "edit", handler: async () => html(profilePage()) },
+  { method: "GET", path: "/profile/view", section: "profile", need: "view", handler: async () => html(profileViewPage()) },
+  { method: "GET", path: "/reports", section: "worksite", need: "view", handler: async () => html(reportListPage()) },
+  { method: "GET", path: "/reports/edit", section: "worksite", need: "edit", handler: async () => html(reportFormPage()) },
+  { method: "GET", path: "/daily-reports", section: "daily_report", need: "view", handler: async () => html(dailyReportListPage()) },
+  { method: "GET", path: "/daily-reports/edit", section: "daily_report", need: "edit", handler: async () => html(dailyReportFormPage()) },
+  { method: "GET", path: "/daily-reports/categories", handler: async () => html(reportCategoryPage()) },
+  { method: "GET", path: "/photos", section: "photo", need: "view", handler: async () => html(photoListPage()) },
+  { method: "GET", path: "/photos/new", section: "photo", need: "edit", handler: async () => html(photoNewPage()) },
+  { method: "GET", path: "/thanks", section: "thanks", need: "view", handler: async () => html(thanksListPage()) },
+  { method: "GET", path: "/thanks/new", section: "thanks", need: "edit", handler: async () => html(thanksNewPage()) },
+  { method: "GET", path: "/thanks/ranking", section: "thanks", need: "view", handler: async () => html(thanksRankingPage()) },
+  { method: "GET", path: "/skill-sheets", section: "skill", need: "view", handler: async () => html(skillSheetPage()) },
+  { method: "GET", path: "/skill-sheets/edit", section: "skill", need: "edit", handler: async () => html(skillSheetFormPage()) },
+  { method: "GET", path: "/notices/edit", section: "notice", need: "edit", handler: async () => html(noticeEditPage()) },
+  { method: "GET", path: "/support", section: "support", need: "view", handler: async () => html(supportPage()) },
   {
     // 設定の反映状況を確認できるようにする。⚠ 値そのものは絶対に返さない
     method: "GET",
@@ -175,6 +184,8 @@ export const routes: RouteDef[] = [
   {
     method: "POST",
     path: "/api/employees",
+    section: "account",
+    need: "edit",
     handler: async (req, ctx) => {
       // 従業員の登録は人事権系統のロールに限る
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
@@ -214,6 +225,8 @@ export const routes: RouteDef[] = [
     //    既存の /api/shifts/sheet と同じくクエリ文字列で受ける。
     method: "GET",
     path: "/api/employees",
+    section: "account",
+    need: "edit",
     handler: async (req, ctx) => {
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
@@ -356,6 +369,8 @@ export const routes: RouteDef[] = [
     // 月次の人事指標レポート（現行「店舗情報」）。人事権系統のみ
     method: "GET",
     path: "/api/reports",
+    section: "worksite",
+    need: "view",
     handler: async (req, ctx) => {
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
@@ -375,6 +390,8 @@ export const routes: RouteDef[] = [
   {
     method: "GET",
     path: "/api/reports/detail",
+    section: "worksite",
+    need: "view",
     handler: async (req, ctx) => {
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
@@ -388,6 +405,8 @@ export const routes: RouteDef[] = [
   {
     method: "POST",
     path: "/api/reports",
+    section: "worksite",
+    need: "edit",
     handler: async (req, ctx) => {
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
@@ -412,6 +431,8 @@ export const routes: RouteDef[] = [
     // 🔴 平均勤続・平均年齢は保存せず都度算出する（現行は保存して陳腐化していた）
     method: "GET",
     path: "/api/reports/workforce",
+    section: "worksite",
+    need: "view",
     handler: async (req, ctx) => {
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
@@ -446,6 +467,9 @@ export const routes: RouteDef[] = [
     handler: async (req, ctx) => {
       // 🔴 カテゴリの定義はマスタ①相当のみ（機能権限表 区分10）
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      // 🔴 日報のマスターデータ定義は①②のみ（機能権限表 §2 区分10）。
+      //   区分の access（①=view）とは別軸のため、専用の判定を使う。
+      if (!canEditReportCategory(ctx.principal)) return json({ error: "forbidden" }, 403);
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const b = (await req.json()) as Record<string, unknown>;
       try {
@@ -465,6 +489,8 @@ export const routes: RouteDef[] = [
   {
     method: "GET",
     path: "/api/daily-reports",
+    section: "daily_report",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const u = new URL(req.url);
@@ -492,6 +518,8 @@ export const routes: RouteDef[] = [
   {
     method: "GET",
     path: "/api/daily-reports/detail",
+    section: "daily_report",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const reportId = new URL(req.url).searchParams.get("reportId");
@@ -506,6 +534,8 @@ export const routes: RouteDef[] = [
   {
     method: "POST",
     path: "/api/daily-reports",
+    section: "daily_report",
+    need: "edit",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const b = (await req.json()) as Record<string, unknown>;
@@ -538,6 +568,8 @@ export const routes: RouteDef[] = [
   {
     method: "POST",
     path: "/api/daily-reports/delete",
+    section: "daily_report",
+    need: "edit",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const b = (await req.json()) as Record<string, unknown>;
@@ -555,6 +587,8 @@ export const routes: RouteDef[] = [
   {
     method: "POST",
     path: "/api/daily-reports/photo",
+    section: "daily_report",
+    need: "edit",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const reportId = new URL(req.url).searchParams.get("reportId");
@@ -581,6 +615,8 @@ export const routes: RouteDef[] = [
   {
     method: "GET",
     path: "/api/daily-reports/photo",
+    section: "daily_report",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const reportId = new URL(req.url).searchParams.get("reportId");
@@ -606,6 +642,8 @@ export const routes: RouteDef[] = [
     // 社内フォト共有。同一テナント内は全員が閲覧できる
     method: "GET",
     path: "/api/photos",
+    section: "photo",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
@@ -627,6 +665,8 @@ export const routes: RouteDef[] = [
     // 投稿。画像を本文で受け取り、ひと言と日付はクエリで受ける
     method: "POST",
     path: "/api/photos",
+    section: "photo",
+    need: "edit",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
@@ -656,6 +696,8 @@ export const routes: RouteDef[] = [
   {
     method: "POST",
     path: "/api/photos/delete",
+    section: "photo",
+    need: "edit",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const b = (await req.json()) as Record<string, unknown>;
@@ -675,6 +717,8 @@ export const routes: RouteDef[] = [
   {
     method: "GET",
     path: "/api/photos/photo",
+    section: "photo",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const postId = new URL(req.url).searchParams.get("postId");
@@ -696,6 +740,8 @@ export const routes: RouteDef[] = [
     // ありがとう情報。同一テナント内は全員が閲覧できる
     method: "GET",
     path: "/api/thanks",
+    section: "thanks",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const u = new URL(req.url);
@@ -717,6 +763,8 @@ export const routes: RouteDef[] = [
     // 今期に送った件数と上限。画面の「今月は○回」に使う
     method: "GET",
     path: "/api/thanks/quota",
+    section: "thanks",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
@@ -737,6 +785,8 @@ export const routes: RouteDef[] = [
   {
     method: "POST",
     path: "/api/thanks",
+    section: "thanks",
+    need: "edit",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       // 🔴 送り主は常にセッションから引く。リクエストの from は受け付けない
@@ -763,6 +813,8 @@ export const routes: RouteDef[] = [
     // 🔴 獲得順位は保存せず都度算出する（現行 article_counter1_rank を廃止）
     method: "GET",
     path: "/api/thanks/ranking",
+    section: "thanks",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       try {
@@ -779,6 +831,8 @@ export const routes: RouteDef[] = [
     // 🔴 本人が見る場合は redactForEmployee() を必ず通す（残業数と非公開の業務内容を落とす）
     method: "GET",
     path: "/api/skill-sheets",
+    section: "skill",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const u = new URL(req.url);
@@ -808,12 +862,19 @@ export const routes: RouteDef[] = [
   {
     method: "GET",
     path: "/api/skill-sheets/detail",
+    section: "skill",
+    need: "view",
     handler: async (req, ctx) => {
-      // 🔴 単票は管理側だけ（業務内容の原文と公開設定を含むため）
-      if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
+      // 🔴 H-4（Session 06）: 従来は管理側だけに限っていたが、機能権限表 §2 区分9 は
+      //   ③にも◎を与えている（§3⑥「③のスキルシートはボタン1つ＝自分の1枚」）。
+      //   ③は自分の1枚だけ見られるように改めた。他人の単票は従来どおり管理側のみ。
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const u = new URL(req.url);
       const employeeId = u.searchParams.get("employeeId");
+      if (!canAccessAttendance(ctx.principal)) {
+        const own = await getOwnEmployeeId(ctx.env.DB, ctx.principal.tenantId, ctx.principal.accountId);
+        if (own === null || own !== employeeId) return json({ error: "forbidden" }, 403);
+      }
       const period = u.searchParams.get("periodYearMonth");
       if (employeeId === null || period === null) return json({ error: "invalid_input" }, 422);
       const sheet = await getSkillSheet(ctx.env.DB, ctx.principal.tenantId, employeeId, period);
@@ -830,6 +891,8 @@ export const routes: RouteDef[] = [
   {
     method: "POST",
     path: "/api/skill-sheets",
+    section: "skill",
+    need: "edit",
     handler: async (req, ctx) => {
       // 🔴 スキルシートを書けるのは人事権系統のみ（本人は書けない）
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
@@ -857,6 +920,8 @@ export const routes: RouteDef[] = [
     // トップ表示。同一テナントの全員が閲覧できる
     method: "GET",
     path: "/api/notices",
+    section: "notice",
+    need: "view",
     handler: async (_req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const n = await getTenantNotice(ctx.env.DB, ctx.principal.tenantId);
@@ -866,6 +931,8 @@ export const routes: RouteDef[] = [
   {
     method: "POST",
     path: "/api/notices",
+    section: "notice",
+    need: "edit",
     handler: async (req, ctx) => {
       // 編集できるのはマスタ①②相当のみ（機能権限表 区分1）
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
@@ -891,6 +958,8 @@ export const routes: RouteDef[] = [
   {
     method: "POST",
     path: "/api/notices/image",
+    section: "notice",
+    need: "edit",
     handler: async (req, ctx) => {
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
@@ -912,6 +981,8 @@ export const routes: RouteDef[] = [
   {
     method: "POST",
     path: "/api/notices/image/delete",
+    section: "notice",
+    need: "edit",
     handler: async (req, ctx) => {
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
@@ -925,6 +996,8 @@ export const routes: RouteDef[] = [
   {
     method: "GET",
     path: "/api/notices/image",
+    section: "notice",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const imageId = new URL(req.url).searchParams.get("imageId");
@@ -956,6 +1029,8 @@ export const routes: RouteDef[] = [
     // サポート（区分12）。⚠ 表示のみ
     method: "GET",
     path: "/api/support",
+    section: "support",
+    need: "view",
     handler: async (_req, ctx) => {
       const c = await getSupportContent(ctx.env.DB);
       return json({ ok: true, support: c });
@@ -974,6 +1049,8 @@ export const routes: RouteDef[] = [
     // PATCH ではなく POST。既存ルートが GET/POST のみで統一されているため
     method: "POST",
     path: "/api/employees/update",
+    section: "account",
+    need: "edit",
     handler: async (req, ctx) => {
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
@@ -1004,6 +1081,8 @@ export const routes: RouteDef[] = [
     // 現行の shift1update / shift2update / shift3update / shift23update の4本を1本に集約
     method: "POST",
     path: "/api/shifts",
+    section: "shift",
+    need: "edit",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const b = (await req.json()) as Record<string, unknown>;
@@ -1046,6 +1125,8 @@ export const routes: RouteDef[] = [
   {
     method: "GET",
     path: "/api/shifts/summary",
+    section: "shift",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const u = new URL(req.url);
@@ -1071,6 +1152,8 @@ export const routes: RouteDef[] = [
     // シフト入力画面のデータ（現行 shift1View.php の aryCalendar 相当）
     method: "GET",
     path: "/api/shifts/sheet",
+    section: "shift",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const u = new URL(req.url);
@@ -1097,6 +1180,8 @@ export const routes: RouteDef[] = [
     // 勤怠評価（WBS ブロック8）
     method: "GET",
     path: "/api/attendance/evaluation",
+    section: "shift",
+    need: "view",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       const u = new URL(req.url);
@@ -1127,6 +1212,8 @@ export const routes: RouteDef[] = [
     // 期間単位の「緊急確認」（現行 shift1_r1_flg1 相当）
     method: "POST",
     path: "/api/shifts/urgent-check",
+    section: "shift",
+    need: "edit",
     handler: async (req, ctx) => {
       if (ctx.principal.tenantId === null) return json({ error: "no_tenant" }, 400);
       if (!canAccessAttendance(ctx.principal)) return json({ error: "forbidden" }, 403);
@@ -1204,6 +1291,22 @@ export const worker = {
 
     if (route.public !== true && ctx.requestId === "") {
       return json({ error: "unauthorized" }, 401);
+    }
+
+    // 🔴 区分単位の権限判定を、ハンドラではなくここで行う（Session 06・H-1〜H-6）。
+    //   ハンドラごとの実装に任せていたため、機能権限表と7件ずれていた。
+    //   画面ルートも同じ検査を通るため、権限の無い階層にはフォームが開かない。
+    if (route.section !== undefined) {
+      const ok = route.need === "edit"
+        ? canEdit(ctx.principal, route.section)
+        : canView(ctx.principal, route.section);
+      if (!ok) {
+        execCtx.waitUntil(writeAudit(ctx, req.method, url.pathname, 403, `section:${route.section}`));
+        // 画面は 403 の JSON ではなくログイン画面へ返す（何があるかを推測させない）
+        return url.pathname.startsWith("/api/")
+          ? json({ error: "forbidden" }, 403)
+          : new Response(null, { status: 302, headers: { Location: "/home" } });
+      }
     }
 
     try {

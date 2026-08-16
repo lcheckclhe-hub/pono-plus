@@ -21,7 +21,9 @@ import {
 } from "../src/services.ts";
 import {
   ROLES, assertTenantScope, canAccessStressCheckResult, canAccessAttendance, hasHrLineRole, AuthzError,
+  accessFor, canView, canEdit, canEditReportCategory, isTenantAdmin, isWorksiteManager, isStaff,
 } from "../src/core.ts";
+import type { Section, Access } from "../src/core.ts";
 import { hashPassword, verifyPassword, needsRehash, ALGO_LABEL, sha256Hex } from "../src/core.ts";
 import { login, logout } from "../src/services.ts";
 import { TenantDb, TenantScopeError, TENANT_SCOPED_TABLES } from "../src/core.ts";
@@ -908,19 +910,37 @@ describe("ディスパッチャ: 認証の一元化（B-5/B-29・設計書 4.2/5
     //    現行は各 Action に認証を個別実装しており、shift3updateAction では
     //    認証失敗時の遷移が丸ごと欠落していた（B-5・設計書 4.13.6）。
     const publicRoutes = routes.filter((r) => r.public === true).map((r) => r.path).sort();
-    // 画面（/ /login /home）は認証前に配信する必要がある。
-    // /home は HTML を返すだけで、中身のデータは /api/me（認証必須）から取る
-    // /employees /employees/new も同様に HTML の配信のみ。データは
-    // /api/employees・/api/employees/detail・/api/shift-types（すべて認証必須）から取る
+    // 🔴 Session 06 で画面24本の public を撤廃した（H-6）。
+    //   従来は業務画面が全て public で、権限の無い階層にもフォームが開いていた。
+    //   実機で ③（employee）が従業員登録画面に到達できることが確認された。
+    //   残る public は「ログイン前に必要なもの」だけである。
     assert.deepEqual(publicRoutes, [
-      "/", "/api/login", "/api/setup", "/attendance",
-      "/daily-reports", "/daily-reports/categories", "/daily-reports/edit",
-      "/employees", "/employees/new",
-      "/healthz", "/home", "/login", "/notices/edit",
-      "/photos", "/photos/new", "/profile", "/profile/view",
-      "/reports", "/reports/edit", "/shifts",
-      "/skill-sheets", "/skill-sheets/edit", "/support",
-      "/thanks", "/thanks/new", "/thanks/ranking",
+      "/", "/api/login", "/api/setup", "/healthz", "/login",
+    ]);
+  });
+
+  test("🔴 業務画面はすべて区分を宣言している（宣言漏れを機械的に防ぐ）", () => {
+    const undeclared = routes
+      .filter((r) => r.public !== true && r.section === undefined)
+      .map((r) => `${r.method} ${r.path}`)
+      .sort();
+    // 区分に紐づかないのは、権限に依らず全員が使うものだけ
+    assert.deepEqual(undeclared, [
+      "GET /api/activities",
+      "GET /api/daily-reports/categories",
+      "GET /api/employees/detail",
+      "GET /api/me",
+      "GET /api/profile",
+      "GET /api/profile/detail",
+      "GET /api/profile/photo",
+      "GET /api/shift-types",
+      "GET /daily-reports/categories",
+      "GET /home",
+      "POST /api/daily-reports/categories",
+      "POST /api/logout",
+      "POST /api/profile/photo",
+      "POST /api/profile/photo/delete",
+      "POST /api/profile/update",
     ]);
   });
 
@@ -3501,11 +3521,13 @@ describe("スキルシート: 🔴 本人に見せない項目（T-44）", () =>
     assert.ok(block.includes("canAccessAttendance"));
   });
 
-  test("🔴 単票APIは管理側のみ（業務内容の原文と公開設定を含む）", () => {
+  test("🔴 単票APIは、他人の分は管理側のみ。③は自分の1枚を見られる（H-4）", () => {
+    // 機能権限表 §2 区分9 は③にも◎を与えている（§3⑥）。
+    // 従来は③を一律拒否しており、一覧は見えるのに詳細が見えない不整合があった。
     const src = readFileSync(join(here, "..", "src", "index.ts"), "utf-8");
     const i = src.indexOf('path: "/api/skill-sheets/detail"');
-    const block = src.slice(i, i + 600);
-    assert.ok(block.includes("canAccessAttendance"));
+    const block = src.slice(i, i + 900);
+    assert.ok(block.includes("getOwnEmployeeId"), "自分の分に絞る分岐が無い");
     assert.ok(block.includes('"forbidden"'));
   });
 });
@@ -4191,5 +4213,171 @@ describe("画面: 副店長の表示（0011）", () => {
 
   test("一覧の表示ラベルに副店長がある", () => {
     assert.ok(employeeListPage().includes("assistant_manager:'副店長'"));
+  });
+});
+
+// ===============================================================
+// 機能権限表 v4 §2 との突き合わせ（H-1〜H-7・Session 06）
+//
+// 🔴 12区分 × 3階層 = 36通りを機械的に検査する。
+//    Session 06 で「実装が仕様と7件ずれていた」ことを受けて追加した。
+//    以後、機能権限表を変えたら必ずこの表も変えること。
+// ===============================================================
+
+describe("権限: 機能権限表 v4 §2 の36通り", () => {
+  const P = (roles: string[]): Principal => ({ accountId: "a", tenantId: "t_1", roleCodes: roles });
+  const ADMIN = P(["tenant_admin"]);   // マスタ①
+  const WS = P(["worksite_manager"]);  // マスタ②
+  const STAFF = P(["employee"]);       // マスタ③
+  const SYS = P(["system_admin"]);     // super管理者
+
+  // 機能権限表 v4 §2 の表を、コードとは独立にここへ書き写す。
+  // SECTION_ACCESS をそのまま参照すると「表と表を比べる」だけになり検査にならない。
+  const EXPECTED: Array<[Section, Access, Access, Access]> = [
+    ["notice",       "edit", "edit", "view"],
+    ["activity",     "view", "view", "view"],
+    ["account",      "edit", "none", "none"],
+    ["worksite",     "edit", "edit", "none"],
+    ["profile",      "edit", "edit", "edit"],
+    ["shift",        "edit", "edit", "view"],
+    ["thanks",       "edit", "edit", "edit"],
+    ["photo",        "edit", "edit", "edit"],
+    ["skill",        "edit", "edit", "edit"],
+    ["daily_report", "view", "edit", "edit"],
+    ["stress_check", "edit", "edit", "edit"],
+    ["support",      "view", "view", "view"],
+  ];
+
+  for (const [section, a1, a2, a3] of EXPECTED) {
+    test(`区分 ${section}: ①=${a1} ②=${a2} ③=${a3}`, () => {
+      assert.equal(accessFor(ADMIN, section), a1, "マスタ①");
+      assert.equal(accessFor(WS, section), a2, "マスタ②");
+      assert.equal(accessFor(STAFF, section), a3, "マスタ③");
+    });
+  }
+
+  test("🔴 super管理者は業務機能を一切持たない（機能権限表 1.1）", () => {
+    for (const [section] of EXPECTED) {
+      assert.equal(accessFor(SYS, section), "none", `${section} を持ってしまっている`);
+    }
+  });
+
+  test("🔴 H-1: アカウント区分は①のみ。②③にはメニューが存在しない", () => {
+    assert.equal(canEdit(ADMIN, "account"), true);
+    assert.equal(canView(WS, "account"), false, "②が発行できてはならない");
+    assert.equal(canView(STAFF, "account"), false);
+  });
+
+  test("🔴 H-2: 業務日報の登録は②③のみ。①は読む側（機能権限表 §3②）", () => {
+    assert.equal(canEdit(ADMIN, "daily_report"), false, "①が日報を書けてはならない");
+    assert.equal(canView(ADMIN, "daily_report"), true, "①は閲覧できる");
+    assert.equal(canEdit(WS, "daily_report"), true);
+    assert.equal(canEdit(STAFF, "daily_report"), true);
+    // マスターデータの定義は別軸。①②が持つ
+    assert.equal(canEditReportCategory(ADMIN), true);
+    assert.equal(canEditReportCategory(WS), true);
+    assert.equal(canEditReportCategory(STAFF), false);
+  });
+
+  test("🔴 H-3: シフトは③が閲覧のみ。登録しない（機能権限表 §3④）", () => {
+    assert.equal(canView(STAFF, "shift"), true);
+    assert.equal(canEdit(STAFF, "shift"), false, "③がシフトを登録できてはならない");
+  });
+
+  test("①と②が区別できる（従来は is_hr_line で同一に扱われていた）", () => {
+    assert.equal(isTenantAdmin(ADMIN), true);
+    assert.equal(isTenantAdmin(WS), false);
+    assert.equal(isWorksiteManager(WS), true);
+    assert.equal(isStaff(STAFF), true);
+    assert.equal(isStaff(ADMIN), false);
+    assert.equal(isStaff(WS), false);
+    // 従来の判定では区別できなかったことを記録する
+    assert.equal(canAccessAttendance(ADMIN), canAccessAttendance(WS));
+  });
+});
+
+// ===============================================================
+// 実リクエストでの権限検証（H-1〜H-6・Session 06）
+//
+// 上の36通りは判定関数の単体検査。ここは【実際に fetch して】
+// ディスパッチャが弾くことを確かめる。宣言し忘れたルートを検出できる。
+// ===============================================================
+
+describe("権限: 実リクエストで機能権限表どおりに弾かれる", () => {
+  /** 指定ロールでログインしたセッションを作る */
+  async function as(db: AnyDb, roleId: string): Promise<string> {
+    const t = nowUtc();
+    await db.prepare(`UPDATE account_roles SET role_id = ?1 WHERE account_id = 'acc_1'`).bind(roleId).run();
+    const r = await login(db, { loginId: "admin1", password: "Pono-Plus-2026!", tenantId: "t_1", ip: null, userAgent: null });
+    assert.equal(r.ok, true);
+    if (!r.ok) throw new Error("login failed");
+    void t;
+    return `pp_session=${r.token}`;
+  }
+  const call = (db: AnyDb, r2: ShimR2, method: string, path: string, cookie: string) =>
+    worker.fetch(req(method, path, { Cookie: cookie, Origin: "https://app.example.com" }), { DB: db, PHOTOS: r2 } as never, execCtx);
+
+  test("🔴 H-1: ②はアカウント区分に触れない（画面もAPIも）", async () => {
+    const { db, r2 } = await seed();
+    const ws = await as(db, "r_ws");
+    assert.equal((await call(db, r2, "GET", "/api/employees", ws)).status, 403, "②がアカウント一覧を取れてはならない");
+    // 画面は 403 ではなく /home へ戻す（何があるかを推測させない）
+    const page = await call(db, r2, "GET", "/employees/new", ws);
+    assert.equal(page.status, 302);
+    assert.equal(page.headers.get("Location"), "/home");
+  });
+
+  test("①はアカウント区分を使える", async () => {
+    const { db, r2 } = await seed();
+    const admin = await as(db, "r_ten");
+    assert.equal((await call(db, r2, "GET", "/api/employees", admin)).status, 200);
+    assert.equal((await call(db, r2, "GET", "/employees/new", admin)).status, 200);
+  });
+
+  test("🔴 H-2: ①は日報を登録できない。閲覧はできる（機能権限表 §3②）", async () => {
+    const { db, r2 } = await seed();
+    const admin = await as(db, "r_ten");
+    assert.equal((await call(db, r2, "GET", "/api/daily-reports", admin)).status, 200, "①は閲覧できる");
+    assert.equal((await call(db, r2, "POST", "/api/daily-reports", admin)).status, 403, "①が日報を書けてはならない");
+    assert.equal((await call(db, r2, "GET", "/daily-reports/edit", admin)).status, 302, "登録画面も開かない");
+  });
+
+  test("③は日報を登録できる", async () => {
+    const { db, r2 } = await seed();
+    const staff = await as(db, "r_emp");
+    assert.equal((await call(db, r2, "GET", "/daily-reports/edit", staff)).status, 200);
+  });
+
+  test("🔴 H-3: ③はシフトを登録できない。閲覧はできる（機能権限表 §3④）", async () => {
+    const { db, r2 } = await seed();
+    const staff = await as(db, "r_emp");
+    assert.equal((await call(db, r2, "GET", "/shifts", staff)).status, 200, "③は閲覧できる");
+    assert.equal((await call(db, r2, "POST", "/api/shifts", staff)).status, 403, "③がシフトを登録できてはならない");
+  });
+
+  test("🔴 H-6: 未ログインでは業務画面が開かない（従来は全て public だった）", async () => {
+    const { db, r2 } = await seed();
+    for (const p of ["/employees/new", "/shifts", "/daily-reports", "/photos", "/skill-sheets", "/notices/edit"]) {
+      const res = await worker.fetch(req("GET", p), { DB: db, PHOTOS: r2 } as never, execCtx);
+      assert.equal(res.status, 401, `${p} が未ログインで開いている`);
+    }
+  });
+
+  test("③は店舗情報（区分4）に触れない", async () => {
+    const { db, r2 } = await seed();
+    const staff = await as(db, "r_emp");
+    assert.equal((await call(db, r2, "GET", "/api/reports", staff)).status, 403);
+    assert.equal((await call(db, r2, "GET", "/reports", staff)).status, 302);
+  });
+
+  test("③でも全員が使う区分は通る（プロフィール・ありがとう・サポート・更新履歴）", async () => {
+    const { db, r2 } = await seed();
+    const staff = await as(db, "r_emp");
+    for (const p of ["/profile", "/thanks", "/support", "/photos", "/skill-sheets"]) {
+      assert.equal((await call(db, r2, "GET", p, staff)).status, 200, `${p} が③で開けない`);
+    }
+    for (const p of ["/api/support", "/api/activities", "/api/thanks/ranking"]) {
+      assert.equal((await call(db, r2, "GET", p, staff)).status, 200, `${p} が③で使えない`);
+    }
   });
 });
