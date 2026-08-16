@@ -840,6 +840,15 @@ async function loggedInCookie(db: AnyDb): Promise<string> {
 }
 
 describe("ディスパッチャ: 認証の一元化（B-5/B-29・設計書 4.2/5.3(3)）", () => {
+  test("🔴 ルート / は /login へ 302（F-12・Session 06 で実機の internal_error を検出）", async () => {
+    // Response.redirect() は絶対URLしか受け付けず、相対パスを渡すと TypeError を投げる。
+    // その結果、トップページを開いただけで internal_error 500 が返っていた。
+    const { db, r2 } = await seed();
+    const res = await worker.fetch(req("GET", "/"), { DB: db, PHOTOS: r2 } as never, execCtx);
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.get("Location"), "/login");
+  });
+
   test("認証不要ルートは通る", async () => {
     const { db, r2 } = await seed();
     const res = await worker.fetch(req("GET", "/healthz"), { DB: db, PHOTOS: r2 } as never, execCtx);

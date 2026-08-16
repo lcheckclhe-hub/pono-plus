@@ -59,7 +59,12 @@ function html(body: string, status = 200): Response {
 
 export const routes: RouteDef[] = [
   // 画面（現行 loginuser*Template.php の構造を踏襲）
-  { method: "GET", path: "/", public: true, handler: async () => Response.redirect("/login", 302) },
+  // 🔴 F-12（Session 06・実機で internal_error を確認）
+  //   Response.redirect() は【絶対URL】しか受け付けない。相対パスを渡すと
+  //   TypeError を投げ、ディスパッチャが internal_error 500 を返していた。
+  //   Location ヘッダは相対パスで問題ないため、Response を直接組み立てる。
+  //   ⚠ リクエストの Host からURLを組み立てる方法は取らない。Host は詐称できるため。
+  { method: "GET", path: "/", public: true, handler: async () => new Response(null, { status: 302, headers: { Location: "/login" } }) },
   { method: "GET", path: "/login", public: true, handler: async () => html(loginPage()) },
   { method: "GET", path: "/home", public: true, handler: async () => html(homePage()) },
   { method: "GET", path: "/shifts", public: true, handler: async () => html(shiftSheetPage()) },
