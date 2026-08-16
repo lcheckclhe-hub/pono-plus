@@ -356,14 +356,8 @@ async function seed(): Promise<{ db: AnyDb; r2: ShimR2 }> {
     ).bind(id, name, t).run();
   }
 
-  for (const [id, code, name, hr] of [
-    ["r_admin", "tenant_admin", "会社管理者", 1],
-    ["r_emp", "employee", "従業員", 0],
-    ["r_sc", "sc_implementer", "ストレスチェック実施者", 0],
-  ] as const) {
-    await db.prepare(`INSERT INTO roles (id,code,name,is_hr_line,created_at) VALUES (?1,?2,?3,?4,?5)`)
-      .bind(id, code, name, hr, t).run();
-  }
+  // ⚠ roles はマイグレーション 0010 が投入する（F-11）。テスト側では作らない。
+  //   ここで作っていたことが、本番に roles が無くても気づけなかった原因だった。
 
   const { hash } = await hashPassword("Pono-Plus-2026!");
   for (const [aid, tid, lid] of [["acc_1", "t_1", "admin1"], ["acc_2", "t_2", "admin2"]]) {
@@ -371,7 +365,7 @@ async function seed(): Promise<{ db: AnyDb; r2: ShimR2 }> {
       `INSERT INTO accounts (id,tenant_id,login_id,password_hash,password_algo,password_updated_at,status,created_at,updated_at)
        VALUES (?1,?2,?3,?4,?5,?6,'active',?6,?6)`
     ).bind(aid, tid, lid, hash, ALGO_LABEL, t).run();
-    await db.prepare(`INSERT INTO account_roles (id,account_id,role_id,scope_type,scope_id,granted_at) VALUES (?1,?2,'r_admin','tenant',?3,?4)`)
+    await db.prepare(`INSERT INTO account_roles (id,account_id,role_id,scope_type,scope_id,granted_at) VALUES (?1,?2,'r_ten','tenant',?3,?4)`)
       .bind(`ar_${aid}`, aid, tid, t).run();
   }
 
@@ -610,7 +604,7 @@ function columns(db: DatabaseSync, table: string): Array<{ name: string; type: s
 }
 
 describe("スキーマ: 設計原則の検査（CIで守る不変条件）", () => {
-  test("マイグレーションが実行でき、テーブル30本・インデックス29本になる", () => {
+  test("マイグレーションが実行でき、テーブル30本・インデックス30本になる", () => {
     // 🔴 この数を変えるときは、意図した追加か必ず確認すること。
     //    0001: テーブル20 / インデックス16
     //    0004: worksite_monthly_reports を追加（テーブル21 / インデックス17）
@@ -619,13 +613,15 @@ describe("スキーマ: 設計原則の検査（CIで守る不変条件）", () 
     //    0007: thanks を追加（テーブル25 / インデックス25）
     //    0008: skill_sheets を追加（テーブル26 / インデックス27）
     //    0009: tenant_notices + _links + _images + support_contents を追加（テーブル30 / インデックス29）
+    //    0010: ux_accounts_login_id を追加（テーブル30 / インデックス30）
     //    0002・0003 は列の追加のみ
+    //    0011 は employees の作り直し。索引2本を張り直すだけで増減しない
     const db = schemaDb();
     assert.equal(tableNames(db).length, 30);
     const idx = db.prepare(
       "select count(*) as n from sqlite_master where type='index' and name not like 'sqlite_%'"
     ).get() as { n: number };
-    assert.equal(idx.n, 29);
+    assert.equal(idx.n, 30);
   });
 
   test("業務テーブルは tenant_id NOT NULL（B-6・スキーマ 2.5）", () => {
@@ -718,10 +714,12 @@ const BASE_REG = {
 const TODAY = "2026-08-14";
 
 describe("登録: 現行画面の値域（index2.html で実証）", () => {
-  test("勤務形態 su2_w_style は 2〜5 の4種。1（マスタ②）は雇用形態ではない", () => {
-    assert.deepEqual(Object.keys(EMPLOYMENT_TYPE_BY_LEGACY).sort(), ["2", "3", "4", "5"]);
+  test("勤務形態 su2_w_style は 1〜5 の5種。1 は副店長（Session 05 §5.6 / 0011）", () => {
+    // 🔴 0001 では 1 をロールとみなして除外していた。user2skillTemplate.php で
+    //    「副店長」と確定し、現行画面が 1〜5 を並列に並べていることから雇用形態に戻した。
+    assert.deepEqual(Object.keys(EMPLOYMENT_TYPE_BY_LEGACY).sort(), ["1", "2", "3", "4", "5"]);
     assert.equal(EMPLOYMENT_TYPE_BY_LEGACY["3"], "part_time");
-    assert.equal(EMPLOYMENT_TYPE_BY_LEGACY["1"], undefined);
+    assert.equal(EMPLOYMENT_TYPE_BY_LEGACY["1"], "assistant_manager");
   });
 
   test("🔴 勤務時間帯を A〜D に固定しない（設計書 4.5 の訂正・Session 03 第6章）", () => {
@@ -1314,21 +1312,15 @@ describe("締め済み期間への登録拒否（現行 shift23update のチェ�
 });
 
 describe("初期セットアップ（設計の欠落として検出・2026-08-15）", () => {
+  // roles はマイグレーション 0010 が投入するため、テスト側で作る必要はない（F-11）
   const emptyDb = () => new ShimD1(SCHEMA) as AnyDb;
-  async function withRoles(db: AnyDb) {
-    const t = nowUtc();
-    for (const [id, code, hr] of [["r_ten","tenant_admin",1],["r_emp","employee",0]] as const) {
-      await db.prepare(`INSERT INTO roles (id,code,name,is_hr_line,created_at) VALUES (?1,?2,?2,?3,?4)`).bind(id, code, hr, t).run();
-    }
-    return db;
-  }
   const INPUT = {
     tenantName: "デモ株式会社", cutoffDay: 20,
     adminLoginId: "admin", adminPassword: "Pono-Plus-2026!", adminEmail: null,
   };
 
   test("トークンが一致すればテナント・管理者・勤務時間帯A〜Dが作られる", async () => {
-    const db = await withRoles(emptyDb());
+    const db = emptyDb();
     const r = await bootstrapSetup(db, "secret-token", "secret-token", INPUT);
     assert.equal(r.ok, true);
     const st = await db.prepare(`SELECT COUNT(*) AS n FROM shift_types`).first();
@@ -1338,7 +1330,7 @@ describe("初期セットアップ（設計の欠落として検出・2026-08-15
   });
 
   test("作った管理者でログインできる", async () => {
-    const db = await withRoles(emptyDb());
+    const db = emptyDb();
     const r = await bootstrapSetup(db, "secret-token", "secret-token", INPUT);
     assert.equal(r.ok, true);
     if (!r.ok) return;
@@ -1347,7 +1339,7 @@ describe("初期セットアップ（設計の欠落として検出・2026-08-15
   });
 
   test("🔴 SETUP_TOKEN が未設定なら常に拒否される", async () => {
-    const db = await withRoles(emptyDb());
+    const db = emptyDb();
     const r = await bootstrapSetup(db, undefined, "anything", INPUT);
     assert.equal(r.ok, false);
     if (r.ok) return;
@@ -1355,13 +1347,13 @@ describe("初期セットアップ（設計の欠落として検出・2026-08-15
   });
 
   test("🔴 トークンが違えば拒否される", async () => {
-    const db = await withRoles(emptyDb());
+    const db = emptyDb();
     const r = await bootstrapSetup(db, "secret-token", "wrong-token!", INPUT);
     assert.equal(r.ok, false);
   });
 
   test("🔴 2回目は拒否される（テナントが既に存在するため）", async () => {
-    const db = await withRoles(emptyDb());
+    const db = emptyDb();
     await bootstrapSetup(db, "secret-token", "secret-token", INPUT);
     const r = await bootstrapSetup(db, "secret-token", "secret-token", { ...INPUT, adminLoginId: "admin2" });
     assert.equal(r.ok, false);
@@ -1370,13 +1362,13 @@ describe("初期セットアップ（設計の欠落として検出・2026-08-15
   });
 
   test("短いパスワード・不正な締め日は拒否される", async () => {
-    const db = await withRoles(emptyDb());
+    const db = emptyDb();
     assert.equal((await bootstrapSetup(db, "t", "t", { ...INPUT, adminPassword: "short" })).ok, false);
     assert.equal((await bootstrapSetup(db, "t", "t", { ...INPUT, cutoffDay: 32 })).ok, false);
   });
 
   test("パスワードは平文で保存されない", async () => {
-    const db = await withRoles(emptyDb());
+    const db = emptyDb();
     await bootstrapSetup(db, "secret-token", "secret-token", INPUT);
     const acc = await db.prepare(`SELECT password_hash FROM accounts`).first();
     assert.ok(acc.password_hash.startsWith("$scrypt$"));
@@ -1499,7 +1491,10 @@ describe("ログイン: 会社を指定しない（現行画面は ID と PW の
 
   test("🔴 IDが複数社に重複していたら、推測せず会社の選択を求める", async () => {
     const { db } = await seed();
-    // 既存データを直接いじって重複を作る（通常は登録時に拒否される）
+    // ⚠ 0010 の ux_accounts_login_id により、この重複は DB が受け付けない（F-10）。
+    //   ここで索引を外すのは「万一 DB 制約をすり抜けた場合でも、
+    //   login() が1件目を推測で選ばない」ことを守るため。多重防御の内側の検査。
+    await db.prepare(`DROP INDEX ux_accounts_login_id`).run();
     const t = nowUtc();
     await db.prepare(
       `INSERT INTO accounts (id,tenant_id,login_id,password_hash,password_algo,password_updated_at,status,created_at,updated_at)
@@ -1516,6 +1511,7 @@ describe("ログイン: 会社を指定しない（現行画面は ID と PW の
 
   test("重複時でも tenantId を指定すればログインできる", async () => {
     const { db } = await seed();
+    await db.prepare(`DROP INDEX ux_accounts_login_id`).run(); // 上と同じ理由
     const t = nowUtc();
     await db.prepare(
       `INSERT INTO accounts (id,tenant_id,login_id,password_hash,password_algo,password_updated_at,status,created_at,updated_at)
@@ -3384,8 +3380,6 @@ describe("F-8: セットアップが管理者の従業員レコードを作る",
 
   test("🔴 管理者にも employees 行ができる", async () => {
     const db = new ShimD1(SCHEMA) as AnyDb;
-    await db.prepare(`INSERT INTO roles (id,code,name,is_hr_line,created_at) VALUES ('r1','tenant_admin','会社管理者',1,?1)`)
-      .bind(nowUtc()).run();
     const r = await bootstrapSetup(db, "secret-token", "secret-token", SETUP);
     assert.equal(r.ok, true);
     if (!r.ok) return;
@@ -3398,8 +3392,6 @@ describe("F-8: セットアップが管理者の従業員レコードを作る",
 
   test("🔴 管理者が自分の従業員IDを引ける（これが無いと全機能が使えない）", async () => {
     const db = new ShimD1(SCHEMA) as AnyDb;
-    await db.prepare(`INSERT INTO roles (id,code,name,is_hr_line,created_at) VALUES ('r1','tenant_admin','会社管理者',1,?1)`)
-      .bind(nowUtc()).run();
     const r = await bootstrapSetup(db, "secret-token", "secret-token", SETUP);
     if (!r.ok) throw new Error("setup failed");
     // プロフィール・日報・社内フォト・ありがとうは、すべてこの関数に依存している
@@ -3410,8 +3402,6 @@ describe("F-8: セットアップが管理者の従業員レコードを作る",
   test("氏名を指定できる。空なら「管理者」になる", async () => {
     for (const [given, expected] of [["宮澤", "宮澤"], ["", "管理者"], ["   ", "管理者"]] as const) {
       const db = new ShimD1(SCHEMA) as AnyDb;
-      await db.prepare(`INSERT INTO roles (id,code,name,is_hr_line,created_at) VALUES ('r1','tenant_admin','会社管理者',1,?1)`)
-        .bind(nowUtc()).run();
       const r = await bootstrapSetup(db, "secret-token", "secret-token", { ...SETUP, adminName: given });
       if (!r.ok) throw new Error("setup failed");
       const emp = await db.prepare(`SELECT name FROM employees WHERE id = ?1`).bind(r.employeeId).first();
@@ -3421,8 +3411,6 @@ describe("F-8: セットアップが管理者の従業員レコードを作る",
 
   test("入社日が入る（勤続の算出に必要・F-1 と同じ理由）", async () => {
     const db = new ShimD1(SCHEMA) as AnyDb;
-    await db.prepare(`INSERT INTO roles (id,code,name,is_hr_line,created_at) VALUES ('r1','tenant_admin','会社管理者',1,?1)`)
-      .bind(nowUtc()).run();
     const r = await bootstrapSetup(db, "secret-token", "secret-token", SETUP);
     if (!r.ok) throw new Error("setup failed");
     const emp = await db.prepare(`SELECT hired_on FROM employees WHERE id = ?1`).bind(r.employeeId).first();
@@ -4024,5 +4012,175 @@ describe("画面: トップ表示・更新履歴・サポート（T-52）", () =
       //   src / href / import で外部を指していないことを見る
       assert.equal(/(?:src|href)\s*=\s*["']https?:\/\//.test(h), false, "外部リソースを直参照している");
     }
+  });
+});
+
+// ===============================================================
+// ログイン統合の土台（F-10 / F-11・マイグレーション 0010）
+// と 雇用形態への副店長の追加（マイグレーション 0011）
+// ===============================================================
+
+describe("スキーマ: 単一ログインの前提を DB で保証する（F-10・0010）", () => {
+  test("🔴 login_id は会社をまたいで一意（アプリ層の検査と DB 制約を一致させる）", () => {
+    const db = schemaDb();
+    const t = "2026-08-16T00:00:00Z";
+    for (const id of ["t_1", "t_2"]) {
+      db.prepare(
+        `INSERT INTO tenants (id,name,cutoff_day,timezone,status,created_at,updated_at)
+         VALUES (?,?,20,'Asia/Tokyo','active',?,?)`
+      ).run(id, id, t, t);
+    }
+    const ins = (aid: string, tid: string) =>
+      db.prepare(
+        `INSERT INTO accounts (id,tenant_id,login_id,password_hash,password_algo,password_updated_at,status,created_at,updated_at)
+         VALUES (?,?,'admin','x','argon2id',?,'active',?,?)`
+      ).run(aid, tid, t, t, t);
+
+    ins("a_1", "t_1");
+    // 会社が違っても同じ login_id は入らない。
+    // ここが通ると login() が tenant_required に落ち、単一ログイン画面が成立しなくなる。
+    assert.throws(() => ins("a_2", "t_2"), /UNIQUE|constraint/i);
+  });
+
+  test("索引 ux_accounts_login_id が存在する", () => {
+    const names = (schemaDb().prepare(
+      "select name from sqlite_master where type='index'"
+    ).all() as Array<{ name: string }>).map((r) => r.name);
+    assert.ok(names.includes("ux_accounts_login_id"));
+  });
+});
+
+describe("スキーマ: ロールの初期データ（F-11・0010）", () => {
+  function roles(): Array<{ id: string; code: string; is_hr_line: number }> {
+    return schemaDb().prepare("select id, code, is_hr_line from roles order by code").all() as never;
+  }
+
+  test("🔴 マイグレーションだけで roles が揃う（テストの seed に依存しない）", () => {
+    // これが無いと bootstrapSetup が accounts を作った後に中断し、
+    // アカウントだけが残る中途半端な状態になる（F-11）。
+    // 🔴 6行・ID とも実機に一致させている【実機実証 2026-08-16】。
+    //    ここが実機とずれると、テストが通るのに本番で権限が付かない状態を見逃す。
+    assert.deepEqual(
+      roles().map((r) => `${r.id}:${r.code}`),
+      [
+        "r_emp:employee",
+        "r_scc:sc_clerk",
+        "r_sci:sc_implementer",
+        "r_sys:system_admin",
+        "r_ten:tenant_admin",
+        "r_ws:worksite_manager",
+      ]
+    );
+  });
+
+  test("🔴 人事権系統は tenant_admin と worksite_manager（段階2で結果から排除する対象）", () => {
+    // 労働安全衛生規則第52条の10第2項 / 設計書 7.2
+    const hr = roles().filter((r) => r.is_hr_line === 1).map((r) => r.code);
+    assert.deepEqual(hr, ["tenant_admin", "worksite_manager"]);
+    // 実施者・事務従事者が人事権系統に入っていたら、段階2の分離が成立しない
+    for (const c of ["sc_implementer", "sc_clerk"]) {
+      assert.equal(roles().find((r) => r.code === c)?.is_hr_line, 0, `${c} が人事権系統になっている`);
+    }
+  });
+
+  test("何度適用しても増えない（INSERT OR IGNORE）", () => {
+    const db = schemaDb();
+    db.exec(readFileSync(join(MIGRATIONS_DIR, "0010_auth_integrity.sql"), "utf-8"));
+    const n = db.prepare("select count(*) as n from roles").get() as { n: number };
+    assert.equal(n.n, 6);
+  });
+});
+
+describe("スキーマ: 雇用形態に副店長を加える（0011・Session 05 §5.6）", () => {
+  function withTenant(): DatabaseSync {
+    const db = schemaDb();
+    const t = "2026-08-16T00:00:00Z";
+    db.prepare(
+      `INSERT INTO tenants (id,name,cutoff_day,timezone,status,created_at,updated_at)
+       VALUES ('t_1','A社',20,'Asia/Tokyo','active',?,?)`
+    ).run(t, t);
+    return db;
+  }
+  const insert = (db: DatabaseSync, id: string, type: string) =>
+    db.prepare(
+      `INSERT INTO employees (id,tenant_id,name,employment_type,status,created_at,updated_at)
+       VALUES (?,'t_1','山田',?,'active','2026-08-16T00:00:00Z','2026-08-16T00:00:00Z')`
+    ).run(id, type);
+
+  test("🔴 assistant_manager が保存できる", () => {
+    const db = withTenant();
+    insert(db, "e_1", "assistant_manager");
+    const r = db.prepare("select employment_type from employees where id='e_1'").get() as { employment_type: string };
+    assert.equal(r.employment_type, "assistant_manager");
+  });
+
+  test("値域は5種のまま。未知の値は DB が拒む", () => {
+    const db = withTenant();
+    for (const v of ["regular", "part_time", "cleaner", "other"]) insert(db, `e_${v}`, v);
+    assert.throws(() => insert(db, "e_x", "master2"), /CHECK|constraint/i);
+  });
+
+  test("🔴 作り直しで列が欠けていない（0002 の default_shift_type_id / 0003 の profile 2本）", () => {
+    const cols = columns(schemaDb(), "employees").map((c) => c.name);
+    for (const c of ["default_shift_type_id", "profile_text", "profile_note", "deleted_at", "photo_object_key"]) {
+      assert.ok(cols.includes(c), `列が失われている: ${c}`);
+    }
+    assert.equal(cols.length, 20);
+  });
+
+  test("🔴 子行がある状態でも適用できる（D1 の暗黙トランザクションを再現）", () => {
+    // Session 06 で実証した落とし穴:
+    //   DROP TABLE は暗黙の DELETE を伴い、子行の数だけ遅延違反カウンタが上がる。
+    //   ALTER TABLE ... RENAME ではカウンタが戻らず、全文が成功しても COMMIT だけが
+    //   FOREIGN KEY constraint failed になる。親行を INSERT し直す形でのみ通る。
+    //   このテストは、その手順が崩されたら COMMIT で落ちる。
+    const db = new DatabaseSync(":memory:");
+    for (const f of MIGRATION_FILES.filter((f) => !f.startsWith("0011"))) {
+      db.exec(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"));
+    }
+    const t = "2026-08-16T00:00:00Z";
+    db.exec(`INSERT INTO tenants (id,name,cutoff_day,timezone,status,created_at,updated_at) VALUES ('t1','A社',20,'Asia/Tokyo','active','${t}','${t}');`);
+    db.exec(`INSERT INTO employees (id,tenant_id,name,name_kana,employment_type,status,hired_on,profile_text,created_at,updated_at) VALUES ('e1','t1','山田','ヤマダ','regular','active','2020-04-01','本文','${t}','${t}');`);
+    db.exec(`INSERT INTO employees (id,tenant_id,name,employment_type,status,created_at,updated_at) VALUES ('e9','t1','佐藤','part_time','active','${t}','${t}');`);
+    db.exec(`INSERT INTO shift_types (id,tenant_id,code,name,sort_order,created_at,updated_at) VALUES ('st1','t1','1','早番',1,'${t}','${t}');`);
+    db.exec(`INSERT INTO shifts (id,tenant_id,employee_id,worked_on,shift_type_id,clock_in,clock_out,break_minutes,overtime_minutes,worked_minutes,created_at,updated_at) VALUES ('s1','t1','e1','2026-08-14','st1','09:00','18:00',60,0,480,'${t}','${t}');`);
+    db.exec(`INSERT INTO thanks (id,tenant_id,from_employee_id,to_employee_id,message,thanked_on,period_year_month,created_at,updated_at) VALUES ('th1','t1','e1','e9','ありがとう','2026-08-14','2026-08','${t}','${t}');`);
+
+    db.exec("BEGIN;");
+    db.exec(readFileSync(join(MIGRATIONS_DIR, "0011_employment_type_assistant_manager.sql"), "utf-8"));
+    db.exec("COMMIT;"); // ここが落ちるなら手順が壊れている
+
+    // 子行が生き残り、参照先が employees のままであること
+    assert.equal((db.prepare("select count(*) as n from shifts").get() as { n: number }).n, 1);
+    assert.equal((db.prepare("select count(*) as n from thanks").get() as { n: number }).n, 1);
+    assert.equal((db.prepare("pragma foreign_key_check").all() as unknown[]).length, 0);
+    const refs = (db.prepare("pragma foreign_key_list(shifts)").all() as Array<{ table: string }>).map((r) => r.table);
+    assert.ok(refs.includes("employees"), "子表の参照先が退避表に書き換わっている");
+    // 値が欠けていないこと
+    const e = db.prepare("select name_kana, hired_on, profile_text from employees where id='e1'").get() as Record<string, string>;
+    assert.deepEqual({ ...e }, { name_kana: "ヤマダ", hired_on: "2020-04-01", profile_text: "本文" });
+    // 退避表が残っていないこと
+    const left = db.prepare("select name from sqlite_master where type='table' and name like 'employees%'").all() as Array<{ name: string }>;
+    assert.deepEqual(left.map((r) => r.name), ["employees"]);
+  });
+
+  test("作り直しで索引が張り直されている", () => {
+    const names = (schemaDb().prepare(
+      "select name from sqlite_master where type='index' and tbl_name='employees'"
+    ).all() as Array<{ name: string }>).map((r) => r.name);
+    assert.ok(names.includes("idx_employees_tenant"));
+    assert.ok(names.includes("idx_employees_worksite"));
+  });
+});
+
+describe("画面: 副店長の表示（0011）", () => {
+  test("登録フォームに副店長がある。既定は社員のまま", () => {
+    const h = employeeFormPage();
+    assert.ok(h.includes('<option value="assistant_manager">副店長</option>'));
+    assert.ok(h.indexOf('value="regular"') < h.indexOf('value="assistant_manager"'), "既定が副店長になっている");
+  });
+
+  test("一覧の表示ラベルに副店長がある", () => {
+    assert.ok(employeeListPage().includes("assistant_manager:'副店長'"));
   });
 });

@@ -318,11 +318,16 @@ async function recordAttempt(db: D1Database, input: LoginInput, succeeded: boole
 
 /** 現行 su2_w_style（index2.html で実証）→ 新設計の雇用形態 */
 export const EMPLOYMENT_TYPE_BY_LEGACY: Record<string, string> = {
+  // 🔴 "1" は user2skillTemplate.php で「副店長」と確定（Session 05 §5.6）。
+  //    0001 では「マスタ②というロールであって雇用形態ではない」と解釈して除外したが、
+  //    現行画面は 1〜5 を雇用形態の選択肢として並列に並べている。
+  //    また副店長は人事権の有無と一対一で対応しないため、ロールに畳むと
+  //    段階2の is_hr_line 判定を誤らせる。雇用形態として持つ（マイグレーション 0011）。
+  "1": "assistant_manager", // 副店長
   "2": "regular", // 社員
   "3": "part_time", // アルバイト
   "4": "cleaner", // 清掃員
   "5": "other", // その他
-  // "1" (マスタ②) は雇用形態ではなくロール。account_roles 側で表現する
 };
 
 /** 現行 pd_sec1（index2.html で実証）→ 新設計の性別 */
@@ -349,7 +354,7 @@ export interface RegisterInput {
   password: string;
   /** 既定の勤務時間帯。shift_types.id（会社ごとに最大21種）。null = 未設定 */
   shiftTypeId: string | null;
-  employmentType: string; // 'regular' | 'part_time' | 'cleaner' | 'other'
+  employmentType: string; // 'assistant_manager' | 'regular' | 'part_time' | 'cleaner' | 'other'
   birthOn: CalendarDate | null;
   hiredOn: CalendarDate | null; // 🔴 勤怠評価の「勤続」に必須（未設定だと常に null になる）
   gender: string | null;

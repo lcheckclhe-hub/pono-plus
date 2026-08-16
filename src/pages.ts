@@ -652,7 +652,7 @@ export function employeeListPage(): string {
   <p class="links"><a href="/home">ホームへ戻る</a> ／ <a href="/attendance">勤怠評価</a></p>
 </div>
 <script>
-const EMPLOYMENT = { regular:'社員', part_time:'アルバイト', cleaner:'清掃員', other:'その他' };
+const EMPLOYMENT = { assistant_manager:'副店長', regular:'社員', part_time:'アルバイト', cleaner:'清掃員', other:'その他' };
 const STATUS = { active:'在籍', suspended:'休止', resigned:'退職' };
 
 function cell(text, cls) {
@@ -771,6 +771,7 @@ export function employeeFormPage(): string {
         <label for="employmentType">雇用形態 <span class="req">*</span></label>
         <select id="employmentType">
           <option value="regular">社員</option>
+          <option value="assistant_manager">副店長</option>
           <option value="part_time">アルバイト</option>
           <option value="cleaner">清掃員</option>
           <option value="other">その他</option>
