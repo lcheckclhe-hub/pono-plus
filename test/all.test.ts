@@ -4648,6 +4648,37 @@ describe("画面: スマホでの崩れにくさ", () => {
     assert.ok(/\.who\s*\{[^}]*min-width:\s*0/.test(src), "1行目が縮まない指定になっている");
   });
 
+  test("🔴 ヘッダーのボタンが共通スタイルの width:100% を継がない", () => {
+    // 実機で2度ログアウトが枠外へ出た。原因は共通の button { width: 100% }。
+    // ログイン画面の送信ボタン用の指定を、ヘッダーが継いでしまっていた。
+    const src = readFileSync(join(here, "..", "src", "pages.ts"), "utf-8");
+    assert.ok(/button\s*\{[^}]*width:\s*100%/.test(src), "前提が変わった。共通 button の指定を確認すること");
+    const m = /\.apphdr \.who button\s*\{([^}]*)\}/.exec(src);
+    assert.ok(m !== null, "ヘッダーのボタン指定が無い");
+    assert.ok(/width:\s*auto/.test(m![1]), "width:100% を打ち消していない");
+    assert.ok(/flex:\s*0\s+0\s+auto/.test(m![1]), "縮まない指定が無い");
+  });
+
+  test("🔴 指で押せる大きさがある（目安40px以上）", () => {
+    const src = readFileSync(join(here, "..", "src", "pages.ts"), "utf-8");
+    for (const [sel, re] of [
+      [".apphdr .who button", /\.apphdr \.who button\s*\{([^}]*)\}/],
+      [".hdrnav a", /\.hdrnav a\s*\{([^}]*)\}/],
+    ] as const) {
+      const m = re.exec(src);
+      assert.ok(m !== null, `${sel} の指定が無い`);
+      const h = /min-height:\s*(\d+)px/.exec(m![1]);
+      assert.ok(h !== null, `${sel} に最小の高さが無い`);
+      assert.ok(Number(h![1]) >= 40, `${sel} が ${h![1]}px。指で押すには小さい`);
+    }
+    // 狭い画面で小さくし直していないか
+    const mq = /@media \(max-width: 640px\) \{([\s\S]*?)\n  \}/.exec(src);
+    assert.ok(mq !== null);
+    for (const m2 of mq![1].matchAll(/min-height:\s*(\d+)px/g)) {
+      assert.ok(Number(m2[1]) >= 40, `狭い画面で ${m2[1]}px まで縮めている`);
+    }
+  });
+
   test("🔴 横幅を固定した表は、はみ出さないよう包まれている", () => {
     // 表を縮めると読めなくなるため、横スクロールできる要素で包む方針
     const src = readFileSync(join(here, "..", "src", "pages.ts"), "utf-8");

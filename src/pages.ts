@@ -64,26 +64,33 @@ const STYLE = `
   .hdrtop, .hdrbar { max-width: 1100px; margin: 0 auto; padding: 0 14px; }
   .hdrtop {
     display: flex; align-items: center; gap: 10px;
-    min-height: 42px; min-width: 0;
+    min-height: 52px; min-width: 0; padding-top: 6px; padding-bottom: 6px;
   }
   .brand { color: #fff; font-weight: 700; text-decoration: none; letter-spacing: .04em; flex: 0 0 auto; }
   .who { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-left: auto; min-width: 0; }
   .wid { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px; }
   .wrole { background: rgba(255,255,255,.18); padding: 3px 10px; border-radius: 999px;
            white-space: nowrap; flex: 0 0 auto; line-height: 1.4; }
-  .who button {
-    font-size: 12px; padding: 4px 10px; white-space: nowrap; flex: 0 0 auto;
-    border: 1px solid rgba(255,255,255,.5); background: transparent; color: #fff;
-    border-radius: 5px; cursor: pointer;
+  /* 🔴 共通の button は width:100% を持つ（ログイン画面の送信ボタン用）。
+     それを継ぐとログアウトが枠外へ押し出されるため、ここで必ず打ち消す。
+     ⚠ width:auto と flex:0 0 auto の両方が要る。実機で2度はみ出した原因。 */
+  .apphdr .who button {
+    width: auto !important; min-width: 0; margin: 0;
+    font-size: 13px; padding: 0 14px; min-height: 40px;
+    white-space: nowrap; flex: 0 0 auto;
+    border: 1px solid rgba(255,255,255,.55); background: transparent; color: #fff;
+    border-radius: 6px; cursor: pointer; font-weight: 600;
   }
-  .who button:hover:not(:disabled) { background: rgba(255,255,255,.15); }
-  .who button:disabled { opacity: .6; cursor: default; }
+  .apphdr .who button:hover:not(:disabled) { background: rgba(255,255,255,.15); }
+  .apphdr .who button:disabled { opacity: .6; cursor: default; }
   .hdrbar { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
   .hdrbar::-webkit-scrollbar { display: none; }
-  .hdrnav { display: flex; gap: 4px; padding-bottom: 6px; width: max-content; }
+  .hdrnav { display: flex; gap: 4px; padding-bottom: 8px; width: max-content; }
+  /* 指で押せる大きさを確保する（目安44px）。狭い画面ほど重要 */
   .hdrnav a {
-    color: #d8e3f2; text-decoration: none; font-size: 13px; padding: 5px 9px;
-    border-radius: 5px; white-space: nowrap;
+    color: #d8e3f2; text-decoration: none; font-size: 14px;
+    display: flex; align-items: center; min-height: 40px; padding: 0 14px;
+    border-radius: 6px; white-space: nowrap;
   }
   .hdrnav a:hover { background: rgba(255,255,255,.12); color: #fff; }
   .hdrnav a.on { background: #fff; color: #1f3b63; font-weight: 600; }
@@ -114,13 +121,14 @@ const STYLE = `
      ============================================================ */
   @media (max-width: 640px) {
     .hdrtop, .hdrbar { padding: 0 10px; }
-    .hdrtop { min-height: 38px; gap: 8px; }
-    .brand { font-size: 14px; }
-    .who { gap: 6px; font-size: 11px; }
-    .wid { max-width: 78px; }
-    .wrole { padding: 2px 7px; }
-    .who button { padding: 4px 9px; font-size: 11px; }
-    .hdrnav a { font-size: 12px; padding: 5px 9px; }
+    .hdrtop { min-height: 52px; gap: 8px; }
+    .brand { font-size: 15px; }
+    .who { gap: 6px; font-size: 12px; }
+    /* ⚠ ここを縮めすぎない。押せない大きさにすると使えなくなる */
+    .wid { max-width: 64px; }
+    .wrole { padding: 3px 8px; font-size: 11px; }
+    .apphdr .who button { padding: 0 12px; font-size: 13px; min-height: 40px; }
+    .hdrnav a { font-size: 14px; padding: 0 13px; min-height: 40px; }
 
     /* 本文。左右に余白が無いと端末の縁に貼り付く */
     body.hashdr > .login, body.hashdr > .wrap, body.hashdr > div:not(.apphdr) {
