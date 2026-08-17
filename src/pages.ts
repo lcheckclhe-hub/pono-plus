@@ -54,6 +54,22 @@ const STYLE = `
   }
   .note { margin-top: 18px; font-size: 12px; color: #6b7885; text-align: center; line-height: 1.7; }
   select { width: 100%; padding: 11px 12px; font-size: 16px; border: 1px solid #c8d0d8; border-radius: 6px; }
+  /* 共通ヘッダー（Session 06・G-2〜G-5） */
+  .apphdr { position: sticky; top: 0; z-index: 50; background: #1f3b63; color: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.2); }
+  .hdrin { max-width: 1100px; margin: 0 auto; display: flex; align-items: center; gap: 12px; padding: 8px 14px; flex-wrap: wrap; }
+  .brand { color: #fff; font-weight: 700; text-decoration: none; letter-spacing: .04em; }
+  .hdrnav { display: flex; gap: 4px; flex-wrap: wrap; flex: 1 1 auto; }
+  .hdrnav a { color: #d8e3f2; text-decoration: none; font-size: 13px; padding: 5px 9px; border-radius: 5px; white-space: nowrap; }
+  .hdrnav a:hover { background: rgba(255,255,255,.12); color: #fff; }
+  .hdrnav a.on { background: #fff; color: #1f3b63; font-weight: 600; }
+  .who { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .wid { font-weight: 600; }
+  .wrole { background: rgba(255,255,255,.18); padding: 2px 8px; border-radius: 999px; }
+  .who button { font-size: 12px; padding: 4px 10px; border: 1px solid rgba(255,255,255,.5); background: transparent; color: #fff; border-radius: 5px; cursor: pointer; }
+  .who button:hover:not(:disabled) { background: rgba(255,255,255,.15); }
+  .who button:disabled { opacity: .6; cursor: default; }
+  /* ヘッダーがある画面は上寄せにする（body の中央寄せを打ち消す） */
+  body.hashdr { display: block; align-items: initial; justify-content: initial; }
 `;
 
 export function loginPage(opts: { errorMessage?: string; loginId?: string } = {}): string {
@@ -174,6 +190,72 @@ const MENU: Array<{ href: string; label: string; section: Section; need: "view" 
   { href: "/support", label: "サポート", section: "support", need: "view" },
 ];
 
+/** 階層の表示名。ロールコードそのままでは意味が伝わらない */
+const ROLE_LABEL: Record<string, string> = {
+  system_admin: "システム管理者",
+  tenant_admin: "会社管理者",
+  worksite_manager: "店舗管理者",
+  employee: "スタッフ",
+  sc_implementer: "ストレスチェック実施者",
+  sc_clerk: "ストレスチェック事務従事者",
+};
+
+export function roleLabel(p: Principal): string {
+  const named = p.roleCodes.map((c) => ROLE_LABEL[c]).filter((x) => x !== undefined);
+  return named.length === 0 ? "権限なし" : named.join(" / ");
+}
+
+/**
+ * 🔴 全画面に出す共通ヘッダー（Session 06・G-2〜G-5）。
+ *
+ * これが無かったために実機で次の事故が起きた:
+ *   - 誰としてログインしているか画面から分からず、`/api/me` を直接叩くまで判明しなかった
+ *   - ログアウトが /home の最下部にしかなく、他の画面から抜けられなかった
+ *   - ログアウトの結果を見ずに /login へ飛ばしていたため、失敗しても気づけなかった
+ *
+ * ⚠ ログインIDは HTML に埋めず、/api/me から描画する。画面はキャッシュされうるため。
+ * ⚠ メニューは menuFor() で組み立てる。権限の無いリンクは【生成しない】。
+ *   style="display:none" で隠すのは不可（開発者ツールで見える・到達できる）。
+ */
+export function headerHtml(p: Principal, current: string): string {
+  const links = menuFor(p)
+    .map((m) => `<a href="${m.href}"${m.href === current ? ' class="on"' : ""}>${m.label}</a>`)
+    .join("");
+  return `<header class="apphdr">
+  <div class="hdrin">
+    <a class="brand" href="/home">PONO-PLUS</a>
+    <nav class="hdrnav">${links}</nav>
+    <div class="who">
+      <span class="wid" id="hdrid">…</span>
+      <span class="wrole">${esc(roleLabel(p))}</span>
+      <button type="button" id="hdrout">ログアウト</button>
+    </div>
+  </div>
+</header>
+<script>
+(async () => {
+  try {
+    const r = await fetch('/api/me');
+    if (r.status === 401) { location.href = '/login'; return; }
+    const me = await r.json();
+    document.getElementById('hdrid').textContent = me.loginId || me.accountId;
+  } catch (e) { document.getElementById('hdrid').textContent = '-'; }
+})();
+document.getElementById('hdrout').addEventListener('click', async () => {
+  const b = document.getElementById('hdrout');
+  b.disabled = true; b.textContent = 'ログアウト中…';
+  try {
+    const r = await fetch('/api/logout', { method: 'POST', headers: { 'Origin': location.origin } });
+    // 🔴 結果を見てから遷移する。従来は見ずに飛ばしており、失敗しても気づけなかった
+    if (!r.ok) { b.disabled = false; b.textContent = 'ログアウト（失敗）'; alert('ログアウトできませんでした。通信を確認してください。'); return; }
+  } catch (e) {
+    b.disabled = false; b.textContent = 'ログアウト（失敗）'; alert('ログアウトできませんでした。'); return;
+  }
+  location.href = '/login';
+});
+</script>`;
+}
+
 export function menuFor(p: Principal): Array<{ href: string; label: string }> {
   return MENU
     .filter((m) => (m.need === "edit" ? canEdit(p, m.section) : canView(p, m.section)))
@@ -217,7 +299,8 @@ export function homePage(p: Principal): string {
   .editlink a { color: #2f6fbf; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/home")}
 <div class="login">
   <h1>PONO-PLUS</h1>
   <div class="box">
@@ -227,14 +310,11 @@ export function homePage(p: Principal): string {
       ${canEdit(p, "notice") ? '<p class="editlink" id="noticeedit" style="display:none"><a href="/notices/edit">トップ表示を編集する</a></p>' : ""}
     </div>
     <table id="me"><tbody><tr><td colspan="2">読み込み中…</td></tr></tbody></table>
-    <nav class="nav">
-      ${menuFor(p).map((m) => `<a href="${m.href}">${m.label}</a>`).join("\n      ")}
-    </nav>
+
     <div class="notice" style="margin-top:20px">
       <h2>更新履歴</h2>
       <ul class="acts" id="acts"><li>読み込み中…</li></ul>
     </div>
-    <div class="logout"><button id="out">ログアウト</button></div>
   </div>
   <p class="note">段階1（基盤・認証・シフト・勤怠評価）まで実装済み</p>
 </div>
@@ -248,10 +328,6 @@ export function homePage(p: Principal): string {
     '<tr><th>会社ID</th><td>' + (me.tenantId || '-') + '</td></tr>' +
     '<tr><th>権限</th><td>' + me.roles.join(', ') + '</td></tr>';
 })();
-document.getElementById('out').addEventListener('click', async () => {
-  await fetch('/api/logout', { method: 'POST', headers: { 'Origin': location.origin } });
-  location.href = '/login';
-});
 
 // --- トップ表示（区分1）---
 (async () => {
@@ -379,7 +455,7 @@ export function parseClockOut(input: string): string {
   return `${hh}:${mm}`;
 }
 
-export function shiftSheetPage(): string {
+export function shiftSheetPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -408,7 +484,8 @@ export function shiftSheetPage(): string {
   .msg.ok { color: #1c7a3e; } .msg.ng { color: #a32020; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/shifts")}
 <div class="login">
   <h1>シフト登録/修正</h1>
   <div class="box">
@@ -628,7 +705,7 @@ const ADMIN_STYLE = `
         padding: 10px 12px; border-radius: 6px; font-size: 14px; margin-bottom: 16px; }
 `;
 
-export function employeeListPage(): string {
+export function employeeListPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -638,7 +715,8 @@ export function employeeListPage(): string {
 <title>従業員一覧 | PONO-PLUS</title>
 <style>${STYLE}${ADMIN_STYLE}</style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/employees")}
 <div class="login">
   <h1>従業員一覧</h1>
   <div class="box">
@@ -756,7 +834,7 @@ load();
 }
 
 /** 登録と修正を1つの画面で兼ねる。employeeId があれば修正モード */
-export function employeeFormPage(): string {
+export function employeeFormPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -768,7 +846,8 @@ export function employeeFormPage(): string {
   .login { max-width: 620px; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/employees")}
 <div class="login">
   <h1 id="title">従業員登録</h1>
   <div class="box">
@@ -981,7 +1060,8 @@ export function attendancePage(p: Principal): string {
              padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-top: 18px; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/attendance")}
 <div class="login">
   <h1>勤怠評価</h1>
   <div class="box">
@@ -1135,7 +1215,8 @@ export function profilePage(p: Principal): string {
   .login { max-width: 620px; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/profile")}
 <div class="login">
   <h1>プロフィール</h1>
   <div class="box">
@@ -1270,7 +1351,8 @@ export function profileViewPage(p: Principal): string {
   .login { max-width: 620px; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/profile")}
 <div class="login">
   <h1 id="title">プロフィール詳細</h1>
   <div class="box">
@@ -1334,7 +1416,7 @@ load();
  *   ・年間集計テーブルを持たず、一覧で合算する
  *   ・締め日の扱いを階層で分けない（現行はマスタ②に分岐が無かった）
  */
-export function reportListPage(): string {
+export function reportListPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1351,7 +1433,8 @@ export function reportListPage(): string {
   .kpi .u { font-size: 12px; font-weight: 400; color: #6b7885; margin-left: 2px; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/reports")}
 <div class="login">
   <h1>店舗情報（月次）</h1>
   <div class="box">
@@ -1447,7 +1530,7 @@ load();
 </html>`;
 }
 
-export function reportFormPage(): string {
+export function reportFormPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1463,7 +1546,8 @@ export function reportFormPage(): string {
          padding: 12px 14px; font-size: 13px; color: #46535f; margin-top: 18px; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/reports")}
 <div class="login">
   <h1 id="title">月次の登録</h1>
   <div class="box">
@@ -1595,7 +1679,8 @@ export function dailyReportListPage(p: Principal): string {
 <title>業務日報 | PONO-PLUS</title>
 <style>${STYLE}${ADMIN_STYLE}</style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/daily-reports")}
 <div class="login">
   <h1>業務日報</h1>
   <div class="box">
@@ -1681,7 +1766,7 @@ load();
 </html>`;
 }
 
-export function dailyReportFormPage(): string {
+export function dailyReportFormPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1700,7 +1785,8 @@ export function dailyReportFormPage(): string {
   .photo { max-width: 100%; border-radius: 8px; border: 1px solid #c8d0d8; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/daily-reports")}
 <div class="login">
   <h1 id="title">業務日報 登録</h1>
   <div class="box">
@@ -1872,7 +1958,7 @@ init();
 }
 
 /** 日報カテゴリの管理。現行マスタ①の「業務日報 > マスターデータ」に相当 */
-export function reportCategoryPage(): string {
+export function reportCategoryPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1884,7 +1970,8 @@ export function reportCategoryPage(): string {
   .login { max-width: 620px; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/daily-reports")}
 <div class="login">
   <h1>日報カテゴリ（マスターデータ）</h1>
   <div class="box">
@@ -2011,7 +2098,7 @@ const PHOTO_GRID_STYLE = `
   .preview img { max-width: 100%; border-radius: 8px; border: 1px solid #c8d0d8; margin-top: 10px; }
 `;
 
-export function photoListPage(): string {
+export function photoListPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -2021,7 +2108,8 @@ export function photoListPage(): string {
 <title>社内フォト共有 | PONO-PLUS</title>
 <style>${STYLE}${ADMIN_STYLE}${PHOTO_GRID_STYLE}</style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/photos")}
 <div class="login">
   <h1>社内フォト共有</h1>
   <div class="box">
@@ -2100,7 +2188,7 @@ load();
 </html>`;
 }
 
-export function photoNewPage(): string {
+export function photoNewPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -2114,7 +2202,8 @@ export function photoNewPage(): string {
     border: 1px solid #c8d0d8; border-radius: 6px; background: #fff; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/photos")}
 <div class="login">
   <h1>写真を投稿</h1>
   <div class="box">
@@ -2209,7 +2298,7 @@ const THANKS_STYLE = `
   tr.me { background: #f2f6fb; }
 `;
 
-export function thanksListPage(): string {
+export function thanksListPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -2221,7 +2310,8 @@ export function thanksListPage(): string {
   .login { max-width: 620px; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/thanks")}
 <div class="login">
   <h1>ありがとう情報</h1>
   <div class="box">
@@ -2286,7 +2376,7 @@ load();
 </html>`;
 }
 
-export function thanksNewPage(): string {
+export function thanksNewPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -2302,7 +2392,8 @@ export function thanksNewPage(): string {
     border: 1px solid #c8d0d8; border-radius: 6px; min-height: 100px; font-family: inherit; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/thanks")}
 <div class="login">
   <h1>ありがとうをする</h1>
   <div class="box">
@@ -2411,7 +2502,7 @@ init();
 </html>`;
 }
 
-export function thanksRankingPage(): string {
+export function thanksRankingPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -2423,7 +2514,8 @@ export function thanksRankingPage(): string {
   .login { max-width: 560px; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/thanks")}
 <div class="login">
   <h1>獲得順位</h1>
   <div class="box">
@@ -2510,7 +2602,7 @@ const SKILL_STYLE = `
   .sugg button { width: auto; padding: 4px 10px; font-size: 12px; background: #6b7885; margin-left: 6px; }
 `;
 
-export function skillSheetPage(): string {
+export function skillSheetPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -2520,7 +2612,8 @@ export function skillSheetPage(): string {
 <title>スキルシート | PONO-PLUS</title>
 <style>${STYLE}${ADMIN_STYLE}${SKILL_STYLE}</style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/skill-sheets")}
 <div class="login">
   <h1>スキルシート</h1>
   <div class="box">
@@ -2633,7 +2726,7 @@ loadEmployees().then(load);
 </html>`;
 }
 
-export function skillSheetFormPage(): string {
+export function skillSheetFormPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -2651,7 +2744,8 @@ export function skillSheetFormPage(): string {
   .chk input { width: auto; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/skill-sheets")}
 <div class="login">
   <h1>スキルシート 登録/修正</h1>
   <div class="box">
@@ -2789,7 +2883,7 @@ init();
  *   ・URL は3本固定ではなく最大5本まで行として持つ
  *   ・画像は R2 に保存し、配信は認証必須
  */
-export function noticeEditPage(): string {
+export function noticeEditPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -2811,7 +2905,8 @@ export function noticeEditPage(): string {
   .preview iframe { width: 100%; aspect-ratio: 16/9; border: 0; border-radius: 6px; margin-top: 8px; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/notices/edit")}
 <div class="login">
   <h1>トップ表示の編集</h1>
   <div class="box">
@@ -2970,7 +3065,7 @@ load();
 }
 
 /** サポート（区分12）。⚠ 表示のみ。編集は super 管理者側とまとめて作る */
-export function supportPage(): string {
+export function supportPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -2984,7 +3079,8 @@ export function supportPage(): string {
   .vlink { display: inline-block; margin-bottom: 12px; color: #2f6fbf; word-break: break-all; }
 </style>
 </head>
-<body>
+<body class="hashdr">
+${headerHtml(p, "/support")}
 <div class="login">
   <h1>サポート</h1>
   <div class="box">

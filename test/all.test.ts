@@ -52,7 +52,7 @@ import {
   NOTICE_IMAGE_MAX, NOTICE_LINK_MAX,
 } from "../src/services.ts";
 import { worker, routes } from "../src/index.ts";
-import { menuFor, loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage, noticeEditPage, supportPage } from "../src/pages.ts";
+import { menuFor, roleLabel, headerHtml, loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage, noticeEditPage, supportPage } from "../src/pages.ts";
 import { bootstrapSetup, evaluateAttendance, ageOn, persistAttendanceSummary, getShiftSheet } from "../src/services.ts";
 import { upsertShift, summarizePeriod, ShiftServiceError, setUrgentCheck, hasUrgentCheck, periodForDate } from "../src/services.ts";
 import type { Principal } from "../src/core.ts";
@@ -1642,13 +1642,13 @@ describe("シフト入力画面（現行 shift1Template.php の列構成を踏�
   });
 
   test("🔴 B-39: 外部CDN（rawgit 等）に依存しない", () => {
-    const body = shiftSheetPage();
+    const body = shiftSheetPage(P1);
     assert.equal(/<script[^>]+src=/.test(body), false);
     assert.equal(body.includes("rawgit"), false);
   });
 
   test("画面に現行と同じ列が並ぶ", () => {
-    const body = shiftSheetPage();
+    const body = shiftSheetPage(P1);
     for (const col of ["確定", "時間帯", "フリー入力", "当日確認", "出勤", "退勤", "休憩", "残業", "実働", "当日フリー"]) {
       assert.ok(body.includes(col), `列「${col}」がある`);
     }
@@ -1693,7 +1693,7 @@ describe("退勤の表示と入力（保存は24時超え表記のまま）", ()
   });
 
   test("画面に変換関数が組み込まれている", () => {
-    const body = shiftSheetPage();
+    const body = shiftSheetPage(P1);
     assert.ok(body.includes("fmtOut"), "表示変換がある");
     assert.ok(body.includes("normTime"), "入力正規化がある");
     assert.ok(body.includes("翌"), "翌日表記を使う");
@@ -1950,38 +1950,38 @@ describe("ディスパッチャ: 従業員ルート（Session 04）", () => {
 
 describe("画面: 従業員一覧・登録（T-7）", () => {
   test("一覧に現行の項目と新設の入社日が並ぶ", () => {
-    const h = employeeListPage();
+    const h = employeeListPage(P1);
     for (const s of ["従業員番号", "氏名", "ログインID", "雇用形態", "勤務時間帯", "入社日", "状態"]) {
       assert.ok(h.includes(s), `${s} が無い`);
     }
   });
 
   test("🔴 一覧は innerHTML に値を混ぜない（B-35 の再発防止）", () => {
-    const h = employeeListPage();
+    const h = employeeListPage(P1);
     assert.ok(h.includes("textContent"));
     assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
   });
 
   test("登録画面に入社日の入力欄がある（F-1）", () => {
-    const h = employeeFormPage();
+    const h = employeeFormPage(P1);
     assert.ok(h.includes('id="hiredOn"'));
     assert.ok(h.includes("入社日"));
   });
 
   test("🔴 勤務時間帯の選択肢を A〜D で固定しない（設計書 4.5 の訂正）", () => {
-    const h = employeeFormPage();
+    const h = employeeFormPage(P1);
     assert.ok(h.includes("/api/shift-types"));
     assert.equal(/<option value="[ABCD]"/.test(h), false);
   });
 
   test("パスワードは新規登録時のみ入力させる", () => {
-    const h = employeeFormPage();
+    const h = employeeFormPage(P1);
     assert.ok(h.includes('id="newOnly"'));
     assert.ok(h.includes("メール送信はしません"));
   });
 
   test("外部CDNに依存しない（B-38/B-39）", () => {
-    for (const h of [employeeListPage(), employeeFormPage()]) {
+    for (const h of [employeeListPage(P1), employeeFormPage(P1)]) {
       assert.equal(h.includes("http://"), false);
       assert.equal(h.includes("cdn"), false);
     }
@@ -2054,11 +2054,11 @@ describe("画面: 導線（T-9）", () => {
   });
 
   test("従業員一覧から勤怠評価へ行ける", () => {
-    assert.ok(employeeListPage().includes("/attendance?employeeId="));
+    assert.ok(employeeListPage(P1).includes("/attendance?employeeId="));
   });
 
   test("各画面からホームへ戻れる", () => {
-    for (const h of [employeeListPage(), employeeFormPage(), attendancePage(P1)]) {
+    for (const h of [employeeListPage(P1), employeeFormPage(P1), attendancePage(P1)]) {
       assert.ok(h.includes('href="/home"'));
     }
   });
@@ -2334,7 +2334,7 @@ describe("画面: プロフィール（T-16）", () => {
 
   test("ホームと従業員一覧から行ける", () => {
     assert.ok(homePage(P1).includes('href="/profile"'));
-    assert.ok(employeeListPage().includes("/profile/view?employeeId="));
+    assert.ok(employeeListPage(P1).includes("/profile/view?employeeId="));
   });
 });
 
@@ -2550,32 +2550,32 @@ describe("月次レポート: 境界とディスパッチャ（T-18 / T-19）", 
 
 describe("画面: 店舗情報（T-21）", () => {
   test("現行 company1Template の項目を踏襲する", () => {
-    const h = reportFormPage();
+    const h = reportFormPage(P1);
     for (const s of ["対象月", "募集数", "採用数", "離職数", "備考"]) {
       assert.ok(h.includes(s), `${s} が無い`);
     }
   });
 
   test("「予備管理」を「備考」に改称したことが分かる", () => {
-    const h = reportFormPage();
+    const h = reportFormPage(P1);
     assert.ok(h.includes("予備管理"));
     assert.ok(h.includes("備考"));
   });
 
   test("🔴 平均勤続・平均年齢は入力欄ではなく参考表示", () => {
-    const h = reportFormPage();
+    const h = reportFormPage(P1);
     assert.ok(h.includes("/api/reports/workforce"));
     assert.ok(h.includes("保存しません"));
     assert.equal(h.includes('id="service"'), false);
   });
 
   test("一覧に年間の合算と離職率が出る", () => {
-    const h = reportListPage();
+    const h = reportListPage(P1);
     for (const s of ["募集", "採用", "離職", "離職率"]) assert.ok(h.includes(s));
   });
 
   test("innerHTML に値を混ぜない（B-35）／外部CDNに依存しない（B-38）", () => {
-    for (const h of [reportListPage(), reportFormPage()]) {
+    for (const h of [reportListPage(P1), reportFormPage(P1)]) {
       assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
       assert.equal(h.includes("http://"), false);
       assert.equal(h.includes("cdn"), false);
@@ -2878,37 +2878,37 @@ describe("日報: 境界と削除計画（T-23）", () => {
 
 describe("画面: 業務日報（T-28）", () => {
   test("現行 dreport2Template の項目を踏襲する", () => {
-    const h = dailyReportFormPage();
+    const h = dailyReportFormPage(P1);
     for (const s of ["日付", "カテゴリ", "開始", "終了", "内容", "画像"]) {
       assert.ok(h.includes(s), `${s} が無い`);
     }
   });
 
   test("🔴 外部CDNに依存しない（現行は終了済みの cdn.rawgit.com を参照していた）", () => {
-    for (const h of [dailyReportListPage(P1), dailyReportFormPage(), reportCategoryPage()]) {
+    for (const h of [dailyReportListPage(P1), dailyReportFormPage(P1), reportCategoryPage(P1)]) {
       assert.equal(h.includes("rawgit"), false);
       assert.equal(h.includes("cdn"), false);
       assert.equal(h.includes("http://"), false);
     }
     // 標準の入力欄を使う
-    assert.ok(dailyReportFormPage().includes('type="time"'));
+    assert.ok(dailyReportFormPage(P1).includes('type="time"'));
   });
 
   test("🔴 画像を公開パスではなく認証必須APIから読む", () => {
-    const h = dailyReportFormPage();
+    const h = dailyReportFormPage(P1);
     assert.ok(h.includes("/api/daily-reports/photo?reportId="));
     assert.equal(h.includes("../images/"), false);
   });
 
   test("🔴 削除は POST で行う（現行は URL クエリの id だけで消せた）", () => {
-    const h = dailyReportFormPage();
+    const h = dailyReportFormPage(P1);
     assert.ok(h.includes("/api/daily-reports/delete"));
     assert.ok(h.includes("削除します。よろしいですか?"));
     assert.equal(h.includes("dreport2delete"), false);
   });
 
   test("重複は警告として表示し、登録済みであることを伝える", () => {
-    const h = dailyReportFormPage();
+    const h = dailyReportFormPage(P1);
     assert.ok(h.includes("時間帯が重なる日報"));
     assert.ok(h.includes("登録は完了しています"));
   });
@@ -2918,11 +2918,11 @@ describe("画面: 業務日報（T-28）", () => {
   });
 
   test("カテゴリ管理画面がマスターデータであると分かる", () => {
-    assert.ok(reportCategoryPage().includes("マスターデータ"));
+    assert.ok(reportCategoryPage(P1).includes("マスターデータ"));
   });
 
   test("innerHTML に値を混ぜない（B-35）", () => {
-    for (const h of [dailyReportListPage(P1), dailyReportFormPage(), reportCategoryPage()]) {
+    for (const h of [dailyReportListPage(P1), dailyReportFormPage(P1), reportCategoryPage(P1)]) {
       assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
     }
   });
@@ -3090,7 +3090,7 @@ describe("フォト: 境界と削除計画（T-30）", () => {
 
 describe("画面: 社内フォト共有（T-33）", () => {
   test("投稿画面は画像とひと言のみ（現行の有効項目に一致）", () => {
-    const h = photoNewPage();
+    const h = photoNewPage(P1);
     assert.ok(h.includes("ひと言"));
     assert.ok(h.includes('type="file"'));
     // コメントアウトされていた②〜⑤を復活させない
@@ -3100,24 +3100,24 @@ describe("画面: 社内フォト共有（T-33）", () => {
   });
 
   test("✅ 投稿前のプレビューを踏襲する（現行の良い実装）", () => {
-    assert.ok(photoNewPage().includes("FileReader"));
-    assert.ok(photoNewPage().includes("プレビュー"));
+    assert.ok(photoNewPage(P1).includes("FileReader"));
+    assert.ok(photoNewPage(P1).includes("プレビュー"));
   });
 
   test("🔴 画像を公開パスではなく認証必須APIから読む", () => {
-    const h = photoListPage();
+    const h = photoListPage(P1);
     assert.ok(h.includes("/api/photos/photo?postId="));
     assert.equal(h.includes("../image/"), false);
   });
 
   test("削除ボタンは自分の投稿か権限がある場合だけ出す", () => {
-    const h = photoListPage();
+    const h = photoListPage(P1);
     assert.ok(h.includes("post.employeeId === own || canDeleteAny"));
     assert.ok(h.includes("この写真を削除します。よろしいですか?"));
   });
 
   test("innerHTML に値を混ぜない（B-35）／外部CDNに依存しない（B-38）", () => {
-    for (const h of [photoListPage(), photoNewPage()]) {
+    for (const h of [photoListPage(P1), photoNewPage(P1)]) {
       assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
       assert.equal(h.includes("http://"), false);
       assert.equal(h.includes("cdn"), false);
@@ -3362,31 +3362,31 @@ describe("ありがとう: 境界と削除計画（T-35）", () => {
 
 describe("画面: ありがとう情報（T-39）", () => {
   test("現行 thanks2Template の項目を踏襲する", () => {
-    const h = thanksNewPage();
+    const h = thanksNewPage(P1);
     for (const s of ["日付", "誰へ", "フリー入力"]) assert.ok(h.includes(s), `${s} が無い`);
   });
 
   test("🔴 上限を表示するだけでなく、達したら送信できなくする", () => {
-    const h = thanksNewPage();
+    const h = thanksNewPage(P1);
     assert.ok(h.includes("/api/thanks/quota"));
     assert.ok(h.includes("$('send').disabled = true"));
     assert.ok(h.includes("上限（30回）に達しています"));
   });
 
   test("🔴 宛先から自分自身を除く", () => {
-    const h = thanksNewPage();
+    const h = thanksNewPage(P1);
     assert.ok(h.includes("if (e.id === own) continue"));
     assert.ok(h.includes("自分自身には送れません"));
   });
 
   test("順位の画面が算出方法を明示する", () => {
-    const h = thanksRankingPage();
+    const h = thanksRankingPage(P1);
     assert.ok(h.includes("受け取った"));
     assert.ok(h.includes("同数は同順位"));
   });
 
   test("innerHTML に値を混ぜない（B-35）／外部CDNに依存しない（B-38）", () => {
-    for (const h of [thanksListPage(), thanksNewPage(), thanksRankingPage()]) {
+    for (const h of [thanksListPage(P1), thanksNewPage(P1), thanksRankingPage(P1)]) {
       assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
       assert.equal(h.includes("http://"), false);
       assert.equal(h.includes("cdn"), false);
@@ -3450,7 +3450,7 @@ describe("F-8: セットアップが管理者の従業員レコードを作る",
 
 describe("F-9: ファイルを選び直したらエラー表示を消す", () => {
   test("プロフィールと日報の画像欄に change ハンドラがある", () => {
-    for (const h of [profilePage(P1), dailyReportFormPage()]) {
+    for (const h of [profilePage(P1), dailyReportFormPage(P1)]) {
       assert.ok(h.includes("$('file').addEventListener('change'"), "change ハンドラが無い");
     }
   });
@@ -3676,33 +3676,33 @@ describe("スキルシート: 境界と削除計画（T-41）", () => {
 
 describe("画面: スキルシート（T-45）", () => {
   test("現行 user3skill2Template の列を踏襲する", () => {
-    const h = skillSheetPage();
+    const h = skillSheetPage(P1);
     for (const s of ["対象月", "出勤数", "遅刻数", "早退数", "当欠数", "ありがとう数", "業務内容"]) {
       assert.ok(h.includes(s), `${s} が無い`);
     }
   });
 
   test("🔴 残業数の列は管理側のときだけ出す", () => {
-    const h = skillSheetPage();
+    const h = skillSheetPage(P1);
     assert.ok(h.includes("if (d.canEdit) cols.push('残業数')"));
     assert.ok(h.includes("残業数は本人には表示されません"));
   });
 
   test("🔴 公開/非公開の切り替えがあり、既定は非公開", () => {
-    const h = skillSheetFormPage();
+    const h = skillSheetFormPage(P1);
     assert.ok(h.includes("この業務内容を本人にも表示する"));
     assert.ok(h.includes("既定は非公開"));
     assert.ok(h.includes("$('visible').checked = false"));
   });
 
   test("シフトの実績を提示し、上書きできると分かる", () => {
-    const h = skillSheetFormPage();
+    const h = skillSheetFormPage(P1);
     assert.ok(h.includes("シフトの実績"));
     assert.ok(h.includes("/api/skill-sheets/detail"));
   });
 
   test("innerHTML に値を混ぜない（B-35）／外部CDNに依存しない（B-38）", () => {
-    for (const h of [skillSheetPage(), skillSheetFormPage()]) {
+    for (const h of [skillSheetPage(P1), skillSheetFormPage(P1)]) {
       assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
       assert.equal(h.includes("http://"), false);
       assert.equal(h.includes("cdn"), false);
@@ -3710,7 +3710,7 @@ describe("画面: スキルシート（T-45）", () => {
   });
 
   test("🔴 平文パスワードを表示しない（現行 user2skillTemplate の SU2_REM1）", () => {
-    for (const h of [skillSheetPage(), skillSheetFormPage()]) {
+    for (const h of [skillSheetPage(P1), skillSheetFormPage(P1)]) {
       assert.equal(/REM1|パスワード/.test(h), false);
     }
   });
@@ -4016,13 +4016,13 @@ describe("画面: トップ表示・更新履歴・サポート（T-52）", () =
   });
 
   test("外部リンクに rel=noopener を付ける", () => {
-    for (const h of [homePage(P1), supportPage()]) {
+    for (const h of [homePage(P1), supportPage(P1)]) {
       assert.ok(h.includes("noopener"), "noopener が無い");
     }
   });
 
   test("編集画面は埋め込みコードではなくURLを求める", () => {
-    const h = noticeEditPage();
+    const h = noticeEditPage(P1);
     assert.ok(h.includes("埋め込みコードは不要です"));
     assert.ok(h.includes("YouTube か Vimeo の URL"));
     // 現行の手順書きを再現しない
@@ -4030,13 +4030,13 @@ describe("画面: トップ表示・更新履歴・サポート（T-52）", () =
   });
 
   test("画像は4枚まで・URLは追加できると分かる", () => {
-    const h = noticeEditPage();
+    const h = noticeEditPage(P1);
     assert.ok(h.includes("最大4枚"));
     assert.ok(h.includes("最大5本"));
   });
 
   test("innerHTML に値を混ぜない（B-35）／外部から読み込まない（B-38）", () => {
-    for (const h of [noticeEditPage(), supportPage()]) {
+    for (const h of [noticeEditPage(P1), supportPage(P1)]) {
       assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
       assert.equal(h.includes("cdn"), false);
       // ⚠ 説明文の中の "http://" は外部読み込みではない。
@@ -4206,13 +4206,13 @@ describe("スキーマ: 雇用形態に副店長を加える（0011・Session 05
 
 describe("画面: 副店長の表示（0011）", () => {
   test("登録フォームに副店長がある。既定は社員のまま", () => {
-    const h = employeeFormPage();
+    const h = employeeFormPage(P1);
     assert.ok(h.includes('<option value="assistant_manager">副店長</option>'));
     assert.ok(h.indexOf('value="regular"') < h.indexOf('value="assistant_manager"'), "既定が副店長になっている");
   });
 
   test("一覧の表示ラベルに副店長がある", () => {
-    assert.ok(employeeListPage().includes("assistant_manager:'副店長'"));
+    assert.ok(employeeListPage(P1).includes("assistant_manager:'副店長'"));
   });
 });
 
@@ -4475,7 +4475,7 @@ describe("画面: 権限の無い遷移先を HTML に埋めない", () => {
     if (canView(p, "profile")) { out.push(["profile", profilePage(p)], ["profileView", profileViewPage(p)]); }
     if (canView(p, "daily_report")) out.push(["dailyReportList", dailyReportListPage(p)]);
     if (canEdit(p, "shift")) out.push(["attendance", attendancePage(p)]);
-    if (canEdit(p, "account")) out.push(["employeeList", employeeListPage()]);
+    if (canEdit(p, "account")) out.push(["employeeList", employeeListPage(P1)]);
     return out;
   }
 
@@ -4514,5 +4514,85 @@ describe("画面: 権限の無い遷移先を HTML に埋めない", () => {
 
   test("②のプロフィールにも従業員一覧は出ない（区分3 は①のみ・H-1）", () => {
     assert.equal(profilePage(P(["worksite_manager"])).includes('href="/employees"'), false);
+  });
+});
+
+// ===============================================================
+// 共通ヘッダー（G-2〜G-5・Session 06）
+//
+// 🔴 実機で次の事故が起きたことへの対処:
+//    - 誰としてログインしているか画面から分からなかった
+//    - ログアウトが /home の最下部にしかなく、他の画面から抜けられなかった
+//    - ログアウトの結果を見ずに /login へ飛ばしていた
+// ===============================================================
+
+describe("画面: 共通ヘッダー", () => {
+  const P = (roles: string[]): Principal => ({ accountId: "a", tenantId: "t_1", roleCodes: roles });
+
+  /** ヘッダーを持つべき画面（ログイン画面を除く全部）*/
+  function allPages(p: Principal): Array<[string, string]> {
+    return [
+      ["home", homePage(p)], ["shiftSheet", shiftSheetPage(p)], ["employeeList", employeeListPage(p)],
+      ["employeeForm", employeeFormPage(p)], ["attendance", attendancePage(p)], ["profile", profilePage(p)],
+      ["profileView", profileViewPage(p)], ["reportList", reportListPage(p)], ["reportForm", reportFormPage(p)],
+      ["dailyReportList", dailyReportListPage(p)], ["dailyReportForm", dailyReportFormPage(p)],
+      ["reportCategory", reportCategoryPage(p)], ["photoList", photoListPage(p)], ["photoNew", photoNewPage(p)],
+      ["thanksList", thanksListPage(p)], ["thanksNew", thanksNewPage(p)], ["thanksRanking", thanksRankingPage(p)],
+      ["skillSheet", skillSheetPage(p)], ["skillSheetForm", skillSheetFormPage(p)],
+      ["noticeEdit", noticeEditPage(p)], ["support", supportPage(p)],
+    ];
+  }
+
+  test("🔴 G-3: すべての画面にログアウトがある（従来は /home だけだった）", () => {
+    const ng = allPages(P(["tenant_admin"])).filter(([, h]) => !h.includes('id="hdrout"')).map(([n]) => n);
+    assert.deepEqual(ng, [], `ログアウトの無い画面: ${ng.join(", ")}`);
+  });
+
+  test("🔴 G-2: すべての画面に現在のログインIDと権限が出る", () => {
+    for (const [name, h] of allPages(P(["tenant_admin"]))) {
+      assert.ok(h.includes('id="hdrid"'), `${name} にログインIDの表示が無い`);
+      assert.ok(h.includes("会社管理者"), `${name} に権限の表示が無い`);
+    }
+  });
+
+  test("権限の表示は階層ごとに変わる", () => {
+    assert.equal(roleLabel(P(["tenant_admin"])), "会社管理者");
+    assert.equal(roleLabel(P(["worksite_manager"])), "店舗管理者");
+    assert.equal(roleLabel(P(["employee"])), "スタッフ");
+    assert.equal(roleLabel(P(["system_admin"])), "システム管理者");
+    assert.equal(roleLabel(P([])), "権限なし");
+  });
+
+  test("🔴 G-4: ログアウトは結果を見てから遷移する（失敗を握りつぶさない）", () => {
+    const h = headerHtml(P(["employee"]), "/home");
+    assert.ok(h.includes("if (!r.ok)"), "応答を確認していない");
+    assert.ok(h.includes("catch"), "通信失敗を拾っていない");
+    // 成功したときだけ /login へ飛ぶ
+    const i = h.indexOf("if (!r.ok)");
+    const j = h.indexOf("location.href = '/login'", i);
+    assert.ok(j > i, "結果を見る前に遷移している");
+  });
+
+  test("🔴 ヘッダーのメニューも権限で出し分ける（③に従業員一覧を出さない）", () => {
+    const staff = headerHtml(P(["employee"]), "/home");
+    assert.equal(staff.includes('href="/employees"'), false);
+    assert.equal(staff.includes('href="/reports"'), false);
+    assert.ok(staff.includes('href="/daily-reports"'));
+    const admin = headerHtml(P(["tenant_admin"]), "/home");
+    assert.ok(admin.includes('href="/employees"'));
+  });
+
+  test("ログインIDを HTML に埋めない（画面はキャッシュされうる）", () => {
+    const h = headerHtml({ accountId: "acc_secret", tenantId: "t_1", roleCodes: ["employee"] }, "/home");
+    assert.equal(h.includes("acc_secret"), false, "主体の識別子が HTML に埋まっている");
+    assert.ok(h.includes("/api/me"), "/api/me から取得していない");
+  });
+
+  test("現在地が分かる", () => {
+    assert.ok(headerHtml(P(["employee"]), "/thanks").includes('href="/thanks" class="on"'));
+  });
+
+  test("ログイン画面にはヘッダーを出さない", () => {
+    assert.equal(loginPage({}).includes('id="hdrout"'), false);
   });
 });

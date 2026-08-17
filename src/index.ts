@@ -76,26 +76,26 @@ export const routes: RouteDef[] = [
   { method: "GET", path: "/", public: true, handler: async () => new Response(null, { status: 302, headers: { Location: "/login" } }) },
   { method: "GET", path: "/login", public: true, handler: async () => html(loginPage()) },
   { method: "GET", path: "/home", handler: async (_req, ctx) => html(homePage(ctx.principal)) },
-  { method: "GET", path: "/shifts", section: "shift", need: "view", handler: async () => html(shiftSheetPage()) },
-  { method: "GET", path: "/employees", section: "account", need: "edit", handler: async () => html(employeeListPage()) },
-  { method: "GET", path: "/employees/new", section: "account", need: "edit", handler: async () => html(employeeFormPage()) },
+  { method: "GET", path: "/shifts", section: "shift", need: "view", handler: async (_req, ctx) => html(shiftSheetPage(ctx.principal)) },
+  { method: "GET", path: "/employees", section: "account", need: "edit", handler: async (_req, ctx) => html(employeeListPage(ctx.principal)) },
+  { method: "GET", path: "/employees/new", section: "account", need: "edit", handler: async (_req, ctx) => html(employeeFormPage(ctx.principal)) },
   { method: "GET", path: "/attendance", section: "shift", need: "edit", handler: async (_req, ctx) => html(attendancePage(ctx.principal)) },
   { method: "GET", path: "/profile", section: "profile", need: "edit", handler: async (_req, ctx) => html(profilePage(ctx.principal)) },
   { method: "GET", path: "/profile/view", section: "profile", need: "view", handler: async (_req, ctx) => html(profileViewPage(ctx.principal)) },
-  { method: "GET", path: "/reports", section: "worksite", need: "view", handler: async () => html(reportListPage()) },
-  { method: "GET", path: "/reports/edit", section: "worksite", need: "edit", handler: async () => html(reportFormPage()) },
+  { method: "GET", path: "/reports", section: "worksite", need: "view", handler: async (_req, ctx) => html(reportListPage(ctx.principal)) },
+  { method: "GET", path: "/reports/edit", section: "worksite", need: "edit", handler: async (_req, ctx) => html(reportFormPage(ctx.principal)) },
   { method: "GET", path: "/daily-reports", section: "daily_report", need: "view", handler: async (_req, ctx) => html(dailyReportListPage(ctx.principal)) },
-  { method: "GET", path: "/daily-reports/edit", section: "daily_report", need: "edit", handler: async () => html(dailyReportFormPage()) },
-  { method: "GET", path: "/daily-reports/categories", handler: async (_req, ctx) => canEditReportCategory(ctx.principal) ? html(reportCategoryPage()) : new Response(null, { status: 302, headers: { Location: "/home" } }) },
-  { method: "GET", path: "/photos", section: "photo", need: "view", handler: async () => html(photoListPage()) },
-  { method: "GET", path: "/photos/new", section: "photo", need: "edit", handler: async () => html(photoNewPage()) },
-  { method: "GET", path: "/thanks", section: "thanks", need: "view", handler: async () => html(thanksListPage()) },
-  { method: "GET", path: "/thanks/new", section: "thanks", need: "edit", handler: async () => html(thanksNewPage()) },
-  { method: "GET", path: "/thanks/ranking", section: "thanks", need: "view", handler: async () => html(thanksRankingPage()) },
-  { method: "GET", path: "/skill-sheets", section: "skill", need: "view", handler: async () => html(skillSheetPage()) },
-  { method: "GET", path: "/skill-sheets/edit", section: "skill", need: "edit", handler: async () => html(skillSheetFormPage()) },
-  { method: "GET", path: "/notices/edit", section: "notice", need: "edit", handler: async () => html(noticeEditPage()) },
-  { method: "GET", path: "/support", section: "support", need: "view", handler: async () => html(supportPage()) },
+  { method: "GET", path: "/daily-reports/edit", section: "daily_report", need: "edit", handler: async (_req, ctx) => html(dailyReportFormPage(ctx.principal)) },
+  { method: "GET", path: "/daily-reports/categories", handler: async (_req, ctx) => canEditReportCategory(ctx.principal) ? html(reportCategoryPage(ctx.principal)) : new Response(null, { status: 302, headers: { Location: "/home" } }) },
+  { method: "GET", path: "/photos", section: "photo", need: "view", handler: async (_req, ctx) => html(photoListPage(ctx.principal)) },
+  { method: "GET", path: "/photos/new", section: "photo", need: "edit", handler: async (_req, ctx) => html(photoNewPage(ctx.principal)) },
+  { method: "GET", path: "/thanks", section: "thanks", need: "view", handler: async (_req, ctx) => html(thanksListPage(ctx.principal)) },
+  { method: "GET", path: "/thanks/new", section: "thanks", need: "edit", handler: async (_req, ctx) => html(thanksNewPage(ctx.principal)) },
+  { method: "GET", path: "/thanks/ranking", section: "thanks", need: "view", handler: async (_req, ctx) => html(thanksRankingPage(ctx.principal)) },
+  { method: "GET", path: "/skill-sheets", section: "skill", need: "view", handler: async (_req, ctx) => html(skillSheetPage(ctx.principal)) },
+  { method: "GET", path: "/skill-sheets/edit", section: "skill", need: "edit", handler: async (_req, ctx) => html(skillSheetFormPage(ctx.principal)) },
+  { method: "GET", path: "/notices/edit", section: "notice", need: "edit", handler: async (_req, ctx) => html(noticeEditPage(ctx.principal)) },
+  { method: "GET", path: "/support", section: "support", need: "view", handler: async (_req, ctx) => html(supportPage(ctx.principal)) },
   {
     // 設定の反映状況を確認できるようにする。⚠ 値そのものは絶対に返さない
     method: "GET",
@@ -114,8 +114,18 @@ export const routes: RouteDef[] = [
   {
     method: "GET",
     path: "/api/me",
-    handler: async (_req, ctx) =>
-      json({ accountId: ctx.principal.accountId, tenantId: ctx.principal.tenantId, roles: ctx.principal.roleCodes }),
+    handler: async (_req, ctx) => {
+      // 🔴 loginId を返すのは共通ヘッダーの表示用（Session 06・G-2）。
+      //   画面はキャッシュされうるため HTML には埋めず、ここから取る。
+      const row = await ctx.env.DB.prepare(`SELECT login_id FROM accounts WHERE id = ?1`)
+        .bind(ctx.principal.accountId).first<{ login_id: string }>();
+      return json({
+        accountId: ctx.principal.accountId,
+        loginId: row?.login_id ?? null,
+        tenantId: ctx.principal.tenantId,
+        roles: ctx.principal.roleCodes,
+      });
+    },
   },
   {
     // 初期セットアップ。テナントが0件のときだけ動作する
