@@ -54,21 +54,40 @@ const STYLE = `
   }
   .note { margin-top: 18px; font-size: 12px; color: #6b7885; text-align: center; line-height: 1.7; }
   select { width: 100%; padding: 11px 12px; font-size: 16px; border: 1px solid #c8d0d8; border-radius: 6px; }
-  /* 共通ヘッダー（Session 06・G-2〜G-5） */
-  .apphdr { position: sticky; top: 0; z-index: 50; background: #1f3b63; color: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.2); }
-  .hdrin { max-width: 1100px; margin: 0 auto; display: flex; align-items: center; gap: 12px; padding: 8px 14px; flex-wrap: wrap; }
+  /* 共通ヘッダー（Session 06・G-2〜G-5）
+     ⚠ 常に2行。1行目=素性とログアウト／2行目=メニュー。
+       折り返しに頼らないので、どの画面幅でも重ならない。 */
+  .apphdr {
+    position: sticky; top: 0; z-index: 50; width: 100%;
+    background: #1f3b63; color: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.2);
+  }
+  .hdrtop, .hdrbar { max-width: 1100px; margin: 0 auto; padding: 0 14px; }
+  .hdrtop {
+    display: flex; align-items: center; gap: 10px;
+    min-height: 42px; min-width: 0;
+  }
   .brand { color: #fff; font-weight: 700; text-decoration: none; letter-spacing: .04em; flex: 0 0 auto; }
-  .hdrnav { display: flex; gap: 4px; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
-  .hdrnav a { color: #d8e3f2; text-decoration: none; font-size: 13px; padding: 5px 9px; border-radius: 5px; white-space: nowrap; }
-  .hdrnav a:hover { background: rgba(255,255,255,.12); color: #fff; }
-  .hdrnav a.on { background: #fff; color: #1f3b63; font-weight: 600; }
-  .who { display: flex; align-items: center; gap: 8px; font-size: 12px; flex: 0 0 auto; }
-  .who > * { white-space: nowrap; flex: 0 0 auto; }
-  .wid { font-weight: 600; }
-  .wrole { background: rgba(255,255,255,.18); padding: 3px 10px; border-radius: 999px; line-height: 1.4; }
-  .who button { font-size: 12px; padding: 4px 10px; border: 1px solid rgba(255,255,255,.5); background: transparent; color: #fff; border-radius: 5px; cursor: pointer; }
+  .who { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-left: auto; min-width: 0; }
+  .wid { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px; }
+  .wrole { background: rgba(255,255,255,.18); padding: 3px 10px; border-radius: 999px;
+           white-space: nowrap; flex: 0 0 auto; line-height: 1.4; }
+  .who button {
+    font-size: 12px; padding: 4px 10px; white-space: nowrap; flex: 0 0 auto;
+    border: 1px solid rgba(255,255,255,.5); background: transparent; color: #fff;
+    border-radius: 5px; cursor: pointer;
+  }
   .who button:hover:not(:disabled) { background: rgba(255,255,255,.15); }
   .who button:disabled { opacity: .6; cursor: default; }
+  .hdrbar { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .hdrbar::-webkit-scrollbar { display: none; }
+  .hdrnav { display: flex; gap: 4px; padding-bottom: 6px; width: max-content; }
+  .hdrnav a {
+    color: #d8e3f2; text-decoration: none; font-size: 13px; padding: 5px 9px;
+    border-radius: 5px; white-space: nowrap;
+  }
+  .hdrnav a:hover { background: rgba(255,255,255,.12); color: #fff; }
+  .hdrnav a.on { background: #fff; color: #1f3b63; font-weight: 600; }
+
   /* 🔴 ヘッダーがある画面は上寄せにする（body の中央寄せを打ち消す）。
      ただし body の flex を外すと本文が左端に寄るため、
      ヘッダー以外の直下要素を margin:auto で中央に戻す（Session 06 実機で修正）。 */
@@ -94,25 +113,14 @@ const STYLE = `
        折り返すとヘッダーが画面の半分を占め、本文が見えなくなる。
      ============================================================ */
   @media (max-width: 640px) {
-    /* 🔴 2段組にする（Session 06 実機で修正）。
-       1段目: ブランド ＋ ログインID ＋ 権限 ＋ ログアウト
-       2段目: メニュー（横スクロール）
-       ⚠ flex-wrap: nowrap を指定するとメニューが2段目に送られず、
-         全部が1行に押し込まれてログアウトと重なる。折り返しは必ず許可する。 */
-    .hdrin { gap: 6px 8px; padding: 6px 10px; flex-wrap: wrap; }
-    .brand { font-size: 14px; flex: 0 0 auto; }
-    .hdrnav {
-      order: 3; flex: 0 0 100%; width: 100%; min-width: 0;
-      flex-wrap: nowrap; overflow-x: auto;
-      -webkit-overflow-scrolling: touch; scrollbar-width: none;
-      gap: 2px; padding-bottom: 2px; margin: 0;
-    }
-    .hdrnav::-webkit-scrollbar { display: none; }
-    .hdrnav a { font-size: 12px; padding: 5px 9px; }
-    .who { order: 2; margin-left: auto; gap: 6px; font-size: 11px; min-width: 0; }
-    .wid { max-width: 88px; overflow: hidden; text-overflow: ellipsis; }
+    .hdrtop, .hdrbar { padding: 0 10px; }
+    .hdrtop { min-height: 38px; gap: 8px; }
+    .brand { font-size: 14px; }
+    .who { gap: 6px; font-size: 11px; }
+    .wid { max-width: 78px; }
     .wrole { padding: 2px 7px; }
     .who button { padding: 4px 9px; font-size: 11px; }
+    .hdrnav a { font-size: 12px; padding: 5px 9px; }
 
     /* 本文。左右に余白が無いと端末の縁に貼り付く */
     body.hashdr > .login, body.hashdr > .wrap, body.hashdr > div:not(.apphdr) {
@@ -277,16 +285,21 @@ export function headerHtml(p: Principal, current: string): string {
   const links = menuFor(p)
     .map((m) => `<a href="${m.href}"${m.href === current ? ' class="on"' : ""}>${m.label}</a>`)
     .join("");
+  // 🔴 常に2行で組む（Session 06 実機で2度崩れたため構造を固定した）。
+  //   1行目: ブランド ＋ ログインID ＋ 権限 ＋ ログアウト
+  //   2行目: メニュー（横スクロール）
+  //   ⚠ flex の折り返しに頼ると、指定の組み合わせ次第で1行に潰れて重なる。
+  //     行を別々の要素に分けることで、画面幅に関係なく崩れなくなる。
   return `<header class="apphdr">
-  <div class="hdrin">
+  <div class="hdrtop">
     <a class="brand" href="/home">PONO-PLUS</a>
-    <nav class="hdrnav">${links}</nav>
     <div class="who">
       <span class="wid" id="hdrid">…</span>
       <span class="wrole">${esc(roleLabel(p))}</span>
       <button type="button" id="hdrout">ログアウト</button>
     </div>
   </div>
+  <div class="hdrbar"><nav class="hdrnav">${links}</nav></div>
 </header>
 <script>
 (async () => {

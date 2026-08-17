@@ -4627,28 +4627,25 @@ describe("画面: スマホでの崩れにくさ", () => {
     assert.deepEqual(ng, [], `viewport が無い画面: ${ng.join(", ")}`);
   });
 
-  test("ヘッダーに狭い画面向けの指定がある", () => {
+  test("🔴 ヘッダーは2行構造で、折り返しに依存しない", () => {
+    // 実機で2度崩れた。1度目は親が nowrap のままメニューに幅100%を指定して1行に潰れ、
+    // 2度目もログアウトがはみ出した。flex の折り返しに頼るのをやめ、
+    // 行そのものを別要素に分けた。この構造が壊れたらここで落ちる。
     const h = headerHtml(P(["tenant_admin"]), "/home");
-    void h;
+    assert.ok(h.includes('class="hdrtop"'), "1行目の要素が無い");
+    assert.ok(h.includes('class="hdrbar"'), "2行目の要素が無い");
+    // メニューは1行目に混ざっていない（混ざると幅の奪い合いになる）
+    const top = h.slice(h.indexOf('class="hdrtop"'), h.indexOf('class="hdrbar"'));
+    assert.equal(top.includes("<nav"), false, "メニューが1行目に入っている");
+    assert.ok(top.includes('id="hdrout"'), "ログアウトが1行目に無い");
+
     const src = readFileSync(join(here, "..", "src", "pages.ts"), "utf-8");
-    assert.ok(src.includes("@media (max-width: 640px)"), "狭い画面向けの指定が無い");
-
-    // 🔴 狭い画面のヘッダー指定を取り出して中身を検査する。
-    //   実機で「メニューとログアウトが重なる」崩れが起きたため、
-    //   文字列の有無ではなく【矛盾する組み合わせ】を検出する形にした。
-    const m = /@media \(max-width: 640px\) \{([\s\S]*?)\n  \}/.exec(src);
-    assert.ok(m !== null, "ヘッダーの縮小指定が無い");
-    const block = m![1];
-    assert.ok(block.includes(".hdrin"), "ヘッダー本体の指定が無い");
-    assert.ok(block.includes("overflow-x: auto"), "メニューが横スクロールにならない");
-
-    // メニューを2段目に送るなら、親は折り返しを許可していなければならない。
-    // nowrap のまま 100% を指定すると1行に押し込まれ、ログアウトと重なる。
-    const sendsToSecondRow = /\.hdrnav\s*\{[\s\S]*?(flex:\s*[01]\s+0\s+100%|width:\s*100%)/.test(block);
-    const parentWraps = /\.hdrin\s*\{[^}]*flex-wrap:\s*wrap/.test(block);
-    if (sendsToSecondRow) {
-      assert.ok(parentWraps, "メニューを2段目に送る指定があるのに、親が折り返しを許可していない");
+    assert.ok(/\.hdrbar\s*\{[^}]*overflow-x:\s*auto/.test(src), "メニューが横スクロールにならない");
+    // 縮められない要素は明示する。押し潰されて重なる原因になる
+    for (const sel of ["\\.wrole", "\\.who button"]) {
+      assert.ok(new RegExp(sel + "\\s*\\{[^}]*white-space:\\s*nowrap").test(src), `${sel} が改行しうる`);
     }
+    assert.ok(/\.who\s*\{[^}]*min-width:\s*0/.test(src), "1行目が縮まない指定になっている");
   });
 
   test("🔴 横幅を固定した表は、はみ出さないよう包まれている", () => {
