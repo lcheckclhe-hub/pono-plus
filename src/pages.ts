@@ -3236,7 +3236,8 @@ export function tenantListPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>テナント一覧 | PONO-PLUS</title>${STYLE}
+<title>テナント一覧 | PONO-PLUS</title>
+<style>${STYLE}</style>
 <style>
   .login { max-width: 1100px; padding: 20px; }
   .wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -3304,7 +3305,8 @@ export function tenantFormPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>テナント発行 | PONO-PLUS</title>${STYLE}
+<title>テナント発行 | PONO-PLUS</title>
+<style>${STYLE}</style>
 <style>
   .login { max-width: 720px; padding-top: 24px; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
@@ -3466,7 +3468,8 @@ export function adminSupportPage(p: Principal): string {
   return `<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>サポート内容の編集 | PONO-PLUS</title>${STYLE}
+<title>サポート内容の編集 | PONO-PLUS</title>
+<style>${STYLE}</style>
 <style>
   .login { max-width: 720px; padding-top: 24px; }
   textarea { width: 100%; min-height: 200px; }

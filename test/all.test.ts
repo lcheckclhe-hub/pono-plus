@@ -5077,3 +5077,96 @@ describe("super管理者: 画面", () => {
     }
   });
 });
+
+// ===============================================================
+// HTML の構造検査（Session 06 実機で検出）
+//
+// 🔴 テナント一覧・発行・サポート編集の3画面で、STYLE を <style> で
+//    包まずに置いていた。STYLE は中身だけの定数なので、CSS が
+//    本文として画面に表示されていた。テスト522件が通っていたのに
+//    見逃したため、構造そのものを検査する。
+// ===============================================================
+
+describe("画面: HTML の骨格が壊れていない", () => {
+  const P = (roles: string[]): Principal => ({ accountId: "a", tenantId: "t_1", roleCodes: roles });
+  const SYS = P(["system_admin"]);
+  const ADM = P(["tenant_admin"]);
+
+  function everyPage(): Array<[string, string]> {
+    return [
+      ["login", loginPage({})], ["home", homePage(ADM)], ["shiftSheet", shiftSheetPage(ADM)],
+      ["employeeList", employeeListPage(ADM)], ["employeeForm", employeeFormPage(ADM)],
+      ["attendance", attendancePage(ADM)], ["profile", profilePage(ADM)], ["profileView", profileViewPage(ADM)],
+      ["reportList", reportListPage(ADM)], ["reportForm", reportFormPage(ADM)],
+      ["dailyReportList", dailyReportListPage(ADM)], ["dailyReportForm", dailyReportFormPage(ADM)],
+      ["reportCategory", reportCategoryPage(ADM)], ["photoList", photoListPage(ADM)], ["photoNew", photoNewPage(ADM)],
+      ["thanksList", thanksListPage(ADM)], ["thanksNew", thanksNewPage(ADM)], ["thanksRanking", thanksRankingPage(ADM)],
+      ["skillSheet", skillSheetPage(ADM)], ["skillSheetForm", skillSheetFormPage(ADM)],
+      ["noticeEdit", noticeEditPage(ADM)], ["support", supportPage(ADM)],
+      ["tenantList", tenantListPage(SYS)], ["tenantForm", tenantFormPage(SYS)], ["adminSupport", adminSupportPage(SYS)],
+    ];
+  }
+
+  test("🔴 CSS が本文に漏れていない（<style> の外に置いていない）", () => {
+    const ng: string[] = [];
+    for (const [name, h] of everyPage()) {
+      // </head> より前の <style> をすべて取り除いた残りに CSS が現れたら漏れている
+      const head = h.slice(0, h.indexOf("</head>"));
+      const stripped = head.replace(/<style>[\s\S]*?<\/style>/g, "");
+      if (/:root\s*\{|box-sizing:|font-family:/.test(stripped)) ng.push(name);
+    }
+    assert.deepEqual(ng, [], `CSS が <style> の外にある: ${ng.join(", ")}`);
+  });
+
+  test("すべての画面が head と body を持つ", () => {
+    for (const [name, h] of everyPage()) {
+      assert.ok(h.startsWith("<!DOCTYPE html>"), `${name}: DOCTYPE が無い`);
+      for (const tag of ["<head>", "</head>", "<body", "</body>", "</html>"]) {
+        assert.ok(h.includes(tag), `${name}: ${tag} が無い`);
+      }
+      assert.ok(h.includes("<title>"), `${name}: title が無い`);
+    }
+  });
+
+  test("スタイルは head の中にだけ置く", () => {
+    for (const [name, h] of everyPage()) {
+      const bodyPart = h.slice(h.indexOf("</head>"));
+      assert.equal(bodyPart.includes("<style>"), false, `${name}: body に style がある`);
+    }
+  });
+
+  test("開いたタグを閉じている（style / head / body）", () => {
+    for (const [name, h] of everyPage()) {
+      for (const t of ["style", "head", "body", "html"]) {
+        const open = (h.match(new RegExp(`<${t}[\\s>]`, "g")) ?? []).length;
+        const close = (h.match(new RegExp(`</${t}>`, "g")) ?? []).length;
+        assert.equal(open, close, `${name}: <${t}> が ${open} 個に対し閉じが ${close} 個`);
+      }
+    }
+  });
+});
+
+describe("画面: super管理者の3画面", () => {
+  const SYS: Principal = { accountId: "a", tenantId: null, roleCodes: ["system_admin"] };
+
+  test("ヘッダーにテナント一覧とサポート編集が出る", () => {
+    const h = tenantListPage(SYS);
+    assert.ok(h.includes('href="/admin/tenants"'));
+    assert.ok(h.includes('href="/admin/support"'));
+  });
+
+  test("🔴 super管理者の画面に業務メニューが出ない（機能権限表 1.1）", () => {
+    for (const h of [tenantListPage(SYS), tenantFormPage(SYS), adminSupportPage(SYS)]) {
+      for (const p of ["/employees", "/shifts", "/daily-reports", "/photos", "/thanks", "/skill-sheets", "/reports"]) {
+        assert.equal(h.includes(`href="${p}"`), false, `業務メニュー ${p} が出ている`);
+      }
+    }
+  });
+
+  test("発行フォームに 0012 の項目が揃っている", () => {
+    const h = tenantFormPage(SYS);
+    for (const id of ["stressCheckEnabled", "maxAccounts", "fiscalStartMonth", "contactName", "managerName"]) {
+      assert.ok(h.includes(id), `${id} の入力欄が無い`);
+    }
+  });
+});
