@@ -62,14 +62,64 @@ const STYLE = `
   .hdrnav a { color: #d8e3f2; text-decoration: none; font-size: 13px; padding: 5px 9px; border-radius: 5px; white-space: nowrap; }
   .hdrnav a:hover { background: rgba(255,255,255,.12); color: #fff; }
   .hdrnav a.on { background: #fff; color: #1f3b63; font-weight: 600; }
-  .who { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .who { display: flex; align-items: center; gap: 8px; font-size: 12px; flex: 0 0 auto; }
+  .who > * { white-space: nowrap; flex: 0 0 auto; }
   .wid { font-weight: 600; }
-  .wrole { background: rgba(255,255,255,.18); padding: 2px 8px; border-radius: 999px; }
+  .wrole { background: rgba(255,255,255,.18); padding: 3px 10px; border-radius: 999px; line-height: 1.4; }
   .who button { font-size: 12px; padding: 4px 10px; border: 1px solid rgba(255,255,255,.5); background: transparent; color: #fff; border-radius: 5px; cursor: pointer; }
   .who button:hover:not(:disabled) { background: rgba(255,255,255,.15); }
   .who button:disabled { opacity: .6; cursor: default; }
-  /* ヘッダーがある画面は上寄せにする（body の中央寄せを打ち消す） */
+  /* 🔴 ヘッダーがある画面は上寄せにする（body の中央寄せを打ち消す）。
+     ただし body の flex を外すと本文が左端に寄るため、
+     ヘッダー以外の直下要素を margin:auto で中央に戻す（Session 06 実機で修正）。 */
   body.hashdr { display: block; align-items: initial; justify-content: initial; }
+  body.hashdr > .login, body.hashdr > .wrap, body.hashdr > div:not(.apphdr) {
+    margin-left: auto; margin-right: auto;
+  }
+
+  /* アコーディオン（更新履歴など） */
+  .acc > summary {
+    cursor: pointer; list-style: none; display: flex; align-items: center;
+    justify-content: space-between; gap: 8px; font-weight: 600; padding: 2px 0;
+  }
+  .acc > summary::-webkit-details-marker { display: none; }
+  .acc > summary::after { content: "＋"; font-weight: 400; opacity: .6; }
+  .acc[open] > summary::after { content: "－"; }
+  .acc > summary .cnt { margin-left: auto; margin-right: 6px; font-weight: 400; font-size: 12px; opacity: .7; }
+  .acc > summary:focus-visible { outline: 2px solid #1f3b63; outline-offset: 2px; }
+
+  /* ============================================================
+     スマホ対応（Session 06・実機で崩れを確認）
+     ⚠ 640px 以下では、ヘッダーのメニューを横スクロールにする。
+       折り返すとヘッダーが画面の半分を占め、本文が見えなくなる。
+     ============================================================ */
+  @media (max-width: 640px) {
+    .hdrin { gap: 8px; padding: 8px 10px; flex-wrap: nowrap; }
+    .brand { font-size: 14px; flex: 0 0 auto; }
+    .hdrnav {
+      order: 3; flex: 1 0 100%; flex-wrap: nowrap; overflow-x: auto;
+      -webkit-overflow-scrolling: touch; scrollbar-width: none;
+      padding-bottom: 2px; margin-top: 2px;
+    }
+    .hdrnav::-webkit-scrollbar { display: none; }
+    .hdrnav a { font-size: 12px; padding: 5px 8px; }
+    .who { margin-left: auto; gap: 6px; font-size: 11px; }
+    .wid { max-width: 90px; overflow: hidden; text-overflow: ellipsis; }
+    .wrole { padding: 2px 7px; }
+    .who button { padding: 4px 8px; font-size: 11px; }
+
+    /* 本文。左右に余白が無いと端末の縁に貼り付く */
+    body.hashdr > .login, body.hashdr > .wrap, body.hashdr > div:not(.apphdr) {
+      padding-left: 12px; padding-right: 12px;
+    }
+    /* 表は横スクロールに逃がす（縮めると読めなくなる） */
+    .wrap, .tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    table { min-width: 0; }
+  }
+  @media (max-width: 400px) {
+    .brand { font-size: 13px; }
+    .wid { max-width: 70px; }
+  }
 `;
 
 export function loginPage(opts: { errorMessage?: string; loginId?: string } = {}): string {
@@ -311,10 +361,10 @@ ${headerHtml(p, "/home")}
     </div>
     <table id="me"><tbody><tr><td colspan="2">読み込み中…</td></tr></tbody></table>
 
-    <div class="notice" style="margin-top:20px">
-      <h2>更新履歴</h2>
+    <details class="notice acc" style="margin-top:20px">
+      <summary><span>更新履歴</span><span class="cnt" id="actcnt"></span></summary>
       <ul class="acts" id="acts"><li>読み込み中…</li></ul>
-    </div>
+    </details>
   </div>
   <p class="note">段階1（基盤・認証・シフト・勤怠評価）まで実装済み</p>
 </div>
@@ -396,6 +446,8 @@ ${headerHtml(p, "/home")}
     ul.appendChild(li);
     return;
   }
+  const cnt = document.getElementById('actcnt');
+  if (cnt) cnt.textContent = d.activities.length + ' 件';
   for (const a of d.activities) {
     const li = document.createElement('li');
     const t = document.createElement('div');
@@ -477,7 +529,16 @@ export function shiftSheetPage(p: Principal): string {
   td select { width: 100px; padding: 5px; font-size: 13px; }
   .sat { background: #f0f6fd; } .sun { background: #fdf1f1; }
   .worked { font-weight: 600; }
-  .wrap { overflow-x: auto; }
+  .wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  @media (max-width: 640px) {
+    /* ⚠ シフト表は縮めると読めなくなる。横スクロールに逃がし、
+       ヘッダー行だけ固定してどの日か分かるようにする */
+    .wrap table { font-size: 12px; }
+    th, td { padding: 4px 5px; }
+    td input[type=text] { width: 56px; }
+    td textarea { width: 110px; }
+    td select { width: 88px; }
+  }
   .actions { margin-top: 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   .actions button { width: auto; padding: 11px 28px; }
   .msg { margin-top: 12px; font-size: 14px; }
@@ -1196,6 +1257,11 @@ const PROFILE_STYLE = `
              display: flex; align-items: center; justify-content: center; }
   .photorow { display: flex; gap: 16px; align-items: flex-start; margin-bottom: 20px; flex-wrap: wrap; }
   .photorow .ctl { flex: 1 1 220px; }
+  @media (max-width: 480px) {
+    .photo, .nophoto { width: 120px; height: 120px; }
+    .photorow { gap: 12px; }
+    .photorow .ctl { flex: 1 1 100%; }
+  }
   .photorow .ctl button { width: auto; padding: 9px 14px; margin-right: 8px; }
   .danger { background: #a32020; }
   textarea { width: 100%; padding: 11px 12px; font-size: 16px; box-sizing: border-box;
@@ -1426,7 +1492,8 @@ export function reportListPage(p: Principal): string {
 <title>店舗情報（月次） | PONO-PLUS</title>
 <style>${STYLE}${ADMIN_STYLE}
   .kpi { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
-  @media (max-width: 640px) { .kpi { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 640px) { .kpi { grid-template-columns: repeat(2, 1fr); gap: 8px; } }
+  @media (max-width: 380px) { .kpi { grid-template-columns: 1fr; } }
   .kpi > div { background: #f7f9fb; border: 1px solid #e4e9ee; border-radius: 8px; padding: 12px 14px; }
   .kpi .k { font-size: 12px; color: #6b7885; }
   .kpi .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
@@ -2898,6 +2965,7 @@ export function noticeEditPage(p: Principal): string {
   .linkrow { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
   @media (max-width: 560px) { .linkrow { grid-template-columns: 1fr; } }
   .thumbs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 10px; }
+  @media (max-width: 560px) { .thumbs { grid-template-columns: repeat(2, 1fr); gap: 8px; } }
   .thumbs figure { margin: 0; }
   .thumbs img { width: 100%; aspect-ratio: 1/1; object-fit: cover; border-radius: 6px;
                 border: 1px solid #c8d0d8; display: block; }

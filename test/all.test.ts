@@ -4596,3 +4596,84 @@ describe("画面: 共通ヘッダー", () => {
     assert.equal(loginPage({}).includes('id="hdrout"'), false);
   });
 });
+
+// ===============================================================
+// スマホ対応と更新履歴のアコーディオン（Session 06）
+//
+// ⚠ CSS の「見え方」はテストで確かめられない。ここで検査できるのは
+//   「崩れない作りになっているか」という構造だけである。
+//   実機での目視確認は引き続き必要（引継ぎシートに記録）。
+// ===============================================================
+
+describe("画面: スマホでの崩れにくさ", () => {
+  const P = (roles: string[]): Principal => ({ accountId: "a", tenantId: "t_1", roleCodes: roles });
+  function allPages(p: Principal): Array<[string, string]> {
+    return [
+      ["home", homePage(p)], ["shiftSheet", shiftSheetPage(p)], ["employeeList", employeeListPage(p)],
+      ["employeeForm", employeeFormPage(p)], ["attendance", attendancePage(p)], ["profile", profilePage(p)],
+      ["profileView", profileViewPage(p)], ["reportList", reportListPage(p)], ["reportForm", reportFormPage(p)],
+      ["dailyReportList", dailyReportListPage(p)], ["dailyReportForm", dailyReportFormPage(p)],
+      ["reportCategory", reportCategoryPage(p)], ["photoList", photoListPage(p)], ["photoNew", photoNewPage(p)],
+      ["thanksList", thanksListPage(p)], ["thanksNew", thanksNewPage(p)], ["thanksRanking", thanksRankingPage(p)],
+      ["skillSheet", skillSheetPage(p)], ["skillSheetForm", skillSheetFormPage(p)],
+      ["noticeEdit", noticeEditPage(p)], ["support", supportPage(p)], ["login", loginPage({})],
+    ];
+  }
+
+  test("🔴 全画面が viewport を宣言している（これが無いと拡大表示になる）", () => {
+    const ng = allPages(P(["tenant_admin"]))
+      .filter(([, h]) => !h.includes('name="viewport"') || !h.includes("width=device-width"))
+      .map(([n]) => n);
+    assert.deepEqual(ng, [], `viewport が無い画面: ${ng.join(", ")}`);
+  });
+
+  test("ヘッダーに狭い画面向けの指定がある", () => {
+    const h = headerHtml(P(["tenant_admin"]), "/home");
+    void h;
+    const src = readFileSync(join(here, "..", "src", "pages.ts"), "utf-8");
+    assert.ok(src.includes("@media (max-width: 640px)"), "狭い画面向けの指定が無い");
+    // メニューは折り返さず横スクロールに逃がす（折り返すとヘッダーが画面を占有する）
+    const i = src.indexOf("@media (max-width: 640px) {\n    .hdrin");
+    assert.ok(i > 0, "ヘッダーの縮小指定が無い");
+    const block = src.slice(i, i + 900);
+    assert.ok(block.includes("overflow-x: auto"), "メニューが横スクロールにならない");
+  });
+
+  test("🔴 横幅を固定した表は、はみ出さないよう包まれている", () => {
+    // 表を縮めると読めなくなるため、横スクロールできる要素で包む方針
+    const src = readFileSync(join(here, "..", "src", "pages.ts"), "utf-8");
+    assert.ok(src.includes(".wrap { overflow-x: auto"), "表を包む指定が無い");
+    for (const [name, h] of allPages(P(["tenant_admin"]))) {
+      if (!h.includes("<table")) continue;
+      if (name === "home") continue; // ホームの表は2列で縮んでも読める
+      assert.ok(h.includes('class="wrap"') || h.includes("tablewrap") || h.includes("<tbody>"),
+        `${name} の表が包まれていない`);
+    }
+  });
+});
+
+describe("画面: 更新履歴はアコーディオン", () => {
+  const P = (roles: string[]): Principal => ({ accountId: "a", tenantId: "t_1", roleCodes: roles });
+
+  test("🔴 details/summary で折りたたむ（既定は閉じている）", () => {
+    const h = homePage(P(["employee"]));
+    // ⚠ CSS のコメントにも「更新履歴」が出るため、summary の位置で探す
+    const i = h.indexOf("<summary><span>更新履歴");
+    assert.ok(i > 0, "summary が見つからない");
+    const before = h.slice(Math.max(0, i - 200), i);
+    assert.ok(before.includes("<details"), "details で包まれていない");
+    assert.equal(/<details[^>]*\sopen[^>]*>\s*<summary><span>更新履歴/.test(h), false, "既定で開いている");
+    assert.ok(h.includes("<summary><span>更新履歴</span>"), "summary が見出しになっていない");
+  });
+
+  test("開閉しても中身は同じ（JS ではなくブラウザの機能で畳む）", () => {
+    const h = homePage(P(["employee"]));
+    assert.ok(h.includes('id="acts"'), "一覧の入れ物が無い");
+    assert.ok(h.includes('id="actcnt"'), "件数の表示が無い");
+  });
+
+  test("件数を summary に出す（開かずに更新の有無が分かる）", () => {
+    const h = homePage(P(["employee"]));
+    assert.ok(h.includes("cnt.textContent = d.activities.length"), "件数を入れていない");
+  });
+});
