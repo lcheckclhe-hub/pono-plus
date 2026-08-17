@@ -334,9 +334,14 @@ document.getElementById('hdrout').addEventListener('click', async () => {
 }
 
 export function menuFor(p: Principal): Array<{ href: string; label: string }> {
-  return MENU
-    .filter((m) => (m.need === "edit" ? canEdit(p, m.section) : canView(p, m.section)))
-    .map((m) => ({ href: m.href, label: m.label }));
+  // 🔴 ホームは区分を持たない。誰でも戻れる場所が必要で、ブランド名のリンクだけでは
+  //    それと分からないという指摘を受けて明示した（Session 06 実機）。
+  return [
+    { href: "/home", label: "ホーム" },
+    ...MENU
+      .filter((m) => (m.need === "edit" ? canEdit(p, m.section) : canView(p, m.section)))
+      .map((m) => ({ href: m.href, label: m.label })),
+  ];
 }
 
 export function homePage(p: Principal): string {
