@@ -618,6 +618,8 @@ describe("スキーマ: 設計原則の検査（CIで守る不変条件）", () 
     //    0010: ux_accounts_login_id を追加（テーブル30 / インデックス30）
     //    0002・0003 は列の追加のみ
     //    0011 は employees の作り直し。索引2本を張り直すだけで増減しない
+    //    0012 は tenants への列追加のみ。索引は増えない
+    //         （idx_tenants_status は 0001 に既にある）
     const db = schemaDb();
     assert.equal(tableNames(db).length, 30);
     const idx = db.prepare(
@@ -4402,7 +4404,7 @@ describe("メニュー: 権限に無い区分はリンク自体を出さない",
 
   test("③に出るのは、機能権限表で③が持つ区分だけ", () => {
     assert.deepEqual(labels(["employee"]), [
-      "シフト", "プロフィール", "業務日報", "社内フォト共有",
+      "ホーム", "シフト", "プロフィール", "業務日報", "社内フォト共有",
       "ありがとう情報", "スキルシート", "サポート",
     ]);
   });
@@ -4416,13 +4418,14 @@ describe("メニュー: 権限に無い区分はリンク自体を出さない",
 
   test("①には全区分が出る", () => {
     assert.deepEqual(labels(["tenant_admin"]), [
-      "従業員一覧", "シフト", "勤怠評価", "プロフィール", "店舗情報（月次）",
+      "ホーム", "従業員一覧", "シフト", "勤怠評価", "プロフィール", "店舗情報（月次）",
       "業務日報", "社内フォト共有", "ありがとう情報", "スキルシート", "サポート",
     ]);
   });
 
   test("🔴 super管理者に業務メニューは出ない（機能権限表 1.1）", () => {
-    assert.deepEqual(labels(["system_admin"]), []);
+    // ホームだけは残る。どこにも行けない状態にはしない
+    assert.deepEqual(labels(["system_admin"]), ["ホーム"]);
   });
 
   test("ホームのHTMLに、権限の無いリンクが埋まっていない", () => {
@@ -4715,5 +4718,147 @@ describe("画面: 更新履歴はアコーディオン", () => {
   test("件数を summary に出す（開かずに更新の有無が分かる）", () => {
     const h = homePage(P(["employee"]));
     assert.ok(h.includes("cnt.textContent = d.activities.length"), "件数を入れていない");
+  });
+});
+
+describe("メニュー: ホームへ戻れる", () => {
+  const P = (roles: string[]): Principal => ({ accountId: "a", tenantId: "t_1", roleCodes: roles });
+
+  test("🔴 どの階層でもホームが先頭にある", () => {
+    for (const r of ["tenant_admin", "worksite_manager", "employee", "system_admin"]) {
+      const m = menuFor(P([r]));
+      assert.equal(m[0]?.label, "ホーム", `${r} にホームが無い`);
+      assert.equal(m[0]?.href, "/home");
+    }
+  });
+
+  test("ヘッダーにホームのリンクが出る", () => {
+    assert.ok(headerHtml(P(["employee"]), "/home").includes(">ホーム</a>"));
+  });
+});
+
+// ===============================================================
+// B-43: 現行の締め日判定は文字列比較でゼロ埋めが無く、
+//       1桁の締め日（1〜9日）で対象月を誤る
+//
+// 現行 user1Action.php dispatch1【コード実証・2026-08-16】:
+//   $thisMonthCutoff = "{$thismonth}-{$cutoffday}";   // "2026-08-5"（ゼロ埋め無し）
+//   if ($thisMonthCutoff > $today) { $day1 = 前月; }   // 文字列比較
+//
+//   締め日5日・当日 2026-08-17 のとき
+//     "2026-08-5" > "2026-08-17"  →  '5' > '1' で true
+//   実際には17日は5日を過ぎているのに【前月】と判定される。
+//   2桁の締め日（10〜31）では偶然正しく動くため、発覚しにくい。
+// ===============================================================
+
+describe("締め日: 1桁の締め日でも対象期間を誤らない（B-43）", () => {
+  test("🔴 締め日5日・8月17日は当月の期間に属する（現行は前月と誤る）", () => {
+    const r = periodForDate("2026-08-17", 5);
+    // 17日は5日を過ぎているので、期間は 8/6〜9/5 = 2026-09
+    assert.equal(r.yearMonth, "2026-09");
+    assert.equal(r.start, "2026-08-06");
+    assert.equal(r.end, "2026-09-05");
+  });
+
+  test("締め日5日・8月3日は締め日前なので当月の期間", () => {
+    const r = periodForDate("2026-08-03", 5);
+    assert.equal(r.yearMonth, "2026-08");
+    assert.equal(r.start, "2026-07-06");
+    assert.equal(r.end, "2026-08-05");
+  });
+
+  test("1桁の締め日すべてで、境界の前後が入れ替わらない", () => {
+    for (let c = 1; c <= 9; c++) {
+      const onCutoff = periodForDate(`2026-08-${String(c).padStart(2, "0")}`, c);
+      const afterCutoff = periodForDate(`2026-08-${String(c + 1).padStart(2, "0")}`, c);
+      assert.notEqual(onCutoff.yearMonth, afterCutoff.yearMonth,
+        `締め日 ${c}: 締め日当日と翌日が同じ期間になっている`);
+      // 締め日の翌日は「次の期間」でなければならない
+      assert.ok(afterCutoff.yearMonth > onCutoff.yearMonth, `締め日 ${c}: 期間が逆転している`);
+    }
+  });
+
+  test("2桁の締め日でも同じ規則で動く（現行が偶然正しかった範囲）", () => {
+    assert.equal(periodForDate("2026-08-17", 20).yearMonth, "2026-08");
+    assert.equal(periodForDate("2026-08-21", 20).yearMonth, "2026-09");
+  });
+});
+
+// ===============================================================
+// 0012: テナント発行フォームに対応する列（機能権限表 v4 §1.2）
+//
+// 🔴 現行の全列を突き合わせた結果、フォームの7項目のうち
+//    「最大登録アカウント数」「年間始月」は現行に保存先が無かった。
+//    現行データは移行しないため、要件から設計した。
+// ===============================================================
+
+describe("スキーマ: テナントの設定項目（0012）", () => {
+  function withTenant(): DatabaseSync {
+    const db = schemaDb();
+    const t = "2026-08-16T00:00:00Z";
+    db.prepare(
+      `INSERT INTO tenants (id,name,cutoff_day,timezone,status,created_at,updated_at)
+       VALUES ('t_1','A社',20,'Asia/Tokyo','active',?,?)`
+    ).run(t, t);
+    return db;
+  }
+
+  test("追加した5列が存在する", () => {
+    const cols = columns(schemaDb(), "tenants").map((c) => c.name);
+    for (const c of ["stress_check_enabled", "contact_name", "manager_name", "max_accounts", "fiscal_start_month"]) {
+      assert.ok(cols.includes(c), `列が無い: ${c}`);
+    }
+  });
+
+  test("🔴 ストレスチェックは既定で無効（要配慮個人情報を扱うため）", () => {
+    const db = withTenant();
+    const r = db.prepare("select stress_check_enabled from tenants where id='t_1'").get() as { stress_check_enabled: number };
+    assert.equal(r.stress_check_enabled, 0, "明示的な有効化なしに使える状態になっている");
+  });
+
+  test("ストレスチェックは有効化できる", () => {
+    const db = withTenant();
+    db.prepare("update tenants set stress_check_enabled = 1 where id='t_1'").run();
+    const r = db.prepare("select stress_check_enabled from tenants where id='t_1'").get() as { stress_check_enabled: number };
+    assert.equal(r.stress_check_enabled, 1);
+  });
+
+  test("最大登録アカウント数と年間始月は未指定を許す", () => {
+    const db = withTenant();
+    const r = db.prepare("select max_accounts, fiscal_start_month from tenants where id='t_1'").get() as Record<string, unknown>;
+    assert.equal(r.max_accounts, null, "NULL = プランに従う");
+    assert.equal(r.fiscal_start_month, null);
+  });
+
+  test("連絡先と年度の区切りを保存できる", () => {
+    const db = withTenant();
+    db.prepare(
+      `update tenants set contact_name='山田', manager_name='佐藤', max_accounts=50, fiscal_start_month=4 where id='t_1'`
+    ).run();
+    const r = db.prepare(
+      "select contact_name, manager_name, max_accounts, fiscal_start_month from tenants where id='t_1'"
+    ).get() as Record<string, unknown>;
+    assert.deepEqual({ ...r }, { contact_name: "山田", manager_name: "佐藤", max_accounts: 50, fiscal_start_month: 4 });
+  });
+
+  test("🔴 表示/非表示は列を足さず status で表す", () => {
+    // 現行の su1_flg1 は【パスワードのメール送信フラグ】であり
+    // 表示/非表示ではなかった（adminupdateAction.php で実証）。
+    // 対応する列が現行に無い以上、新設せず既存の status を使う。
+    const cols = columns(schemaDb(), "tenants").map((c) => c.name);
+    assert.equal(cols.includes("is_visible"), false);
+    assert.equal(cols.includes("display_flag"), false);
+    const db = withTenant();
+    for (const st of ["suspended", "terminated", "active"]) {
+      db.prepare("update tenants set status = ?1 where id='t_1'").run(st);
+    }
+    assert.throws(() => db.prepare("update tenants set status='hidden' where id='t_1'").run(), /CHECK|constraint/i);
+  });
+
+  test("プラン単位の上限は残す（テナント個別が優先）", () => {
+    // 段階1は plans.max_employees で設計したが、現行の発行画面は
+    // テナントごとの直接指定だった（機能権限表 §1.2①）。両方を持つ。
+    const cols = columns(schemaDb(), "plans").map((c) => c.name);
+    assert.ok(cols.includes("max_employees"));
   });
 });
