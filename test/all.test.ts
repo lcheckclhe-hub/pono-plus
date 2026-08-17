@@ -52,7 +52,7 @@ import {
   NOTICE_IMAGE_MAX, NOTICE_LINK_MAX,
 } from "../src/services.ts";
 import { worker, routes } from "../src/index.ts";
-import { menuFor, roleLabel, headerHtml, loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage, noticeEditPage, supportPage } from "../src/pages.ts";
+import { tenantListPage, tenantFormPage, adminSupportPage, menuFor, roleLabel, headerHtml, loginPage, shiftSheetPage, formatClockOut, parseClockOut, employeeListPage, employeeFormPage, attendancePage, homePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage, noticeEditPage, supportPage } from "../src/pages.ts";
 import { bootstrapSetup, evaluateAttendance, ageOn, persistAttendanceSummary, getShiftSheet } from "../src/services.ts";
 import { upsertShift, summarizePeriod, ShiftServiceError, setUrgentCheck, hasUrgentCheck, periodForDate } from "../src/services.ts";
 import type { Principal } from "../src/core.ts";
@@ -130,6 +130,24 @@ export class ShimD1 {
 
   prepare(sql: string): ShimStatement {
     return new ShimStatement(this.raw, sql);
+  }
+
+  /**
+   * 🔴 D1 の batch() は暗黙のトランザクションになる（Session 06 で追加）。
+   *    これが無いと、実機では動くのにテストだけ 500 で落ちる。
+   *    複数表への書き込みを一括で行う処理（テナント発行など）が該当する。
+   */
+  async batch(stmts: ShimStatement[]): Promise<Array<{ success: boolean }>> {
+    this.raw.exec("BEGIN;");
+    try {
+      const out: Array<{ success: boolean }> = [];
+      for (const st of stmts) { await st.run(); out.push({ success: true }); }
+      this.raw.exec("COMMIT;");
+      return out;
+    } catch (e) {
+      this.raw.exec("ROLLBACK;");
+      throw e;
+    }
   }
 }
 
@@ -618,6 +636,8 @@ describe("スキーマ: 設計原則の検査（CIで守る不変条件）", () 
     //    0010: ux_accounts_login_id を追加（テーブル30 / インデックス30）
     //    0002・0003 は列の追加のみ
     //    0011 は employees の作り直し。索引2本を張り直すだけで増減しない
+    //    0012 は tenants への列追加のみ。索引は増えない
+    //         （idx_tenants_status は 0001 に既にある）
     const db = schemaDb();
     assert.equal(tableNames(db).length, 30);
     const idx = db.prepare(
@@ -921,7 +941,7 @@ describe("ディスパッチャ: 認証の一元化（B-5/B-29・設計書 4.2/5
 
   test("🔴 業務画面はすべて区分を宣言している（宣言漏れを機械的に防ぐ）", () => {
     const undeclared = routes
-      .filter((r) => r.public !== true && r.section === undefined)
+      .filter((r) => r.public !== true && r.section === undefined && r.sysadmin !== true)
       .map((r) => `${r.method} ${r.path}`)
       .sort();
     // 区分に紐づかないのは、権限に依らず全員が使うものだけ
@@ -4422,8 +4442,11 @@ describe("メニュー: 権限に無い区分はリンク自体を出さない",
   });
 
   test("🔴 super管理者に業務メニューは出ない（機能権限表 1.1）", () => {
-    // ホームだけは残る。どこにも行けない状態にはしない
-    assert.deepEqual(labels(["system_admin"]), ["ホーム"]);
+    // 🔴 業務区分は1つも出さない。弊社側の機能だけを出す（機能権限表 1.1）
+    assert.deepEqual(labels(["system_admin"]), ["ホーム", "テナント一覧", "サポート編集"]);
+    for (const l of ["従業員一覧", "シフト", "業務日報", "店舗情報（月次）", "スキルシート"]) {
+      assert.equal(labels(["system_admin"]).includes(l), false, `${l} が出ている`);
+    }
   });
 
   test("ホームのHTMLに、権限の無いリンクが埋まっていない", () => {
@@ -4732,5 +4755,325 @@ describe("メニュー: ホームへ戻れる", () => {
 
   test("ヘッダーにホームのリンクが出る", () => {
     assert.ok(headerHtml(P(["employee"]), "/home").includes(">ホーム</a>"));
+  });
+});
+
+// ===============================================================
+// B-43: 現行の締め日判定は文字列比較でゼロ埋めが無く、
+//       1桁の締め日（1〜9日）で対象月を誤る
+//
+// 現行 user1Action.php dispatch1【コード実証・2026-08-16】:
+//   $thisMonthCutoff = "{$thismonth}-{$cutoffday}";   // "2026-08-5"（ゼロ埋め無し）
+//   if ($thisMonthCutoff > $today) { $day1 = 前月; }   // 文字列比較
+//
+//   締め日5日・当日 2026-08-17 のとき
+//     "2026-08-5" > "2026-08-17"  →  '5' > '1' で true
+//   実際には17日は5日を過ぎているのに【前月】と判定される。
+//   2桁の締め日（10〜31）では偶然正しく動くため、発覚しにくい。
+// ===============================================================
+
+describe("締め日: 1桁の締め日でも対象期間を誤らない（B-43）", () => {
+  test("🔴 締め日5日・8月17日は当月の期間に属する（現行は前月と誤る）", () => {
+    const r = periodForDate("2026-08-17", 5);
+    // 17日は5日を過ぎているので、期間は 8/6〜9/5 = 2026-09
+    assert.equal(r.yearMonth, "2026-09");
+    assert.equal(r.start, "2026-08-06");
+    assert.equal(r.end, "2026-09-05");
+  });
+
+  test("締め日5日・8月3日は締め日前なので当月の期間", () => {
+    const r = periodForDate("2026-08-03", 5);
+    assert.equal(r.yearMonth, "2026-08");
+    assert.equal(r.start, "2026-07-06");
+    assert.equal(r.end, "2026-08-05");
+  });
+
+  test("1桁の締め日すべてで、境界の前後が入れ替わらない", () => {
+    for (let c = 1; c <= 9; c++) {
+      const onCutoff = periodForDate(`2026-08-${String(c).padStart(2, "0")}`, c);
+      const afterCutoff = periodForDate(`2026-08-${String(c + 1).padStart(2, "0")}`, c);
+      assert.notEqual(onCutoff.yearMonth, afterCutoff.yearMonth,
+        `締め日 ${c}: 締め日当日と翌日が同じ期間になっている`);
+      // 締め日の翌日は「次の期間」でなければならない
+      assert.ok(afterCutoff.yearMonth > onCutoff.yearMonth, `締め日 ${c}: 期間が逆転している`);
+    }
+  });
+
+  test("2桁の締め日でも同じ規則で動く（現行が偶然正しかった範囲）", () => {
+    assert.equal(periodForDate("2026-08-17", 20).yearMonth, "2026-08");
+    assert.equal(periodForDate("2026-08-21", 20).yearMonth, "2026-09");
+  });
+});
+
+// ===============================================================
+// 0012: テナント発行フォームに対応する列（機能権限表 v4 §1.2）
+//
+// 🔴 現行の全列を突き合わせた結果、フォームの7項目のうち
+//    「最大登録アカウント数」「年間始月」は現行に保存先が無かった。
+//    現行データは移行しないため、要件から設計した。
+// ===============================================================
+
+describe("スキーマ: テナントの設定項目（0012）", () => {
+  function withTenant(): DatabaseSync {
+    const db = schemaDb();
+    const t = "2026-08-16T00:00:00Z";
+    db.prepare(
+      `INSERT INTO tenants (id,name,cutoff_day,timezone,status,created_at,updated_at)
+       VALUES ('t_1','A社',20,'Asia/Tokyo','active',?,?)`
+    ).run(t, t);
+    return db;
+  }
+
+  test("追加した5列が存在する", () => {
+    const cols = columns(schemaDb(), "tenants").map((c) => c.name);
+    for (const c of ["stress_check_enabled", "contact_name", "manager_name", "max_accounts", "fiscal_start_month"]) {
+      assert.ok(cols.includes(c), `列が無い: ${c}`);
+    }
+  });
+
+  test("🔴 ストレスチェックは既定で無効（要配慮個人情報を扱うため）", () => {
+    const db = withTenant();
+    const r = db.prepare("select stress_check_enabled from tenants where id='t_1'").get() as { stress_check_enabled: number };
+    assert.equal(r.stress_check_enabled, 0, "明示的な有効化なしに使える状態になっている");
+  });
+
+  test("ストレスチェックは有効化できる", () => {
+    const db = withTenant();
+    db.prepare("update tenants set stress_check_enabled = 1 where id='t_1'").run();
+    const r = db.prepare("select stress_check_enabled from tenants where id='t_1'").get() as { stress_check_enabled: number };
+    assert.equal(r.stress_check_enabled, 1);
+  });
+
+  test("最大登録アカウント数と年間始月は未指定を許す", () => {
+    const db = withTenant();
+    const r = db.prepare("select max_accounts, fiscal_start_month from tenants where id='t_1'").get() as Record<string, unknown>;
+    assert.equal(r.max_accounts, null, "NULL = プランに従う");
+    assert.equal(r.fiscal_start_month, null);
+  });
+
+  test("連絡先と年度の区切りを保存できる", () => {
+    const db = withTenant();
+    db.prepare(
+      `update tenants set contact_name='山田', manager_name='佐藤', max_accounts=50, fiscal_start_month=4 where id='t_1'`
+    ).run();
+    const r = db.prepare(
+      "select contact_name, manager_name, max_accounts, fiscal_start_month from tenants where id='t_1'"
+    ).get() as Record<string, unknown>;
+    assert.deepEqual({ ...r }, { contact_name: "山田", manager_name: "佐藤", max_accounts: 50, fiscal_start_month: 4 });
+  });
+
+  test("🔴 表示/非表示は列を足さず status で表す", () => {
+    // 現行の su1_flg1 は【パスワードのメール送信フラグ】であり
+    // 表示/非表示ではなかった（adminupdateAction.php で実証）。
+    // 対応する列が現行に無い以上、新設せず既存の status を使う。
+    const cols = columns(schemaDb(), "tenants").map((c) => c.name);
+    assert.equal(cols.includes("is_visible"), false);
+    assert.equal(cols.includes("display_flag"), false);
+    const db = withTenant();
+    for (const st of ["suspended", "terminated", "active"]) {
+      db.prepare("update tenants set status = ?1 where id='t_1'").run(st);
+    }
+    assert.throws(() => db.prepare("update tenants set status='hidden' where id='t_1'").run(), /CHECK|constraint/i);
+  });
+
+  test("プラン単位の上限は残す（テナント個別が優先）", () => {
+    // 段階1は plans.max_employees で設計したが、現行の発行画面は
+    // テナントごとの直接指定だった（機能権限表 §1.2①）。両方を持つ。
+    const cols = columns(schemaDb(), "plans").map((c) => c.name);
+    assert.ok(cols.includes("max_employees"));
+  });
+});
+
+// ===============================================================
+// super管理者の画面（機能権限表 1.1・Session 06）
+//
+// 🔴 super管理者は【弊社】。テナントの発行・一覧・サポート編集だけを行い、
+//    業務機能を一切持たない。逆に、テナント側の誰もここへ入れない。
+// ===============================================================
+
+describe("super管理者: テナント管理", () => {
+  async function asRole(db: AnyDb, roleId: string): Promise<string> {
+    await db.prepare(`UPDATE account_roles SET role_id = ?1 WHERE account_id = 'acc_1'`).bind(roleId).run();
+    const r = await login(db, { loginId: "admin1", password: "Pono-Plus-2026!", tenantId: "t_1", ip: null, userAgent: null });
+    assert.equal(r.ok, true);
+    if (!r.ok) throw new Error("login failed");
+    return `pp_session=${r.token}`;
+  }
+  const call = (db: AnyDb, r2: ShimR2, method: string, path: string, cookie: string, body?: unknown) =>
+    worker.fetch(
+      new Request(`https://app.example.com${path}`, {
+        method,
+        // ⚠ checkCsrf は Origin と Host を突き合わせる。Host が無いと 403 になる
+        headers: { Cookie: cookie, Origin: "https://app.example.com", Host: "app.example.com", "Content-Type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }),
+      { DB: db, PHOTOS: r2 } as never,
+      execCtx
+    );
+
+  test("🔴 ①②③はテナント管理に一切触れない", async () => {
+    const { db, r2 } = await seed();
+    for (const role of ["r_ten", "r_ws", "r_emp"]) {
+      const c = await asRole(db, role);
+      assert.equal((await call(db, r2, "GET", "/api/admin/tenants", c)).status, 403, `${role} が一覧を取れる`);
+      assert.equal((await call(db, r2, "POST", "/api/admin/support", c, {})).status, 403, `${role} がサポートを書ける`);
+      const page = await call(db, r2, "GET", "/admin/tenants", c);
+      assert.equal(page.status, 302, `${role} に画面が開く`);
+      assert.equal(page.headers.get("Location"), "/home");
+    }
+  });
+
+  test("未ログインでは開かない", async () => {
+    const { db, r2 } = await seed();
+    const res = await worker.fetch(req("GET", "/admin/tenants"), { DB: db, PHOTOS: r2 } as never, execCtx);
+    assert.equal(res.status, 401);
+  });
+
+  test("super管理者は一覧を取得できる", async () => {
+    const { db, r2 } = await seed();
+    const c = await asRole(db, "r_sys");
+    const res = await call(db, r2, "GET", "/api/admin/tenants", c);
+    assert.equal(res.status, 200);
+    const d = (await res.json()) as { tenants: Array<{ id: string; name: string; accountCount: number }> };
+    assert.ok(d.tenants.length >= 1, "1件も返らない");
+    const t1 = d.tenants.find((x) => x.id === "t_1");
+    assert.ok(t1 !== undefined, "seed のテナントが一覧に出ていない");
+    assert.ok(t1.accountCount >= 1, "アカウント数が出ていない");
+  });
+
+  test("🔴 テナントを発行すると、管理者・従業員・店舗・勤務時間帯が揃う", async () => {
+    const { db, r2 } = await seed();
+    const c = await asRole(db, "r_sys");
+    const res = await call(db, r2, "POST", "/api/admin/tenants", c, {
+      id: null, name: "B社", status: "active", cutoffDay: 25,
+      stressCheckEnabled: true, maxAccounts: 30, fiscalStartMonth: 4,
+      contactName: "山田", managerName: "佐藤",
+      adminLoginId: "bsha-admin", adminPassword: "Pono-Plus-2026-B!", adminName: "B管理者",
+    });
+    assert.equal(res.status, 200);
+    const { tenantId } = (await res.json()) as { tenantId: string };
+
+    const t = await db.prepare(`SELECT name, stress_check_enabled, max_accounts, fiscal_start_month, contact_name FROM tenants WHERE id=?1`).bind(tenantId).first();
+    assert.equal(t?.name, "B社");
+    assert.equal(t?.stress_check_enabled, 1);
+    assert.equal(t?.max_accounts, 30);
+    assert.equal(t?.fiscal_start_month, 4);
+    assert.equal(t?.contact_name, "山田");
+
+    // 🔴 F-8: 管理者にも employees が要る。無いとプロフィール等が全部使えない
+    const emp = await db.prepare(`SELECT COUNT(*) AS n FROM employees WHERE tenant_id=?1`).bind(tenantId).first();
+    assert.equal(emp?.n, 1, "管理者の従業員レコードが無い");
+    const ws = await db.prepare(`SELECT COUNT(*) AS n FROM worksites WHERE tenant_id=?1`).bind(tenantId).first();
+    assert.equal(ws?.n, 1, "店舗が無い");
+    const st = await db.prepare(`SELECT COUNT(*) AS n FROM shift_types WHERE tenant_id=?1`).bind(tenantId).first();
+    assert.equal(st?.n, 4, "勤務時間帯の初期値が無い");
+    // 🔴 権限が付いていないと、発行したのにログインしても何もできない（F-11 と同じ穴）
+    const ar = await db.prepare(
+      `SELECT r.code AS code FROM account_roles ar JOIN accounts a ON a.id=ar.account_id
+       JOIN roles r ON r.id=ar.role_id WHERE a.tenant_id=?1`
+    ).bind(tenantId).first();
+    assert.equal(ar?.code, "tenant_admin");
+  });
+
+  test("🔴 発行時のログインIDは全社で重複できない（F-10 と同じ規則）", async () => {
+    const { db, r2 } = await seed();
+    const c = await asRole(db, "r_sys");
+    const res = await call(db, r2, "POST", "/api/admin/tenants", c, {
+      id: null, name: "C社", status: "active", cutoffDay: 20,
+      stressCheckEnabled: false, maxAccounts: null, fiscalStartMonth: null,
+      contactName: null, managerName: null,
+      adminLoginId: "admin1", adminPassword: "Pono-Plus-2026-C!",
+    });
+    assert.equal(res.status, 400);
+    const d = (await res.json()) as { issues: Array<{ field: string; code: string }> };
+    assert.deepEqual(d.issues, [{ field: "adminLoginId", code: "duplicated" }]);
+  });
+
+  test("🔴 初期パスワードは12文字以上（現行は制限が無く平文で送っていた・B-45）", async () => {
+    const { db, r2 } = await seed();
+    const c = await asRole(db, "r_sys");
+    const res = await call(db, r2, "POST", "/api/admin/tenants", c, {
+      id: null, name: "D社", status: "active", cutoffDay: 20,
+      stressCheckEnabled: false, maxAccounts: null, fiscalStartMonth: null,
+      contactName: null, managerName: null,
+      adminLoginId: "dsha-admin", adminPassword: "short",
+    });
+    assert.equal(res.status, 400);
+    const d = (await res.json()) as { issues: Array<{ field: string; code: string }> };
+    assert.ok(d.issues.some((i) => i.field === "adminPassword" && i.code === "too_short"));
+  });
+
+  test("値域の検査（締日・年間始月・状態・上限）", async () => {
+    const { db, r2 } = await seed();
+    const c = await asRole(db, "r_sys");
+    const base = {
+      id: null as string | null, name: "E社", status: "active", cutoffDay: 20,
+      stressCheckEnabled: false, maxAccounts: null as number | null, fiscalStartMonth: null as number | null,
+      contactName: null, managerName: null,
+      adminLoginId: "esha-admin", adminPassword: "Pono-Plus-2026-E!",
+    };
+    for (const [patch, field] of [
+      [{ cutoffDay: 32 }, "cutoffDay"],
+      [{ fiscalStartMonth: 13 }, "fiscalStartMonth"],
+      [{ status: "hidden" }, "status"],
+      [{ maxAccounts: 0 }, "maxAccounts"],
+      [{ name: "  " }, "name"],
+    ] as const) {
+      const res = await call(db, r2, "POST", "/api/admin/tenants", c, { ...base, ...patch });
+      assert.equal(res.status, 400, `${field} が通ってしまう`);
+      const d = (await res.json()) as { issues: Array<{ field: string }> };
+      assert.ok(d.issues.some((i) => i.field === field), `${field} の指摘が無い`);
+    }
+  });
+
+  test("既存テナントの更新では管理者を作らない", async () => {
+    const { db, r2 } = await seed();
+    const c = await asRole(db, "r_sys");
+    const before = await db.prepare(`SELECT COUNT(*) AS n FROM accounts`).first();
+    const res = await call(db, r2, "POST", "/api/admin/tenants", c, {
+      id: "t_1", name: "A社（改）", status: "suspended", cutoffDay: 15,
+      stressCheckEnabled: true, maxAccounts: 10, fiscalStartMonth: 7,
+      contactName: "田中", managerName: null,
+    });
+    assert.equal(res.status, 200);
+    const after = await db.prepare(`SELECT COUNT(*) AS n FROM accounts`).first();
+    assert.equal(after?.n, before?.n, "更新なのにアカウントが増えている");
+    const t = await db.prepare(`SELECT name, status, stress_check_enabled FROM tenants WHERE id='t_1'`).first();
+    assert.equal(t?.name, "A社（改）");
+    assert.equal(t?.status, "suspended");
+    assert.equal(t?.stress_check_enabled, 1);
+  });
+});
+
+describe("super管理者: 画面", () => {
+  const P = (roles: string[]): Principal => ({ accountId: "a", tenantId: null, roleCodes: roles });
+
+  test("🔴 業務画面へのリンクを1つも出さない（機能権限表 1.1）", () => {
+    for (const h of [tenantListPage(P(["system_admin"])), tenantFormPage(P(["system_admin"])), adminSupportPage(P(["system_admin"]))]) {
+      for (const path of ["/employees", "/shifts", "/daily-reports", "/reports", "/photos", "/thanks", "/skill-sheets", "/attendance"]) {
+        assert.equal(h.includes(`href="${path}"`), false, `業務画面へのリンクがある: ${path}`);
+      }
+    }
+  });
+
+  test("ヘッダーにテナント一覧とサポート編集が出る", () => {
+    const h = headerHtml(P(["system_admin"]), "/admin/tenants");
+    assert.ok(h.includes('href="/admin/tenants"'));
+    assert.ok(h.includes('href="/admin/support"'));
+    assert.ok(h.includes("システム管理者"));
+  });
+
+  test("🔴 発行フォームでストレスチェックの既定は無効", () => {
+    const h = tenantFormPage(P(["system_admin"]));
+    const i = h.indexOf('<select id="sc">');
+    const block = h.slice(i, i + 200);
+    assert.ok(block.indexOf('value="0"') < block.indexOf('value="1"'), "既定が有効になっている");
+  });
+
+  test("innerHTML に値を混ぜない（B-35）／外部から読み込まない（B-38）", () => {
+    for (const h of [tenantListPage(P(["system_admin"])), tenantFormPage(P(["system_admin"])), adminSupportPage(P(["system_admin"]))]) {
+      assert.equal(/innerHTML\s*=\s*[^;]*\+/.test(h), false);
+      assert.equal(/(?:src|href)\s*=\s*["']https?:\/\//.test(h), false, "外部リソースを直参照している");
+    }
   });
 });

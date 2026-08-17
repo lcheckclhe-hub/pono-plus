@@ -3504,3 +3504,209 @@ export async function getSupportContent(
     .first<{ video_url: string | null; body: string | null }>();
   return { videoUrl: r?.video_url ?? null, body: r?.body ?? null };
 }
+
+// ===============================================================
+// super管理者のテナント管理（機能権限表 1.1「アカウント情報：一覧／発行／サポート」）
+//
+// 🔴 super管理者は【弊社】であり、業務機能を一切持たない。
+//    テナントの発行・一覧・サポート内容の編集だけを行う。
+//
+// ⚠ 現行の adminupdateAction.php を踏襲しない。次の欠陥を持ち込まない:
+//    B-44 パスワードにソルトが無い（固定文字列で挟んだ二重 SHA-256）
+//    B-45 平文パスワードを保存し、メールで送信している
+//    ID とパスワードをまとめて重複判定していた
+//      （他人と同じパスワードだと登録できず、パスワードの存在が漏れる）
+// ===============================================================
+
+export interface TenantSummary {
+  id: string;
+  name: string;
+  status: string;
+  cutoffDay: number;
+  stressCheckEnabled: boolean;
+  maxAccounts: number | null;
+  fiscalStartMonth: number | null;
+  contactName: string | null;
+  managerName: string | null;
+  accountCount: number;
+  createdAt: string;
+}
+
+export async function listTenants(db: D1Database): Promise<TenantSummary[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT t.id, t.name, t.status, t.cutoff_day, t.stress_check_enabled,
+              t.max_accounts, t.fiscal_start_month, t.contact_name, t.manager_name, t.created_at,
+              (SELECT COUNT(*) FROM accounts a WHERE a.tenant_id = t.id) AS account_count
+         FROM tenants t
+        WHERE t.deleted_at IS NULL
+        ORDER BY t.created_at DESC`
+    )
+    .all<Record<string, never>>();
+  return (results ?? []).map((r: Record<string, unknown>) => ({
+    id: String(r.id),
+    name: String(r.name),
+    status: String(r.status),
+    cutoffDay: Number(r.cutoff_day),
+    stressCheckEnabled: Number(r.stress_check_enabled) === 1,
+    maxAccounts: r.max_accounts === null ? null : Number(r.max_accounts),
+    fiscalStartMonth: r.fiscal_start_month === null ? null : Number(r.fiscal_start_month),
+    contactName: r.contact_name === null ? null : String(r.contact_name),
+    managerName: r.manager_name === null ? null : String(r.manager_name),
+    accountCount: Number(r.account_count),
+    createdAt: String(r.created_at),
+  }));
+}
+
+export async function getTenantDetail(db: D1Database, tenantId: string): Promise<TenantSummary | null> {
+  const all = await listTenants(db);
+  return all.find((t) => t.id === tenantId) ?? null;
+}
+
+export interface TenantInput {
+  id: string | null;
+  name: string;
+  status: string;
+  cutoffDay: number;
+  stressCheckEnabled: boolean;
+  maxAccounts: number | null;
+  fiscalStartMonth: number | null;
+  contactName: string | null;
+  managerName: string | null;
+  /** 新規発行時のみ。初期の会社管理者アカウント */
+  adminLoginId?: string;
+  adminPassword?: string;
+  adminName?: string;
+  adminEmail?: string | null;
+  worksiteName?: string | null;
+}
+
+export type TenantSaveResult =
+  | { ok: true; tenantId: string }
+  | { ok: false; issues: Array<{ field: string; code: string }> };
+
+/**
+ * テナントの発行と更新。新規のときは初期の会社管理者を同時に作る。
+ *
+ * ⚠ 現行は pl_su1 / tb_m_company / tb_m_line の3テーブルへトランザクションなしで
+ *   書き込んでおり、途中で失敗すると不整合が残っていた。
+ *   D1 は batch() が暗黙のトランザクションになるため、まとめて実行する。
+ */
+export async function upsertTenant(db: D1Database, input: TenantInput): Promise<TenantSaveResult> {
+  const issues: Array<{ field: string; code: string }> = [];
+  const name = input.name.trim();
+  if (name === "") issues.push({ field: "name", code: "required" });
+  if (!Number.isInteger(input.cutoffDay) || input.cutoffDay < 1 || input.cutoffDay > 31) {
+    issues.push({ field: "cutoffDay", code: "range" });
+  }
+  if (!["active", "suspended", "terminated"].includes(input.status)) {
+    issues.push({ field: "status", code: "invalid" });
+  }
+  if (input.maxAccounts !== null && (!Number.isInteger(input.maxAccounts) || input.maxAccounts < 1)) {
+    issues.push({ field: "maxAccounts", code: "range" });
+  }
+  if (
+    input.fiscalStartMonth !== null &&
+    (!Number.isInteger(input.fiscalStartMonth) || input.fiscalStartMonth < 1 || input.fiscalStartMonth > 12)
+  ) {
+    issues.push({ field: "fiscalStartMonth", code: "range" });
+  }
+
+  const isNew = input.id === null;
+  if (isNew) {
+    const loginId = (input.adminLoginId ?? "").trim();
+    if (loginId === "") issues.push({ field: "adminLoginId", code: "required" });
+    // 🔴 12文字以上。現行は制限が無く、平文で保存・送信していた（B-45）
+    if ((input.adminPassword ?? "").length < 12) issues.push({ field: "adminPassword", code: "too_short" });
+    if (loginId !== "") {
+      // 🔴 ログインIDだけで重複を見る。現行はIDとパスワードをまとめて判定しており、
+      //    他人と同じパスワードだと登録できなかった（パスワードの存在が漏れる）。
+      const dup = await db.prepare(`SELECT id FROM accounts WHERE login_id = ?1`).bind(loginId).first<{ id: string }>();
+      if (dup !== null) issues.push({ field: "adminLoginId", code: "duplicated" });
+    }
+  }
+  if (issues.length > 0) return { ok: false, issues };
+
+  const t = nowUtc();
+  if (!isNew) {
+    await db
+      .prepare(
+        `UPDATE tenants SET name=?2, status=?3, cutoff_day=?4, stress_check_enabled=?5,
+                max_accounts=?6, fiscal_start_month=?7, contact_name=?8, manager_name=?9, updated_at=?10
+          WHERE id=?1 AND deleted_at IS NULL`
+      )
+      .bind(
+        input.id, name, input.status, input.cutoffDay, input.stressCheckEnabled ? 1 : 0,
+        input.maxAccounts, input.fiscalStartMonth, input.contactName, input.managerName, t
+      )
+      .run();
+    return { ok: true, tenantId: input.id as string };
+  }
+
+  const tenantId = crypto.randomUUID();
+  const accountId = crypto.randomUUID();
+  const employeeId = crypto.randomUUID();
+  const worksiteId = crypto.randomUUID();
+  const { hash } = await hashPassword(input.adminPassword as string);
+  const adminName = (input.adminName ?? "").trim() === "" ? "管理者" : (input.adminName as string).trim();
+  const role = await db.prepare(`SELECT id FROM roles WHERE code = 'tenant_admin'`).first<{ id: string }>();
+  if (role === null) return { ok: false, issues: [{ field: "role", code: "missing" }] };
+
+  const stmts = [
+    db.prepare(
+      `INSERT INTO tenants (id,name,cutoff_day,timezone,status,stress_check_enabled,max_accounts,
+                            fiscal_start_month,contact_name,manager_name,created_at,updated_at)
+       VALUES (?1,?2,?3,'Asia/Tokyo',?4,?5,?6,?7,?8,?9,?10,?10)`
+    ).bind(tenantId, name, input.cutoffDay, input.status, input.stressCheckEnabled ? 1 : 0,
+           input.maxAccounts, input.fiscalStartMonth, input.contactName, input.managerName, t),
+    db.prepare(
+      `INSERT INTO worksites (id,tenant_id,name,is_primary,created_at,updated_at) VALUES (?1,?2,?3,1,?4,?4)`
+    ).bind(worksiteId, tenantId, (input.worksiteName ?? "").trim() === "" ? name : (input.worksiteName as string).trim(), t),
+    db.prepare(
+      `INSERT INTO accounts (id,tenant_id,login_id,email,password_hash,password_algo,password_updated_at,status,created_at,updated_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,'active',?7,?7)`
+    ).bind(accountId, tenantId, (input.adminLoginId as string).trim(), input.adminEmail ?? null, hash, ALGO_LABEL, t),
+    db.prepare(
+      `INSERT INTO account_roles (id,account_id,role_id,scope_type,scope_id,granted_at) VALUES (?1,?2,?3,'tenant',?4,?5)`
+    ).bind(crypto.randomUUID(), accountId, role.id, tenantId, t),
+    // 🔴 F-8: 管理者にも従業員レコードを作る。無いと getOwnEmployeeId() が null を返し、
+    //    プロフィール・業務日報・社内フォト・ありがとうがすべて使えない。
+    db.prepare(
+      `INSERT INTO employees (id,tenant_id,worksite_id,account_id,name,employment_type,status,hired_on,created_at,updated_at)
+       VALUES (?1,?2,?3,?4,?5,'regular','active',?6,?7,?7)`
+    ).bind(employeeId, tenantId, worksiteId, accountId, adminName, toJstCalendarDate(t), t),
+  ];
+  // 勤務時間帯の初期値（現行 tb_m_cate1 相当。会社ごとに変更できる）
+  for (const [i, nm] of ["早番", "日勤", "遅番", "夜勤"].entries()) {
+    stmts.push(
+      db.prepare(
+        `INSERT INTO shift_types (id,tenant_id,code,name,sort_order,is_active,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,1,?6,?6)`
+      ).bind(crypto.randomUUID(), tenantId, String(i + 1), nm, i + 1, t)
+    );
+  }
+  await db.batch(stmts);
+  return { ok: true, tenantId };
+}
+
+/** サポート内容の保存。1件のみ保持する */
+export async function upsertSupportContent(
+  db: D1Database,
+  videoUrl: string | null,
+  body: string | null
+): Promise<void> {
+  const t = nowUtc();
+  const cur = await db.prepare(`SELECT id FROM support_contents LIMIT 1`).first<{ id: string }>();
+  if (cur === null) {
+    await db
+      .prepare(`INSERT INTO support_contents (id,video_url,body,created_at,updated_at) VALUES (?1,?2,?3,?4,?4)`)
+      .bind(crypto.randomUUID(), videoUrl, body, t)
+      .run();
+  } else {
+    await db
+      .prepare(`UPDATE support_contents SET video_url=?2, body=?3, updated_at=?4 WHERE id=?1`)
+      .bind(cur.id, videoUrl, body, t)
+      .run();
+  }
+}
+

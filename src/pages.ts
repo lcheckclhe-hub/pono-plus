@@ -11,7 +11,7 @@
  *   会社の入力欄は現行どおり設けない。ログインIDから特定する
  */
 
-import { canView, canEdit, canEditReportCategory } from "./core.ts";
+import { canView, canEdit, canEditReportCategory, isSystemAdmin } from "./core.ts";
 import type { Principal, Section } from "./core.ts";
 
 function esc(s: string): string {
@@ -336,6 +336,16 @@ document.getElementById('hdrout').addEventListener('click', async () => {
 export function menuFor(p: Principal): Array<{ href: string; label: string }> {
   // 🔴 ホームは区分を持たない。誰でも戻れる場所が必要で、ブランド名のリンクだけでは
   //    それと分からないという指摘を受けて明示した（Session 06 実機）。
+  //
+  // 🔴 super管理者は業務区分を1つも持たない（機能権限表 1.1）。
+  //    弊社側の機能だけを出し、業務メニューは1つも出さない。
+  if (isSystemAdmin(p)) {
+    return [
+      { href: "/home", label: "ホーム" },
+      { href: "/admin/tenants", label: "テナント一覧" },
+      { href: "/admin/support", label: "サポート編集" },
+    ];
+  }
   return [
     { href: "/home", label: "ホーム" },
     ...MENU
@@ -3213,4 +3223,292 @@ ${headerHtml(p, "/support")}
 </script>
 </body>
 </html>`;
+}
+
+// ===============================================================
+// super管理者の画面（機能権限表 1.1）
+//
+// 🔴 super管理者は【弊社】。テナントの発行・一覧・サポート内容の編集だけを行い、
+//    業務機能を一切持たない。メニューも業務区分を出さない。
+// ===============================================================
+
+export function tenantListPage(p: Principal): string {
+  return `<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>テナント一覧 | PONO-PLUS</title>${STYLE}
+<style>
+  .login { max-width: 1100px; padding: 20px; }
+  .wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+  .b-on { background: #e6f4ea; color: #1e7e34; }
+  .b-off { background: #eceff1; color: #607d8b; }
+  .b-sus { background: #fff4e5; color: #a35b00; }
+  .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; }
+</style>
+</head>
+<body class="hashdr">
+${headerHtml(p, "/admin/tenants")}
+<div class="login">
+  <h1>テナント一覧</h1>
+  <div class="box">
+    <div class="toolbar">
+      <span id="cnt">読み込み中…</span>
+      <a class="btn" href="/admin/tenants/edit">新規発行</a>
+    </div>
+    <div class="wrap">
+      <table><thead><tr>
+        <th>会社名</th><th>状態</th><th>締日</th><th>年間始月</th>
+        <th>ストレスチェック</th><th>アカウント</th><th>担当者</th><th></th>
+      </tr></thead><tbody id="rows"><tr><td colspan="8">読み込み中…</td></tr></tbody></table>
+    </div>
+  </div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s);
+const STATUS = { active: ['稼働中','b-on'], suspended: ['停止中','b-sus'], terminated: ['解約','b-off'] };
+function cell(t) { const td = document.createElement('td'); td.textContent = t; return td; }
+async function init() {
+  const res = await fetch('/api/admin/tenants');
+  const tb = $('rows'); tb.textContent = '';
+  if (res.status === 403) { const tr = document.createElement('tr'); const td = cell('この画面を見る権限がありません'); td.colSpan = 8; tr.appendChild(td); tb.appendChild(tr); return; }
+  const d = await res.json();
+  $('cnt').textContent = d.tenants.length + ' 件';
+  if (d.tenants.length === 0) { const tr = document.createElement('tr'); const td = cell('まだ1件もありません'); td.colSpan = 8; tr.appendChild(td); tb.appendChild(tr); return; }
+  for (const t of d.tenants) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell(esc(t.name)));
+    const st = document.createElement('td'); const sp = document.createElement('span');
+    const s = STATUS[t.status] || [t.status, 'b-off'];
+    sp.className = 'badge ' + s[1]; sp.textContent = s[0]; st.appendChild(sp); tr.appendChild(st);
+    tr.appendChild(cell(t.cutoffDay + ' 日'));
+    tr.appendChild(cell(t.fiscalStartMonth == null ? '-' : t.fiscalStartMonth + ' 月'));
+    const sc = document.createElement('td'); const sp2 = document.createElement('span');
+    sp2.className = 'badge ' + (t.stressCheckEnabled ? 'b-on' : 'b-off');
+    sp2.textContent = t.stressCheckEnabled ? '有効' : '無効'; sc.appendChild(sp2); tr.appendChild(sc);
+    tr.appendChild(cell(t.accountCount + (t.maxAccounts == null ? '' : ' / ' + t.maxAccounts)));
+    tr.appendChild(cell(esc(t.contactName) || '-'));
+    const act = document.createElement('td'); const a = document.createElement('a');
+    a.href = '/admin/tenants/edit?id=' + encodeURIComponent(t.id); a.textContent = '修正';
+    act.appendChild(a); tr.appendChild(act);
+    tb.appendChild(tr);
+  }
+}
+init();
+</script>
+</body></html>`;
+}
+
+export function tenantFormPage(p: Principal): string {
+  return `<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>テナント発行 | PONO-PLUS</title>${STYLE}
+<style>
+  .login { max-width: 720px; padding-top: 24px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  .sec { margin-top: 20px; padding-top: 16px; border-top: 1px solid #e3e8ee; }
+  .sec h2 { font-size: 15px; margin: 0 0 4px; }
+  .note { font-size: 12px; color: #667; margin: 0 0 12px; }
+</style>
+</head>
+<body class="hashdr">
+${headerHtml(p, "/admin/tenants")}
+<div class="login">
+  <h1 id="ttl">テナント発行</h1>
+  <div class="box">
+    <div class="error" id="err" style="display:none"></div>
+    <div class="ok" id="ok" style="display:none"></div>
+
+    <label for="name">会社名 <span class="req">*</span></label>
+    <input id="name" type="text" maxlength="100">
+
+    <div class="grid">
+      <div><label for="contact">担当者名</label><input id="contact" type="text" maxlength="60"></div>
+      <div><label for="manager">責任者名</label><input id="manager" type="text" maxlength="60"></div>
+    </div>
+
+    <div class="grid">
+      <div>
+        <label for="cutoff">締日 <span class="req">*</span></label>
+        <input id="cutoff" type="number" min="1" max="31" value="20">
+        <p class="hint">1〜31。月の区切りとなる日</p>
+      </div>
+      <div>
+        <label for="fiscal">年間始月</label>
+        <input id="fiscal" type="number" min="1" max="12">
+        <p class="hint">会社ごとの年度の区切り。未入力可</p>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div>
+        <label for="status">状態</label>
+        <select id="status">
+          <option value="active">稼働中</option>
+          <option value="suspended">停止中</option>
+          <option value="terminated">解約</option>
+        </select>
+      </div>
+      <div>
+        <label for="maxacc">最大登録アカウント数</label>
+        <input id="maxacc" type="number" min="1">
+        <p class="hint">未入力ならプランに従う</p>
+      </div>
+    </div>
+
+    <label for="sc">ストレスチェック</label>
+    <select id="sc">
+      <option value="0">無効</option>
+      <option value="1">有効</option>
+    </select>
+    <p class="hint">🔴 要配慮個人情報を扱う機能。既定は無効</p>
+
+    <div class="sec" id="newonly">
+      <h2>初期の会社管理者</h2>
+      <p class="note">発行時に1つだけ作ります。以後のアカウント追加は会社側で行います。</p>
+      <label for="wsname">店名</label>
+      <input id="wsname" type="text" maxlength="100">
+      <p class="hint">未入力なら会社名と同じにします</p>
+      <div class="grid">
+        <div><label for="lid">ログインID <span class="req">*</span></label><input id="lid" type="text" maxlength="60">
+          <p class="hint">全社で重複できません</p></div>
+        <div><label for="aname">氏名</label><input id="aname" type="text" maxlength="60"></div>
+      </div>
+      <label for="amail">メールアドレス</label>
+      <input id="amail" type="email" maxlength="120">
+      <label for="apw">初期パスワード <span class="req">*</span></label>
+      <input id="apw" type="text" maxlength="128">
+      <p class="hint">12文字以上。控えて本人に直接伝えてください（メール送信はしません）</p>
+    </div>
+
+    <button id="save">保存</button>
+  </div>
+  <p class="links"><a href="/admin/tenants">テナント一覧へ戻る</a> ／ <a href="/home">ホーム</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const show = (el, t) => { el.textContent = t; el.style.display = 'block'; };
+const hide = (el) => { el.style.display = 'none'; };
+const params = new URLSearchParams(location.search);
+const id = params.get('id');
+const isEdit = id !== null && id !== '';
+const LABEL = { name: '会社名', cutoffDay: '締日', status: '状態', maxAccounts: '最大登録アカウント数',
+  fiscalStartMonth: '年間始月', adminLoginId: 'ログインID', adminPassword: '初期パスワード', role: 'ロール' };
+const CODE = { required: 'を入力してください', range: 'の値が範囲外です', invalid: 'が不正です',
+  duplicated: 'は既に使われています', too_short: 'は12文字以上にしてください', missing: 'の初期データがありません' };
+
+async function init() {
+  if (!isEdit) return;
+  $('ttl').textContent = 'テナント修正';
+  $('newonly').style.display = 'none';
+  const res = await fetch('/api/admin/tenants/detail?id=' + encodeURIComponent(id));
+  if (!res.ok) { show($('err'), '読み込めませんでした'); return; }
+  const d = await res.json();
+  const t = d.tenant;
+  $('name').value = t.name || '';
+  $('contact').value = t.contactName || '';
+  $('manager').value = t.managerName || '';
+  $('cutoff').value = t.cutoffDay;
+  $('fiscal').value = t.fiscalStartMonth == null ? '' : t.fiscalStartMonth;
+  $('status').value = t.status;
+  $('maxacc').value = t.maxAccounts == null ? '' : t.maxAccounts;
+  $('sc').value = t.stressCheckEnabled ? '1' : '0';
+}
+
+$('save').addEventListener('click', async () => {
+  hide($('err')); hide($('ok'));
+  const num = (v) => v === '' ? null : Number(v);
+  const body = {
+    id: isEdit ? id : null,
+    name: $('name').value,
+    status: $('status').value,
+    cutoffDay: Number($('cutoff').value),
+    stressCheckEnabled: $('sc').value === '1',
+    maxAccounts: num($('maxacc').value),
+    fiscalStartMonth: num($('fiscal').value),
+    contactName: $('contact').value || null,
+    managerName: $('manager').value || null,
+  };
+  if (!isEdit) {
+    body.worksiteName = $('wsname').value || null;
+    body.adminLoginId = $('lid').value;
+    body.adminPassword = $('apw').value;
+    body.adminName = $('aname').value || null;
+    body.adminEmail = $('amail').value || null;
+  }
+  const res = await fetch('/api/admin/tenants', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify(body)
+  });
+  if (res.ok) {
+    if (isEdit) { show($('ok'), '保存しました'); }
+    else { location.href = '/admin/tenants'; }
+    return;
+  }
+  const d = await res.json().catch(() => ({}));
+  if (d.issues) {
+    show($('err'), d.issues.map((i) => (LABEL[i.field] || i.field) + (CODE[i.code] || 'が不正です')).join(' / '));
+  } else if (res.status === 403) {
+    show($('err'), 'この操作を行う権限がありません');
+  } else {
+    show($('err'), '保存できませんでした');
+  }
+});
+init();
+</script>
+</body></html>`;
+}
+
+export function adminSupportPage(p: Principal): string {
+  return `<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>サポート内容の編集 | PONO-PLUS</title>${STYLE}
+<style>
+  .login { max-width: 720px; padding-top: 24px; }
+  textarea { width: 100%; min-height: 200px; }
+</style>
+</head>
+<body class="hashdr">
+${headerHtml(p, "/admin/support")}
+<div class="login">
+  <h1>サポート内容の編集</h1>
+  <div class="box">
+    <div class="error" id="err" style="display:none"></div>
+    <div class="ok" id="ok" style="display:none"></div>
+    <label for="video">動画のURL</label>
+    <input id="video" type="url" maxlength="500">
+    <p class="hint">全テナント共通で表示されます</p>
+    <label for="body">本文</label>
+    <textarea id="body" maxlength="4000"></textarea>
+    <button id="save">保存</button>
+  </div>
+  <p class="links"><a href="/home">ホームへ戻る</a></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const show = (el, t) => { el.textContent = t; el.style.display = 'block'; };
+const hide = (el) => { el.style.display = 'none'; };
+async function init() {
+  const res = await fetch('/api/support');
+  if (!res.ok) return;
+  const d = await res.json();
+  $('video').value = d.support.videoUrl || '';
+  $('body').value = d.support.body || '';
+}
+$('save').addEventListener('click', async () => {
+  hide($('err')); hide($('ok'));
+  const res = await fetch('/api/admin/support', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+    body: JSON.stringify({ videoUrl: $('video').value || null, body: $('body').value || null })
+  });
+  if (res.ok) { show($('ok'), '保存しました'); return; }
+  show($('err'), res.status === 403 ? 'この操作を行う権限がありません' : '保存できませんでした');
+});
+init();
+</script>
+</body></html>`;
 }

@@ -10,10 +10,10 @@
  *   認証を通っていないリクエストがハンドラ本体に到達しない構造にする。
  *   ハンドラ側で認証を書き忘れても、ここを通らなければ実行されない。
  */
-import { AuthzError, nowUtc, toJstCalendarDate, sha256Hex, canAccessAttendance, canView, canEdit, canEditReportCategory } from "./core.ts";
+import { AuthzError, nowUtc, toJstCalendarDate, sha256Hex, canAccessAttendance, canView, canEdit, canEditReportCategory, isSystemAdmin } from "./core.ts";
 import type { Section } from "./core.ts";
-import { loginPage, homePage, shiftSheetPage, employeeListPage, employeeFormPage, attendancePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage, noticeEditPage, supportPage } from "./pages.ts";
-import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet, listEmployees, getEmployee, updateEmployee, listShiftTypes, getProfile, getOwnEmployeeId, updateProfile, putProfilePhoto, deleteProfilePhoto, getProfilePhotoKey, PHOTO_MAX_BYTES, upsertMonthlyReport, getMonthlyReport, listMonthlyReports, monthlyWorkforceStats, listReportCategories, upsertReportCategory, upsertDailyReport, getDailyReport, listDailyReports, deleteDailyReport, putDailyReportPhoto, getDailyReportPhotoKey, createPhotoPost, listPhotoPosts, getPhotoPost, getPhotoPostKey, deletePhotoPost, CAPTION_MAX, sendThanks, listThanks, thanksRanking, countThanksSent, thanksPeriodOf, THANKS_MONTHLY_LIMIT, upsertSkillSheet, getSkillSheet, listSkillSheetsByYear, suggestSkillCounts, redactForEmployee, getTenantNotice, updateTenantNotice, addNoticeImage, deleteNoticeImage, getNoticeImageKey, listActivities, getSupportContent } from "./services.ts";
+import { tenantListPage, tenantFormPage, adminSupportPage, loginPage, homePage, shiftSheetPage, employeeListPage, employeeFormPage, attendancePage, profilePage, profileViewPage, reportListPage, reportFormPage, dailyReportListPage, dailyReportFormPage, reportCategoryPage, photoListPage, photoNewPage, thanksListPage, thanksNewPage, thanksRankingPage, skillSheetPage, skillSheetFormPage, noticeEditPage, supportPage } from "./pages.ts";
+import { login, logout, registerEmployee, RegistrationError, upsertShift, summarizePeriod, ShiftServiceError, bootstrapSetup, evaluateAttendance, setUrgentCheck, getShiftSheet, listEmployees, getEmployee, updateEmployee, listShiftTypes, getProfile, getOwnEmployeeId, updateProfile, putProfilePhoto, deleteProfilePhoto, getProfilePhotoKey, PHOTO_MAX_BYTES, upsertMonthlyReport, getMonthlyReport, listMonthlyReports, monthlyWorkforceStats, listReportCategories, upsertReportCategory, upsertDailyReport, getDailyReport, listDailyReports, deleteDailyReport, putDailyReportPhoto, getDailyReportPhotoKey, createPhotoPost, listPhotoPosts, getPhotoPost, getPhotoPostKey, deletePhotoPost, CAPTION_MAX, sendThanks, listThanks, thanksRanking, countThanksSent, thanksPeriodOf, THANKS_MONTHLY_LIMIT, upsertSkillSheet, getSkillSheet, listSkillSheetsByYear, suggestSkillCounts, redactForEmployee, getTenantNotice, updateTenantNotice, addNoticeImage, deleteNoticeImage, getNoticeImageKey, listActivities, getSupportContent, listTenants, getTenantDetail, upsertTenant, upsertSupportContent } from "./services.ts";
 import type { Principal } from "./core.ts";
 
 export interface Env {
@@ -47,6 +47,12 @@ interface RouteDef {
   section?: Section;
   /** "view" = 閲覧できれば通す ／ "edit" = 作成・編集できる場合のみ通す */
   need?: "view" | "edit";
+  /**
+   * 🔴 super管理者だけが使えるルート（機能権限表 1.1）。
+   *    super管理者は業務区分を1つも持たないため section では表せない。
+   *    弊社側の機能であり、テナントの利用者には存在を知らせない。
+   */
+  sysadmin?: boolean;
   handler: Handler;
 }
 
@@ -1046,6 +1052,65 @@ export const routes: RouteDef[] = [
       return json({ ok: true, support: c });
     },
   },
+  // --- super管理者（機能権限表 1.1「アカウント情報：一覧／発行／サポート」）---
+  { method: "GET", path: "/admin/tenants", sysadmin: true, handler: async (_req, ctx) => html(tenantListPage(ctx.principal)) },
+  { method: "GET", path: "/admin/tenants/edit", sysadmin: true, handler: async (_req, ctx) => html(tenantFormPage(ctx.principal)) },
+  { method: "GET", path: "/admin/support", sysadmin: true, handler: async (_req, ctx) => html(adminSupportPage(ctx.principal)) },
+  {
+    method: "GET",
+    path: "/api/admin/tenants",
+    sysadmin: true,
+    handler: async (_req, ctx) => json({ ok: true, tenants: await listTenants(ctx.env.DB) }),
+  },
+  {
+    method: "GET",
+    path: "/api/admin/tenants/detail",
+    sysadmin: true,
+    handler: async (req, ctx) => {
+      const id = new URL(req.url).searchParams.get("id");
+      if (id === null) return json({ error: "invalid_input" }, 400);
+      const t = await getTenantDetail(ctx.env.DB, id);
+      if (t === null) return json({ error: "not_found" }, 404);
+      return json({ ok: true, tenant: t });
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/admin/tenants",
+    sysadmin: true,
+    handler: async (req, ctx) => {
+      const b = (await req.json()) as Record<string, unknown>;
+      const num = (v: unknown): number | null => (v === null || v === undefined || v === "" ? null : Number(v));
+      const r = await upsertTenant(ctx.env.DB, {
+        id: (b.id as string | null) ?? null,
+        name: String(b.name ?? ""),
+        status: String(b.status ?? "active"),
+        cutoffDay: Number(b.cutoffDay ?? 0),
+        stressCheckEnabled: b.stressCheckEnabled === true,
+        maxAccounts: num(b.maxAccounts),
+        fiscalStartMonth: num(b.fiscalStartMonth),
+        contactName: (b.contactName as string | null) ?? null,
+        managerName: (b.managerName as string | null) ?? null,
+        worksiteName: (b.worksiteName as string | null) ?? null,
+        adminLoginId: b.adminLoginId === undefined ? undefined : String(b.adminLoginId),
+        adminPassword: b.adminPassword === undefined ? undefined : String(b.adminPassword),
+        adminName: b.adminName === undefined || b.adminName === null ? undefined : String(b.adminName),
+        adminEmail: (b.adminEmail as string | null) ?? null,
+      });
+      if (!r.ok) return json({ error: "invalid_input", issues: r.issues }, 400);
+      return json({ ok: true, tenantId: r.tenantId });
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/admin/support",
+    sysadmin: true,
+    handler: async (req, ctx) => {
+      const b = (await req.json()) as Record<string, unknown>;
+      await upsertSupportContent(ctx.env.DB, (b.videoUrl as string | null) ?? null, (b.body as string | null) ?? null);
+      return json({ ok: true });
+    },
+  },
   {
     method: "GET",
     path: "/api/shift-types",
@@ -1301,6 +1366,13 @@ export const worker = {
 
     if (route.public !== true && ctx.requestId === "") {
       return json({ error: "unauthorized" }, 401);
+    }
+
+    if (route.sysadmin === true && !isSystemAdmin(ctx.principal)) {
+      execCtx.waitUntil(writeAudit(ctx, req.method, url.pathname, 403, "sysadmin_only"));
+      return url.pathname.startsWith("/api/")
+        ? json({ error: "forbidden" }, 403)
+        : new Response(null, { status: 302, headers: { Location: "/home" } });
     }
 
     // 🔴 区分単位の権限判定を、ハンドラではなくここで行う（Session 06・H-1〜H-6）。
