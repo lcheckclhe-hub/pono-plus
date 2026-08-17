@@ -57,8 +57,8 @@ const STYLE = `
   /* 共通ヘッダー（Session 06・G-2〜G-5） */
   .apphdr { position: sticky; top: 0; z-index: 50; background: #1f3b63; color: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.2); }
   .hdrin { max-width: 1100px; margin: 0 auto; display: flex; align-items: center; gap: 12px; padding: 8px 14px; flex-wrap: wrap; }
-  .brand { color: #fff; font-weight: 700; text-decoration: none; letter-spacing: .04em; }
-  .hdrnav { display: flex; gap: 4px; flex-wrap: wrap; flex: 1 1 auto; }
+  .brand { color: #fff; font-weight: 700; text-decoration: none; letter-spacing: .04em; flex: 0 0 auto; }
+  .hdrnav { display: flex; gap: 4px; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
   .hdrnav a { color: #d8e3f2; text-decoration: none; font-size: 13px; padding: 5px 9px; border-radius: 5px; white-space: nowrap; }
   .hdrnav a:hover { background: rgba(255,255,255,.12); color: #fff; }
   .hdrnav a.on { background: #fff; color: #1f3b63; font-weight: 600; }
@@ -94,19 +94,25 @@ const STYLE = `
        折り返すとヘッダーが画面の半分を占め、本文が見えなくなる。
      ============================================================ */
   @media (max-width: 640px) {
-    .hdrin { gap: 8px; padding: 8px 10px; flex-wrap: nowrap; }
+    /* 🔴 2段組にする（Session 06 実機で修正）。
+       1段目: ブランド ＋ ログインID ＋ 権限 ＋ ログアウト
+       2段目: メニュー（横スクロール）
+       ⚠ flex-wrap: nowrap を指定するとメニューが2段目に送られず、
+         全部が1行に押し込まれてログアウトと重なる。折り返しは必ず許可する。 */
+    .hdrin { gap: 6px 8px; padding: 6px 10px; flex-wrap: wrap; }
     .brand { font-size: 14px; flex: 0 0 auto; }
     .hdrnav {
-      order: 3; flex: 1 0 100%; flex-wrap: nowrap; overflow-x: auto;
+      order: 3; flex: 0 0 100%; width: 100%; min-width: 0;
+      flex-wrap: nowrap; overflow-x: auto;
       -webkit-overflow-scrolling: touch; scrollbar-width: none;
-      padding-bottom: 2px; margin-top: 2px;
+      gap: 2px; padding-bottom: 2px; margin: 0;
     }
     .hdrnav::-webkit-scrollbar { display: none; }
-    .hdrnav a { font-size: 12px; padding: 5px 8px; }
-    .who { margin-left: auto; gap: 6px; font-size: 11px; }
-    .wid { max-width: 90px; overflow: hidden; text-overflow: ellipsis; }
+    .hdrnav a { font-size: 12px; padding: 5px 9px; }
+    .who { order: 2; margin-left: auto; gap: 6px; font-size: 11px; min-width: 0; }
+    .wid { max-width: 88px; overflow: hidden; text-overflow: ellipsis; }
     .wrole { padding: 2px 7px; }
-    .who button { padding: 4px 8px; font-size: 11px; }
+    .who button { padding: 4px 9px; font-size: 11px; }
 
     /* 本文。左右に余白が無いと端末の縁に貼り付く */
     body.hashdr > .login, body.hashdr > .wrap, body.hashdr > div:not(.apphdr) {

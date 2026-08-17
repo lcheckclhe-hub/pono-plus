@@ -4632,11 +4632,23 @@ describe("画面: スマホでの崩れにくさ", () => {
     void h;
     const src = readFileSync(join(here, "..", "src", "pages.ts"), "utf-8");
     assert.ok(src.includes("@media (max-width: 640px)"), "狭い画面向けの指定が無い");
-    // メニューは折り返さず横スクロールに逃がす（折り返すとヘッダーが画面を占有する）
-    const i = src.indexOf("@media (max-width: 640px) {\n    .hdrin");
-    assert.ok(i > 0, "ヘッダーの縮小指定が無い");
-    const block = src.slice(i, i + 900);
+
+    // 🔴 狭い画面のヘッダー指定を取り出して中身を検査する。
+    //   実機で「メニューとログアウトが重なる」崩れが起きたため、
+    //   文字列の有無ではなく【矛盾する組み合わせ】を検出する形にした。
+    const m = /@media \(max-width: 640px\) \{([\s\S]*?)\n  \}/.exec(src);
+    assert.ok(m !== null, "ヘッダーの縮小指定が無い");
+    const block = m![1];
+    assert.ok(block.includes(".hdrin"), "ヘッダー本体の指定が無い");
     assert.ok(block.includes("overflow-x: auto"), "メニューが横スクロールにならない");
+
+    // メニューを2段目に送るなら、親は折り返しを許可していなければならない。
+    // nowrap のまま 100% を指定すると1行に押し込まれ、ログアウトと重なる。
+    const sendsToSecondRow = /\.hdrnav\s*\{[\s\S]*?(flex:\s*[01]\s+0\s+100%|width:\s*100%)/.test(block);
+    const parentWraps = /\.hdrin\s*\{[^}]*flex-wrap:\s*wrap/.test(block);
+    if (sendsToSecondRow) {
+      assert.ok(parentWraps, "メニューを2段目に送る指定があるのに、親が折り返しを許可していない");
+    }
   });
 
   test("🔴 横幅を固定した表は、はみ出さないよう包まれている", () => {
